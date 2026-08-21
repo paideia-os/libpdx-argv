@@ -1,0 +1,24 @@
+# libpdx-argv — caps.decl
+#
+# Wave: R49
+# Doc:  design/tooling/r49-r50-plan.md §3.3 in the paideia-os repo.
+#
+# libpdx-argv is a pure userspace library. It reads only the caller's own
+# argv memory and (for --foo=bar) mutates that memory in place to null-
+# terminate on the '='. It performs NO syscalls of its own and therefore
+# requires NO capabilities of its own. The caller's argv memory is
+# already backed by cap grants the caller holds (typically the loader's
+# InitCap sidecar per src/kernel/core/loader/init_caps.pdx in paideia-os).
+#
+# Callers that use libpdx-argv must independently declare in their own
+# caps.decl any caps their tool needs (KIND_USER, KIND_TTY, KIND_PDXFS_*,
+# KIND_IPC_ENDPOINT, ...). This file exists so the R49 caps-manifest
+# tooling can consult a uniform declaration for every library.
+requires: (none)
+
+# Declared output schemas — the semantic-pipe schema record that the
+# parser emits when the caller asks for --pdx-schema. Landed as a
+# text-form stub in M1; migrates to libpdx-semantic-pipe wire format in
+# M3 (see r49-r50-plan.md §5.12 M3 line).
+declares_output_schemas:
+  - PdxArgvParsed@0.1

@@ -1,0 +1,217 @@
+// src/parser.pdx — libpdx-argv.M1-001
+// Parser: entry point parse_argv(argv, argc) → error_code.
+// M1-001 grammar: long flags (--foo, --foo=bar, --foo bar), positionals,
+//                 and the well-known --pdx-schema flag (sets emit_schema).
+// M1-001 rejects short flags with ERR_UNKNOWN_ARG_FORM; libpdx-argv.M1-002
+// replaces that branch with the one-per-hyphen short-flag handler.
+//
+// See design/architecture.md §4 for the state-machine spec and §6 for the
+// paideia-as encoding constraints this module observes.
+// Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os).
+//
+// Cross-module symbols read/written (all in ParsedArgs .bss):
+//   flag_names, flag_values, flag_count, pos_ptrs, pos_count,
+//   error_code, error_arg_index, emit_schema
+// Resolved by unqualified linker name — the same pattern dispatch.pdx uses
+// to read Tokenizer::argc / argv_buf in src/user/*.pdx (paideia-os).
+
+module Parser = structure {
+
+  // parse_argv(argv, argc) → u64
+  //   rdi = argv (u64* array of NUL-terminated arg pointers)
+  //   rsi = argc (count of entries in argv)
+  //   rax = 0 (ERR_OK) on success, else one of the ERR_* codes in
+  //         ParsedArgs. On error the offending arg index is also recorded
+  //         to ParsedArgs::error_arg_index for the diagnostic renderer.
+  //
+  // Register plan (all caller-save; leaf function — no callee-save touched):
+  //   r8  = i          (arg loop counter)
+  //   r9  = argv       (base pointer copy of rdi)
+  //   r10 = argc       (copy of rsi)
+  //   r11 = scratch    (paideia-as reserved scratch; used for every LEA)
+  //   rax = byte load  (post xor rax,rax per #1248 mitigation) / return
+  //   rcx = walk cursor within current arg / value pointer
+  //   rdx = current argv[i] pointer
+  pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M1-001 parse_argv entry point. Long-flag grammar per design/architecture.md §4: --foo / --foo=bar / --foo bar lookahead. Positional args go into pos_ptrs. Well-known --pdx-schema flag sets ParsedArgs::emit_schema=1 in addition to normal flag storage. Short flags in M1-001 return ERR_UNKNOWN_ARG_FORM; M1-002 replaces the parse_argv_maybe_flag → not-'-' arm with the one-per-hyphen handler. paideia-as conformance: cross-module writes via lea r11,[rip+sym]+mov; byte loads always preceded by xor rax,rax; every cmp reg,imm ≤ 0x7FFFFFFF; no test mnemonic; r11 scratch. Leaf function — no callee-save touched, no push/pop.",
+      block: {
+        // ---- prologue ---------------------------------------------------
+        mov r9, rdi;                    // r9 = argv base
+        mov r10, rsi;                   // r10 = argc
+        xor r8, r8;                     // r8 = i = 0
+
+      parse_argv_loop_head:
+        cmp r8, r10;
+        jge parse_argv_done_ok;
+
+        mov rdx, [r9 + r8*8];           // rdx = argv[i]
+
+        // byte0 = rdx[0]. '-' == 0x2D.
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0x2D;
+        je parse_argv_maybe_flag;
+        jmp parse_argv_positional;
+
+      parse_argv_maybe_flag:
+        // byte1 = rdx[1]. '-' == 0x2D; NUL == 0.
+        xor rax, rax;
+        mov_b rax, [rdx + 1];
+        cmp rax, 0x2D;
+        je parse_argv_long_flag;
+        cmp rax, 0;
+        je parse_argv_positional;       // bare "-" is a positional
+        // M1-001: short-flag arm is a stub. M1-002 replaces this branch.
+        mov rax, 3;                     // ERR_UNKNOWN_ARG_FORM
+        jmp parse_argv_fail;
+
+      parse_argv_long_flag:
+        // byte2 = rdx[2]. Must be a name char — reject NUL and '='.
+        xor rax, rax;
+        mov_b rax, [rdx + 2];
+        cmp rax, 0;
+        je parse_argv_long_missing_name;
+        cmp rax, 0x3D;                  // '=' == 0x3D
+        je parse_argv_long_missing_name;
+
+        // Walk cursor from rdx+2 looking for '=' or NUL.
+        mov rcx, rdx;
+        add rcx, 2;                     // rcx = walk cursor = name start
+
+      parse_argv_walk_name:
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je parse_argv_name_no_value;
+        cmp rax, 0x3D;
+        je parse_argv_name_eq_value;
+        add rcx, 1;
+        jmp parse_argv_walk_name;
+
+      parse_argv_name_eq_value:
+        // In-place null-terminate the '=' byte. value = rcx + 1.
+        xor rax, rax;
+        mov_b [rcx], rax;
+        add rcx, 1;
+        jmp parse_argv_store_long_flag;
+
+      parse_argv_name_no_value:
+        // Name already NUL-terminated. Check argv[i+1] for lookahead.
+        mov rax, r8;
+        add rax, 1;
+        cmp rax, r10;
+        jge parse_argv_no_lookahead;
+
+        mov rcx, [r9 + rax*8];          // rcx = argv[i+1] candidate value
+
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je parse_argv_no_lookahead;     // empty string → not a value
+        cmp rax, 0x2D;
+        je parse_argv_no_lookahead;     // starts with '-' → not a value
+
+        // Consume argv[i+1] as value. Advance i by an extra step so the
+        // outer loop's add r8,1 lands us past both args.
+        add r8, 1;
+        jmp parse_argv_store_long_flag;
+
+      parse_argv_no_lookahead:
+        xor rcx, rcx;                   // value = 0 (boolean flag)
+        jmp parse_argv_store_long_flag;
+
+      parse_argv_store_long_flag:
+        // Entry contract: rdx = arg ptr (name lives at rdx+2), rcx = value
+        // pointer (or 0 for boolean flag).
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 32;                    // ParsedArgs::MAX_FLAGS
+        jge parse_argv_flag_overflow;
+
+        // name = rdx + 2 (skip the "--" prefix). Mutate rdx in place —
+        // no further read of rdx as arg ptr occurs below this point on
+        // this iteration.
+        add rdx, 2;
+
+        lea r11, [rip + flag_names];
+        mov [r11 + rax*8], rdx;         // flag_names[k] = name ptr
+
+        lea r11, [rip + flag_values];
+        mov [r11 + rax*8], rcx;         // flag_values[k] = value ptr
+
+        add rax, 1;
+        lea r11, [rip + flag_count];
+        mov [r11], rax;
+
+        // Well-known flag detection: if name equals "pdx-schema"
+        // (byte-exact, length 10 + NUL), set emit_schema = 1. Inline
+        // byte compare — libpdx-argv predates any strcmp helper. Any
+        // mismatch falls through to parse_argv_advance_loop with
+        // emit_schema left untouched.
+        xor rax, rax; mov_b rax, [rdx + 0];  cmp rax, 0x70; jne parse_argv_advance_loop;  // 'p'
+        xor rax, rax; mov_b rax, [rdx + 1];  cmp rax, 0x64; jne parse_argv_advance_loop;  // 'd'
+        xor rax, rax; mov_b rax, [rdx + 2];  cmp rax, 0x78; jne parse_argv_advance_loop;  // 'x'
+        xor rax, rax; mov_b rax, [rdx + 3];  cmp rax, 0x2D; jne parse_argv_advance_loop;  // '-'
+        xor rax, rax; mov_b rax, [rdx + 4];  cmp rax, 0x73; jne parse_argv_advance_loop;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 5];  cmp rax, 0x63; jne parse_argv_advance_loop;  // 'c'
+        xor rax, rax; mov_b rax, [rdx + 6];  cmp rax, 0x68; jne parse_argv_advance_loop;  // 'h'
+        xor rax, rax; mov_b rax, [rdx + 7];  cmp rax, 0x65; jne parse_argv_advance_loop;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 8];  cmp rax, 0x6D; jne parse_argv_advance_loop;  // 'm'
+        xor rax, rax; mov_b rax, [rdx + 9];  cmp rax, 0x61; jne parse_argv_advance_loop;  // 'a'
+        xor rax, rax; mov_b rax, [rdx + 10]; cmp rax, 0;    jne parse_argv_advance_loop;  // NUL
+
+        mov rax, 1;
+        lea r11, [rip + emit_schema];
+        mov [r11], rax;
+        jmp parse_argv_advance_loop;
+
+      parse_argv_positional:
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 32;                    // ParsedArgs::MAX_POS
+        jge parse_argv_pos_overflow;
+
+        lea r11, [rip + pos_ptrs];
+        mov [r11 + rax*8], rdx;         // pos_ptrs[m] = argv[i]
+
+        add rax, 1;
+        lea r11, [rip + pos_count];
+        mov [r11], rax;
+        jmp parse_argv_advance_loop;
+
+      parse_argv_advance_loop:
+        add r8, 1;
+        jmp parse_argv_loop_head;
+
+      parse_argv_long_missing_name:
+        mov rax, 5;                     // ERR_LONG_MISSING_NAME
+        jmp parse_argv_fail;
+
+      parse_argv_flag_overflow:
+        mov rax, 1;                     // ERR_FLAG_OVERFLOW
+        jmp parse_argv_fail;
+
+      parse_argv_pos_overflow:
+        mov rax, 2;                     // ERR_POS_OVERFLOW
+        jmp parse_argv_fail;
+
+      parse_argv_fail:
+        // rax = error code. Record it + the offending arg index for the
+        // consumer's stderr diagnostic. Return rax so the caller sees the
+        // error without a second load.
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        lea r11, [rip + error_arg_index];
+        mov [r11], r8;
+        ret
+
+      parse_argv_done_ok:
+        xor rax, rax;                   // ERR_OK
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        ret
+      }
+    }
+}

@@ -1,0 +1,47 @@
+// src/parsed_args.pdx — libpdx-argv.M1-001
+// ParsedArgs record: singleton .bss storage for one parse_argv() call.
+// See design/architecture.md §2–§3 for layout rationale and storage model.
+// Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os).
+
+module ParsedArgs = structure {
+  // --- Error codes (0 = OK). Consumers pattern-match on these. ---------
+  pub let ERR_OK                : u64 = 0
+  pub let ERR_FLAG_OVERFLOW     : u64 = 1
+  pub let ERR_POS_OVERFLOW      : u64 = 2
+  pub let ERR_UNKNOWN_ARG_FORM  : u64 = 3   // set by M1-001 for a short flag; M1-002 replaces with SHORT-flag handling
+  pub let ERR_CLUSTERED_SHORT   : u64 = 4   // set by M1-002 for -la et al
+  pub let ERR_LONG_MISSING_NAME : u64 = 5   // "--" or "--=foo"
+
+  // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
+  pub let MAX_FLAGS : u64 = 32
+  pub let MAX_POS   : u64 = 32
+
+  // --- Singleton storage (bootstrap-scope; M4 migrates to caller-owned). -
+  pub let mut flag_names        : [u64; 32] = uninit @align(8)
+  pub let mut flag_values       : [u64; 32] = uninit @align(8)
+  pub let mut flag_count        : u64       = uninit @align(8)
+  pub let mut pos_ptrs          : [u64; 32] = uninit @align(8)
+  pub let mut pos_count         : u64       = uninit @align(8)
+  pub let mut error_code        : u64       = uninit @align(8)
+  pub let mut error_arg_index   : u64       = uninit @align(8)  // set by parser on error
+  pub let mut emit_schema       : u64       = uninit @align(8)  // 1 iff --pdx-schema seen
+
+  // reset() — clear the counters, the error, and the schema flag.
+  // The flag_names / flag_values / pos_ptrs arrays are consumed by index
+  // up to flag_count / pos_count, so stale trailing entries are
+  // unreachable and do not need zeroing.
+  pub let reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M1-001: zero the four bookkeeping slots so parse_argv starts from a known-empty ParsedArgs. r11 is scratch (paideia-as conformance). rax=0 is the value written into each slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result.",
+      block: {
+        xor rax, rax;                            // rax = 0
+        lea r11, [rip + flag_count];      mov [r11], rax;
+        lea r11, [rip + pos_count];       mov [r11], rax;
+        lea r11, [rip + error_code];      mov [r11], rax;
+        lea r11, [rip + error_arg_index]; mov [r11], rax;
+        lea r11, [rip + emit_schema];     mov [r11], rax;
+        ret
+      }
+    }
+}
