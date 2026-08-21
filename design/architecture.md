@@ -135,13 +135,14 @@ category error, not a two-flag shorthand.
 `flag_names[k] = "f\0"` (interior pointer just past the `-`),
 `flag_values[k] = 0`. If the next argv element does not start with `-` or
 NUL, it is consumed as the value (mirrors the long-flag lookahead rule
-above).
+above). Short flags do not participate in the `--pdx-schema` well-known
+compare — that flag is long-only.
 
 **Rejected:** `-la` — a two-or-more-character run after the `-`. Sets
 `ERR_CLUSTERED_SHORT`. The parser stops before this arg is stored, and
-the erroring `argv[i]` is discoverable via a later
-`ParsedArgs::error_arg_index` slot that M1-002 introduces alongside the
-error-code write.
+the erroring `argv[i]` is discoverable via the
+`ParsedArgs::error_arg_index` slot the parser writes alongside every
+error-code write (see `parse_argv_fail` in `src/parser.pdx`).
 
 D3 justification: the GNU behaviour of clustering (`ls -la` == `ls -l -a`)
 lets a typo like `-lat` silently activate a third flag `-t` the user did

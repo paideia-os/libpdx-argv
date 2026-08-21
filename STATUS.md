@@ -1,14 +1,16 @@
 # libpdx-argv — status
 
 **Wave:** R49 shared library
-**Current milestone:** M1 (design + skeleton) — in progress
+**Current milestone:** M1 (design + skeleton) — CLOSED. Ready for M2
+(core implementation: typed flag args + 9-flag standard vocabulary +
+positional-argument list handling).
 
 ## Milestone rollup
 
 | ID              | Title                                                        | State  |
 |-----------------|--------------------------------------------------------------|--------|
 | M1-001 (#1)     | scaffold + ParsedArgs struct + long-flag grammar             | LANDED |
-| M1-002 (#2)     | short-flag grammar one-per-hyphen (clustered → reject)       | open   |
+| M1-002 (#2)     | short-flag grammar one-per-hyphen (clustered → reject)       | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.12 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.

@@ -1,9 +1,9 @@
-// src/parser.pdx — libpdx-argv.M1-001
+// src/parser.pdx — libpdx-argv.M1-001 + M1-002
 // Parser: entry point parse_argv(argv, argc) → error_code.
 // M1-001 grammar: long flags (--foo, --foo=bar, --foo bar), positionals,
 //                 and the well-known --pdx-schema flag (sets emit_schema).
-// M1-001 rejects short flags with ERR_UNKNOWN_ARG_FORM; libpdx-argv.M1-002
-// replaces that branch with the one-per-hyphen short-flag handler.
+// M1-002 adds:    short flags one-per-hyphen (-f accepted; -la rejected
+//                 with ERR_CLUSTERED_SHORT per D3 in design/tooling/plan.md).
 //
 // See design/architecture.md §4 for the state-machine spec and §6 for the
 // paideia-as encoding constraints this module observes.
@@ -35,7 +35,7 @@ module Parser = structure {
   pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M1-001 parse_argv entry point. Long-flag grammar per design/architecture.md §4: --foo / --foo=bar / --foo bar lookahead. Positional args go into pos_ptrs. Well-known --pdx-schema flag sets ParsedArgs::emit_schema=1 in addition to normal flag storage. Short flags in M1-001 return ERR_UNKNOWN_ARG_FORM; M1-002 replaces the parse_argv_maybe_flag → not-'-' arm with the one-per-hyphen handler. paideia-as conformance: cross-module writes via lea r11,[rip+sym]+mov; byte loads always preceded by xor rax,rax; every cmp reg,imm ≤ 0x7FFFFFFF; no test mnemonic; r11 scratch. Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-argv.M1-001 + M1-002 parse_argv entry point. Long-flag grammar per design/architecture.md §4: --foo / --foo=bar / --foo bar lookahead. Short-flag grammar per §5: -f accepted (single letter + NUL, with same lookahead rule as long flags); -la or any two-or-more-character run after '-' rejected with ERR_CLUSTERED_SHORT (D3 one-per-hyphen contract). Positional args go into pos_ptrs. Well-known --pdx-schema flag sets ParsedArgs::emit_schema=1 in addition to normal flag storage. paideia-as conformance: cross-module writes via lea r11,[rip+sym]+mov; byte loads always preceded by xor rax,rax; every cmp reg,imm ≤ 0x7FFFFFFF; no test mnemonic; r11 scratch. Leaf function — no callee-save touched, no push/pop.",
       block: {
         // ---- prologue ---------------------------------------------------
         mov r9, rdi;                    // r9 = argv base
@@ -63,9 +63,7 @@ module Parser = structure {
         je parse_argv_long_flag;
         cmp rax, 0;
         je parse_argv_positional;       // bare "-" is a positional
-        // M1-001: short-flag arm is a stub. M1-002 replaces this branch.
-        mov rax, 3;                     // ERR_UNKNOWN_ARG_FORM
-        jmp parse_argv_fail;
+        jmp parse_argv_short_flag;
 
       parse_argv_long_flag:
         // byte2 = rdx[2]. Must be a name char — reject NUL and '='.
@@ -166,6 +164,63 @@ module Parser = structure {
         lea r11, [rip + emit_schema];
         mov [r11], rax;
         jmp parse_argv_advance_loop;
+
+      parse_argv_short_flag:
+        // Entry contract: rdx = arg ptr, rdx[0]='-', rdx[1]=letter (not
+        // '-' and not NUL — those were already routed by parse_argv_maybe_
+        // flag). Check byte2: NUL → single-letter short flag; anything
+        // else → clustered → ERR_CLUSTERED_SHORT per D3.
+        xor rax, rax;
+        mov_b rax, [rdx + 2];
+        cmp rax, 0;
+        jne parse_argv_short_clustered;
+
+        // Single short flag. Same value-lookahead rule as long flags.
+        mov rax, r8;
+        add rax, 1;
+        cmp rax, r10;
+        jge parse_argv_short_no_lookahead;
+
+        mov rcx, [r9 + rax*8];
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je parse_argv_short_no_lookahead;
+        cmp rax, 0x2D;
+        je parse_argv_short_no_lookahead;
+
+        add r8, 1;                      // consume argv[i+1] as value
+        jmp parse_argv_store_short_flag;
+
+      parse_argv_short_no_lookahead:
+        xor rcx, rcx;
+        jmp parse_argv_store_short_flag;
+
+      parse_argv_store_short_flag:
+        // rdx = arg ptr (name = rdx+1, a NUL-terminated 1-char string).
+        // rcx = value ptr (or 0). Short flags do not participate in the
+        // --pdx-schema well-known compare — that flag is long-only.
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 32;                    // ParsedArgs::MAX_FLAGS
+        jge parse_argv_flag_overflow;
+
+        add rdx, 1;                     // name = rdx + 1 (skip '-')
+
+        lea r11, [rip + flag_names];
+        mov [r11 + rax*8], rdx;
+
+        lea r11, [rip + flag_values];
+        mov [r11 + rax*8], rcx;
+
+        add rax, 1;
+        lea r11, [rip + flag_count];
+        mov [r11], rax;
+        jmp parse_argv_advance_loop;
+
+      parse_argv_short_clustered:
+        mov rax, 4;                     // ERR_CLUSTERED_SHORT
+        jmp parse_argv_fail;
 
       parse_argv_positional:
         lea r11, [rip + pos_count];
