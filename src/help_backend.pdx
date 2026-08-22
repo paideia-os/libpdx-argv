@@ -1,0 +1,92 @@
+// src/help_backend.pdx — libpdx-argv.M3-002
+// HelpBackend: --help back-end integration with `doc <tool>`.
+//
+// Every P0 tool implements `--help` (I3 STD_ID_HELP). At M2 the consumer
+// detected the flag but had to render help itself. M3-002 integrates
+// with `doc` (paideia-os/doc) so the tool's help surface is the same
+// hyperlinked `.pdxdoc` render the user sees when they type
+// `doc <toolname>` at the shell.
+//
+// libpdx-argv cannot statically depend on doc (doc itself depends on
+// libpdx-argv — the dependency would be circular). Instead this module
+// exposes two helpers the consumer wires:
+//
+//   HelpBackend::fill_doc_argv(out_argv_slot_ptr, tool_name_ptr) -> ()
+//       Populates a caller-owned 2-slot argv array so the consumer
+//       can pass it to whatever doc entry-point it linked. Slot 0
+//       always points at HelpBackend::DOC_TOOL_NAME ("doc\0"); slot 1
+//       carries the caller's tool_name_ptr. Slot 0 is a stable public
+//       .rodata address so every consumer's synthesized argv agrees on
+//       argv[0] byte-for-byte.
+//
+//   HelpBackend::DOC_TOOL_NAME  : [u8; 4]
+//       The public ASCII "doc\0" string every consumer's synthesized
+//       argv shares. Exposed as a symbol so a consumer's own inline
+//       .rodata for the doc tool name can be dropped in favour of
+//       a single canonical copy.
+//
+// Consumer pattern (at bootstrap-scope, statically linked doc):
+//
+//   let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_HELP)
+//   if k != 32 {
+//     let mut argv_slots : [u64; 2] = uninit @align(8)
+//     HelpBackend::fill_doc_argv(&argv_slots[0], my_tool_name_ptr)
+//     exit(DocDispatch::doc_dispatch(&argv_slots[0], 2))
+//   }
+//
+// Non-consumer pattern (fork/exec, once R51+ substrate lands): the
+// consumer synthesizes the argv, then forks a child running `doc`
+// through libpdx-elevate + libpdx-cap. The fill_doc_argv helper still
+// applies — the difference is what the caller does with the two
+// pointers after they're written.
+//
+// See design/architecture.md §10.2 for the M3 integration rationale
+// and the reason libpdx-argv exposes only the argv-fill primitive
+// (avoids the circular-dep + fn-pointer indirection at bootstrap).
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M3-002 (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module HelpBackend (PascalCase basename).
+//   - fill_doc_argv is a leaf; no push/pop, r11 scratch.
+//   - No test mnemonic; no cmp instructions in this module.
+//   - DOC_TOOL_NAME is a public [u8; 4] .rodata symbol.
+
+module HelpBackend = structure {
+
+  // The literal `doc` NUL-terminated string every tool's synthesized
+  // --help argv shares. Byte-length 4 = strlen("doc") + 1 for NUL.
+  pub let DOC_TOOL_NAME : [u8; 4] = "doc\0"
+
+  // ============================================================
+  // fill_doc_argv(out_argv_slot_ptr, tool_name_ptr) -> ()
+  //
+  // Signature: (u64, u64) -> () !{mem} @{}
+  //   rdi = out_argv_slot_ptr — points at caller-owned [u64; 2]
+  //                             storage; contents overwritten with
+  //                             (&DOC_TOOL_NAME, tool_name_ptr).
+  //   rsi = tool_name_ptr    — NUL-terminated string naming the
+  //                             calling tool (e.g. "cat\0").
+  //
+  // After the call the caller's argv storage looks like:
+  //   argv_slots[0] = &DOC_TOOL_NAME  ("doc\0")
+  //   argv_slots[1] = tool_name_ptr
+  // and the caller invokes their linked doc entry-point with
+  // (argv=&argv_slots[0], argc=2).
+  //
+  // Leaf function. Register plan (all caller-save):
+  //   rax = temporary for the DOC_TOOL_NAME address
+  //   r11 = lea scratch for the .rodata address
+  // ============================================================
+  pub let fill_doc_argv : (u64, u64) -> () !{mem} @{} =
+    fn (out_argv_slot_ptr: u64) (tool_name_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M3-002 HelpBackend::fill_doc_argv — writes two qwords into a caller-owned [u64; 2] argv scratch so the caller can spawn (or in-process-call) doc with argv = ('doc', <tool_name>). Slot 0 always points at the module-local DOC_TOOL_NAME symbol so every consumer agrees on the argv[0] byte-for-byte; the caller supplies the tool name in slot 1. Leaf; no callee-save touched; r11 scratch for the lea. paideia-as conformance: no test mnemonic; no cmp needed; qword stores are aligned when the caller's slot is 8-byte aligned (contract). SysV push/pop parity trivially satisfied (leaf).",
+      block: {
+        lea r11, [rip + DOC_TOOL_NAME];
+        mov [rdi + 0], r11;                 // argv_slots[0] = &DOC_TOOL_NAME
+        mov [rdi + 8], rsi;                 // argv_slots[1] = tool_name_ptr
+        ret
+      }
+    }
+}

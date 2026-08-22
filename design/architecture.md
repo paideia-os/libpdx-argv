@@ -509,3 +509,43 @@ else:                                # invoked via semantic-pipe
 `Parser::parse_argv` exactly: push rbx/rbp/r12/r13/r14/r15 + `sub
 rsp, 8` = 7 stack slots after the return address, so `rsp % 16 == 0`
 at every nested call site.
+
+### 10.2 `--help` back-end integration with `doc <tool>` (M3-002)
+
+New file: `src/help_backend.pdx`. Module `HelpBackend` with one
+public `.rodata` symbol and one leaf helper:
+
+```
+HelpBackend::DOC_TOOL_NAME     : [u8; 4]     // "doc\0"
+HelpBackend::fill_doc_argv(out_argv_slot_ptr, tool_name_ptr) -> ()
+```
+
+**Why an argv-fill primitive, not a fn-pointer dispatcher.** libpdx-
+argv cannot statically link against `doc` — the reverse dependency
+already holds (`doc` uses libpdx-argv). A fn-pointer table would work
+but at bootstrap-scope every P0 tool is one statically-linked binary
+that knows at link time which `doc_dispatch` symbol to call. The
+argv-fill helper lets the caller synthesize the two pointers once and
+hand them to whichever entry it linked; no indirect call, no
+per-invocation registration.
+
+**Consumer wiring pattern.**
+
+```
+let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_HELP)
+if k != 32 {
+  let mut argv_slots : [u64; 2] = uninit @align(8)
+  HelpBackend::fill_doc_argv(&argv_slots[0], my_tool_name_ptr)
+  exit(DocDispatch::doc_dispatch(&argv_slots[0], 2))
+}
+```
+
+Once fork/exec substrate lands (R51+), the same fill_doc_argv output
+can seed the child's argv instead of an in-process call — the two
+pointers are the invariant, the transport is not.
+
+**Why a shared `DOC_TOOL_NAME` symbol.** Every consumer's synthesized
+argv[0] agrees byte-for-byte, so a shell-side audit-record consumer
+can recognise the "doc" tool without normalising per-caller
+whitespace or case. The symbol is 4 bytes; the cost of the shared
+copy is negligible.

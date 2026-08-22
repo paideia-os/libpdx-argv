@@ -1,8 +1,8 @@
 # libpdx-argv — status
 
 **Wave:** R49 shared library
-**Current milestone:** M3 in progress (M3-001 LANDED — alternate
-invocation path via typed schema record; M3-002 and M3-003 next).
+**Current milestone:** M3 in progress (M3-001 + M3-002 LANDED; M3-003
+next: --schema declared-schema emission).
 
 ## Milestone rollup
 
@@ -14,6 +14,7 @@ invocation path via typed schema record; M3-002 and M3-003 next).
 | M2-002 (#4)     | 9-flag standard vocabulary from I3                                 | LANDED |
 | M2-003 (#5)     | positional-argument list handling (`--` sentinel, `:` separator)   | LANDED |
 | M3-001 (#6)     | alternate invocation: typed schema record -> ParsedArgs            | LANDED |
+| M3-002 (#7)     | --help back-end integration with doc <tool>                        | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.12 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
@@ -22,7 +23,7 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
 
 - `design/architecture.md` — internal spec (M1 record shape + state
   machine + M2 additions: FlagSpec, StdVocab, Typed, positional list
-  + M3.1: SchemaInvoke).
+  + M3.1: SchemaInvoke, M3.2: HelpBackend).
 - `src/parsed_args.pdx` — `ParsedArgs` module (error codes + slot
   storage + `find_flag_by_id` helper).
 - `src/parser.pdx` — `Parser` module (`parse_argv` entry point;
@@ -35,6 +36,8 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
   `parse_timespan`; M2-001).
 - `src/schema_invoke.pdx` — `SchemaInvoke` module (alt invocation:
   typed record -> ParsedArgs; M3-001).
+- `src/help_backend.pdx` — `HelpBackend` module (`--help` -> doc
+  argv synthesis; M3-002).
 - `caps.decl` — libpdx-argv requires no caps of its own; declares the
   `PdxArgvRecord@0.1` wire schema consumed by SchemaInvoke.
 - `tests/` — empty until `libpdx-argv.M4-001` lands the
