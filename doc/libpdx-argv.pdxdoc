@@ -1,0 +1,167 @@
+.pdxdoc-version 1
+.tool           libpdx-argv
+.kind           library
+.version        1.0.0
+.author         paideia-os-team
+.wave           R49
+.summary        CLI argument parsing (long primary, short one-per-hyphen)
+                for every R49+R50 P0 tool; also decodes the alternate
+                semantic-pipe invocation record.
+
+.section NAME
+libpdx-argv - argv parser for PaideiaOS tools
+
+.section SYNOPSIS
+    #include this library in a tool's link line via `deps.list`
+    then, at _start:
+
+        FlagSpec::reset()
+        StdVocab::register_all()
+        FlagSpec::register(<tool-flag-name>, <kind>, <id>)
+        ...
+        ParsedArgs::reset()
+        let err = Parser::parse_argv(argv, argc)
+
+    or, when invoked through a semantic pipe:
+
+        let err = SchemaInvoke::parse_from_schema_record(rec_ptr, rec_len)
+
+.section DESCRIPTION
+libpdx-argv turns a `_start`-time argv (or an equivalent
+`PdxArgvRecord@0.1` semantic-pipe record) into a `ParsedArgs`
+struct that a tool's dispatch loop reads by id. The library ships
+no default caps and issues no syscalls of its own; every consumer
+declares its own caps in its own `caps.decl`.
+
+Two invocation paths converge on the same `ParsedArgs`:
+
+  argv (textual)  --parse_argv-->  ParsedArgs
+  wire (typed)    --parse_from_schema_record-->  ParsedArgs
+
+The dispatch code that follows is invocation-path-agnostic; a
+tool that renders `--help` via `doc <tool>` (see `HelpBackend`)
+does so identically whether the user typed the flag or a peer
+tool set the flag through a pipe.
+
+.section FLAG GRAMMAR
+The R49 grammar is fixed (see D3 in `design/tooling/plan.md`):
+
+  --foo             boolean long flag
+  --foo bar         long flag with lookahead value
+  --foo=bar         long flag with inline value
+  -x                single-letter short flag (one per hyphen)
+  --                sentinel; all remaining tokens are positional
+  -                 bare hyphen; positional (stdin convention)
+
+.section BREAKS WITH POSIX
+Clustered short flags (`-la`, `-abc`) are REJECTED with error
+code `ERR_CLUSTERED_SHORT`. Every short flag must have its own
+hyphen (`-l -a`). This is deliberate: the semantic pipe binds
+flags by id, and clustering collides with typed short flags that
+consume an argument (e.g. `-n 5` in `head`). See D3 for the full
+rationale.
+
+Long flags may accept a `=` separator OR a lookahead token, at
+the tool's choice per `FlagSpec::register` kind. The `:` separator
+is reserved for `--no-cap:<name>` (I3-vocabulary) and for future
+namespaced-flag forms; consumer tools may not repurpose it.
+
+.section STANDARD FLAGS (I3 vocabulary)
+`StdVocab::register_all` binds these nine ids into `FlagSpec`
+for every tool that calls it. IDs 1..9 are RESERVED for these
+flags; a tool's own flags start at id 100.
+
+  id 1  --help           back-end forwards to `doc <tool>`
+  id 2  --version        emits `<tool> <semver>` on stdout
+  id 3  --dry-run        report what would change; don't do it
+  id 4  --json           emit output as line-delimited JSON
+  id 5  --schema         list this tool's declared output schemas
+  id 6  --verbose        raise output verbosity by one step
+  id 7  --quiet          suppress non-error output
+  id 8  --color=<mode>   `auto`, `always`, `never`
+  id 9  --no-cap:<name>  strip the named cap before exec (I7)
+
+.section TYPED FLAG ARGUMENTS
+`Typed::parse_int_u64` / `parse_size` / `parse_timespan` decode
+the string half of a typed flag into a `(ok: u64, value: u64)`
+pair. Failing decodes set `ParsedArgs::error_code =
+ERR_TYPED_PARSE` and leave `flag_values[k]` pointing at the
+offending text so the tool can render a diagnostic.
+
+  --older-than 7d       parse_timespan -> 604800 (seconds)
+  --older-than 3h       parse_timespan -> 10800
+  --size 2m             parse_size     -> 2097152
+  --size 3g             parse_size     -> 3221225472
+  -n 42                 parse_int_u64  -> 42
+
+The `w` (week) suffix on `parse_timespan` is deferred to M6 (a
+per-tool concern once anything ships a `--older-than 1w` need).
+
+.section ALTERNATE INVOCATION (SEMANTIC PIPE)
+When a tool is invoked through a `KIND_IPC_ENDPOINT` semantic
+pipe with a `PdxArgvRecord@0.1` payload rather than through the
+loader-seeded argv slot, the launcher hands the tool the
+record's `(ptr, len)` in place of `(argv, argc)`. The tool
+routes to `SchemaInvoke::parse_from_schema_record` instead of
+`Parser::parse_argv`. Everything downstream — id-keyed dispatch,
+typed-value decoding, `--help` forwarding — is identical.
+
+The wire form is documented in `design/architecture.md` §10.1
+and its schema fingerprint is registered with
+`libpdx-semantic-pipe` M2 envelope framing.
+
+.section --HELP BACK-END
+`HelpBackend::fill_doc_argv` synthesises a two-slot argv of the
+shape `["doc", tool_name]` in caller-provided storage and hands
+it to the consumer, which then reaches `doc` through the shell.
+libpdx-argv itself does not spawn `doc`; the consumer's own
+loader-supplied cap chain decides whether the doc invocation is
+permitted.
+
+.section --SCHEMA
+`SchemaEmit::register(schema_name_ptr)` at init lets a tool
+publish which schemas it emits on stdout under normal operation.
+`Parser::parse_argv` intercepts `--schema` at parse time and the
+consumer's dispatch loop walks `SchemaEmit::get_count` /
+`SchemaEmit::get_name` to print them one per line, then exits 0.
+
+Consumers that emit no schema-bearing output register nothing
+(the flag is still accepted; the tool exits 0 with empty stdout).
+
+.section CAPABILITY REQUIREMENTS
+libpdx-argv itself requires none (see `caps.decl`). It reads
+only the caller's own argv memory, and for the `--foo=bar` form
+mutates that memory in place to null-terminate on `=`. It runs
+synchronously inside the caller's process and issues no
+syscalls.
+
+.section DIAGNOSTICS
+Non-zero return from `Parser::parse_argv` or
+`SchemaInvoke::parse_from_schema_record` sets
+`ParsedArgs::error_code`. Consumers render the diagnostic on
+stderr and exit per I4:
+
+  exit 2   ERR_UNKNOWN_FLAG          unrecognised long/short name
+  exit 2   ERR_CLUSTERED_SHORT       `-la` etc.
+  exit 2   ERR_LONG_MISSING_NAME     `--=foo`, `--:foo`
+  exit 2   ERR_MISSING_VALUE         typed flag without value
+  exit 2   ERR_TYPED_PARSE           `--size xyz`, `--older-than 3q`
+  exit 3   ERR_SCHEMA_RECORD_MALFORMED  semantic-pipe path only
+
+exit 3 is a system error (audit-journal broker refused, or
+peer sent a malformed schema record); exit 2 is a user error.
+
+.section CROSS-REFERENCES
+  doc doc                        the .pdxdoc reader (renders this file)
+  doc libpdx-semantic-pipe       envelope framing for PdxArgvRecord@0.1
+  doc pkg                        package installation and verify
+  design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os)
+  design/tooling/plan.md         §4.2 I3 (standard flag vocabulary)
+                                 §4.2 I6 (caps.decl invariant)
+                                 D3 (flag grammar)
+
+.section HISTORY
+  1.0.0  2026-08-22   First signed release. Closes M1..M5.
+
+.section AUTHORS
+  paideia-os-team.  Repo: github.com/paideia-os/libpdx-argv.

@@ -1,9 +1,17 @@
 # libpdx-argv — status
 
 **Wave:** R49 shared library
-**Current milestone:** M4 (tests + smoke) — CLOSED. Ready for M5
-(dual-signed release + .pdxdoc + mirror push; gated on pkg.M4 per
-`design/tooling/r49-r50-plan.md` §5.12).
+**Current milestone:** M5 (dual-signed release + `.pdxdoc` + mirror
+push) — CLOSED. Repo is at v1.0.0. Every milestone issue (#1..#10)
+is closed. See `CHANGELOG.md` for the 1.0 entry and
+`design/tooling/r49-r50-plan.md` §5.12 for the wave-level rubric.
+
+Signature state at 1.0: `manifest.pdxsig` is payload-frozen; both
+signature slots carry `PENDING:` sentinels. Populated in place by
+`paideia-as release --sign` (author slot) once v0.33-crypto-kdf is
+reachable on the release-runner host, and by the pkgs.paideia-os
+mirror runner (paideia_root slot) at admission time — see
+paideia-os meta issue `T-INFRA-001`.
 
 ## Milestone rollup
 
@@ -18,6 +26,7 @@
 | M3-002 (#7)     | --help back-end integration with doc <tool>                        | LANDED |
 | M3-003 (#8)     | --schema prints tool's declared output schemas                     | LANDED |
 | M4-001 (#9)     | parse-correctness matrix + clustered-short + typed diag + --help round-trip | LANDED |
+| M5-001 (#10)    | dual-signed release + .pdxdoc + mirror push (v1.0.0)                     | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.12 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
@@ -49,6 +58,14 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
   (harness + 8 fixture modules + smoke_driver + README). See
   `tests/README.md` for the coverage matrix.
 - `.plans/` — per-milestone implementation notes.
+- `VERSION` — semver (`1.0.0`).
+- `CHANGELOG.md` — release history with the 1.0.0 rollup.
+- `deps.list` — library dependencies (none; toolchain floor only).
+- `manifest.pdxsig` — dual-signed release manifest per §6.3
+  (both signature slots PENDING until runner passes complete).
+- `doc/libpdx-argv.pdxdoc` — the `doc libpdx-argv` file per I7.
+- `pkgs/mirror.entry` — pkgs.paideia-os admission entry
+  (consumed once T-INFRA-001 lands in paideia-os).
 
 ## Consumer wiring (M3)
 

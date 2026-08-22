@@ -1,0 +1,20 @@
+# libpdx-argv deps.list
+#
+# Wave:  R49
+# Doc:   design/tooling/r49-r50-plan.md §5.12 in paideia-os.
+#
+# libpdx-argv has NO library dependencies (per §5.12 "libpdx-argv.M1 has
+# no library dependencies (pure userspace)"). Its M3 wire-schema shape
+# is *coordinated* with libpdx-semantic-pipe (`PdxArgvRecord@0.1`) but
+# the alternate-invocation code path in src/schema_invoke.pdx decodes
+# the on-wire record itself; it does not link against libpdx-semantic-
+# pipe symbols.
+#
+# Format (mirrors design/tooling/plan.md §6.4 `deps.list` shape):
+#   <name>  <semver-lo>..<semver-hi>  <link-kind>
+# link-kind is one of: static, dynamic, shape.
+#
+# (No library entries.)
+
+# Toolchain floor (informational; enforced by pkg-install, not link):
+toolchain:paideia-as   >= 0.33-crypto-kdf   build

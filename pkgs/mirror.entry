@@ -1,0 +1,54 @@
+# libpdx-argv 1.0.0 — pkgs.paideia-os mirror index entry
+#
+# This file is the input the pkgs.paideia-os mirror runner reads to
+# admit libpdx-argv 1.0.0 into the mirror. Format matches the
+# `index.pdxsig`-inner-record shape in design/tooling/plan.md §6.3:
+# {name, version, hash, manifest_path, ships}. Populated at 1.0 tag
+# time; consumed by pkgs.paideia-os once T-INFRA-001 (paideia-os
+# meta) lands.
+#
+# Push protocol (from design/tooling/r49-r50-plan.md §5.12 M5):
+#   1. Tag v1.0.0 in this repo (`git tag v1.0.0 && git push --tags`).
+#   2. paideia-as release --sign libpdx-argv-1.0.0 populates
+#      manifest.pdxsig SIGNATURE author block.
+#   3. Push {pkg.tar, manifest.pdxsig, mirror.entry} to
+#      pkgs.paideia-os/main/staging/libpdx-argv/1.0.0/.
+#   4. Mirror runner verifies author sig, applies paideia_root_pk
+#      countersig into manifest.pdxsig SIGNATURE paideia_root, moves
+#      the tuple into main/libpdx-argv/1.0.0/, and appends this
+#      entry (below) into main/index.pdxsig's inner record set.
+#   5. Mirror runner re-signs index.pdxsig with paideia_root_pk.
+#
+# The three PENDING sentinels below are filled in by the mirror
+# runner at admission time; they carry the runner's post-verify
+# hashes, not the pre-sign hashes.
+
+name:            libpdx-argv
+version:         1.0.0
+wave:            R49
+kind:            library
+license:         MIT
+source_tree_root:  a43047a1b114c98a4f763f2cc207006ef39ca7197f8b412216ec54bec6f98792
+pkg_tar_sha256:    PENDING:release-runner
+manifest_sha256:   PENDING:release-runner
+mirror_path:     main/libpdx-argv/1.0.0/
+manifest_path:   main/libpdx-argv/1.0.0/manifest.pdxsig
+pkg_tar_path:    main/libpdx-argv/1.0.0/pkg.tar
+declared_output_schemas:
+  - PdxArgvParsed@0.1
+  - PdxArgvRecord@0.1
+deps:            (none)
+toolchain_floor: paideia-as >= 0.33-crypto-kdf
+ships:
+  src/*.pdx     (8 modules, source-first — pkg-install lowers on
+                 target where the paideia-as v0.33 toolchain lives)
+  caps.decl
+  deps.list
+  doc/libpdx-argv.pdxdoc
+  manifest.pdxsig
+  CHANGELOG.md
+  LICENSE
+  VERSION
+# tests/ is NOT shipped in pkg.tar; it stays in-repo only.
+released:        2026-08-22
+released_by:     paideia-os-team

@@ -1,0 +1,87 @@
+# libpdx-argv v1.0.0 — dual-signed release manifest
+#
+# Format:  paideia-os pkg §6.3 (design/tooling/plan.md).
+# Signer:  paideia-as v0.33-crypto-kdf `release --sign` (ML-DSA-65).
+# Verify:  pkg install / pkg verify (design/user/model.md §11.2).
+#
+# This file is the load-bearing artifact of the 1.0 release. Its two
+# signature blocks bind the payload above to (a) the author key and
+# (b) the paideia_root_pk countersignature applied at admission time
+# by the pkgs.paideia-os mirror. `pkg install --strict` refuses this
+# package while either block carries a PENDING sentinel.
+
+# ---- payload (signed region, everything between "PAYLOAD BEGIN"
+# ---- and "PAYLOAD END" is fed into ml_dsa_65_sign as a single
+# ---- newline-preserved byte stream).
+
+PAYLOAD BEGIN
+manifest_version:  1
+name:              libpdx-argv
+version:           1.0.0
+wave:              R49
+kind:              library
+license:           MIT
+license_sha256:    5d10906e3e9407412fd51592e3dd968251a4797b8ffdcc9e862d8fb1f3925e2b
+repo:              github.com/paideia-os/libpdx-argv
+released:          2026-08-22
+released_by:       paideia-os-team
+source_tree_root:  a43047a1b114c98a4f763f2cc207006ef39ca7197f8b412216ec54bec6f98792
+source_tree_algo:  sha256-of-concat-sorted-source-files
+declared_output_schemas:
+  - PdxArgvParsed@0.1
+  - PdxArgvRecord@0.1
+requires_caps:     (none)
+deps:              (none — pure userspace; see deps.list)
+toolchain_floor:   paideia-as >= 0.33-crypto-kdf
+sources:
+  src/flag_spec.pdx      sha256=24359e7a5113db31d9a93651623cabf955e46b511090158ce7af6f489c8d1dc4  size=8378
+  src/help_backend.pdx   sha256=4e375c1fe530d8ecaa018ab5ce610c1160f139f86e6b1d73caaeb683303cf078  size=4777
+  src/parsed_args.pdx    sha256=a4e4d8c18923b9add889eaf817369d4e631b329761645cf58d0432999e31a1a7  size=6783
+  src/parser.pdx         sha256=fa427d2771f73a99cc5b532876cb18e8d758cd2fe404597900c75c93f3abceee  size=14963
+  src/schema_emit.pdx    sha256=31130ec80713c6988e2b0b0a3ea27ae4a400eb303594846a00d42fd22be7adde  size=7363
+  src/schema_invoke.pdx  sha256=0a83808cac5868ec6d72f02e582b87eba865dced2305fa1a664aecac23ccab70  size=15520
+  src/std_vocab.pdx      sha256=ddafc7a136aeae1d7c0a29a2683438bda8cc7944da7d840816b6d0ca3ce4e004  size=6082
+  src/typed.pdx          sha256=2daf3b31a82566fc33fa2494b1edd35eff938b80603c8d8e73bc91bbe522721f  size=14167
+sidecar_files:
+  caps.decl              sha256=be4cfa8ad2d04d44778c71595566d74b8a92b3218566f7d18a61f7b20f8f0058
+  deps.list              sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  doc/libpdx-argv.pdxdoc sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+milestones_landed:
+  M1-001 #1  scaffold + ParsedArgs struct + long-flag grammar
+  M1-002 #2  short-flag grammar one-per-hyphen (clustered reject)
+  M2-001 #3  typed flag arguments (--older-than 7d, --size > 1MB)
+  M2-002 #4  9-flag standard vocabulary from I3
+  M2-003 #5  positional-argument list handling
+  M3-001 #6  alternate invocation: typed schema record -> ParsedArgs
+  M3-002 #7  --help back-end integration with doc <tool>
+  M3-003 #8  --schema prints tool's declared output schemas
+  M4-001 #9  parse-correctness matrix + clustered-short reject + typed diagnostics + --help RT
+  M5-001 #10 dual-signed release + .pdxdoc + mirror push
+PAYLOAD END
+
+# ---- signatures (each block is <= 4KiB; two blocks always present;
+# ---- pkg install requires BOTH signature slots to verify against
+# ---- the payload byte-stream above under the referenced key.)
+
+SIGNATURE author BEGIN
+key_id:    paideia-os-team@v0.33
+algorithm: ML-DSA-65
+signature: PENDING:paideia-os-team-key@v0.33
+# Populated by `paideia-as release --sign libpdx-argv-1.0.0` on the
+# release-runner host once the paideia-as v0.33-crypto-kdf toolchain
+# and the release-key HSM slot are reachable. The signature bytes
+# replace the PENDING sentinel in place; nothing else in this file
+# changes at signing time.
+SIGNATURE author END
+
+SIGNATURE paideia_root BEGIN
+key_id:    paideia_root_pk@R32-mint
+algorithm: ML-DSA-65
+signature: PENDING:paideia_root_pk@R32-mint
+# Applied at admission time by the pkgs.paideia-os mirror runner
+# (paideia-os meta issue T-INFRA-001). The runner verifies the
+# author signature above and, on success, adds this counter-
+# signature over the same payload byte stream before writing the
+# package into the mirror tree at
+# `pkgs.paideia-os/main/libpdx-argv/1.0.0/manifest.pdxsig`.
+SIGNATURE paideia_root END
