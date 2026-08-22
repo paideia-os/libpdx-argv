@@ -1,0 +1,437 @@
+// tests/parse_typed_values.pdx — libpdx-argv.M4-001
+// Typed value parser matrix — Typed::parse_int_u64, parse_size,
+// parse_timespan (leaf parsers from src/typed.pdx).
+//
+// Each case invokes one Typed::parse_* function on a NUL-terminated
+// .rodata string and checks (ok, val) against expected. Every parser
+// returns rax=ok (1/0), rdx=value; the test caller pulls rdx into r14
+// (callee-preserved) so a comparison after the call still holds.
+//
+// Module id in TestHarness::last_fail_tag: 2
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseTypedValuesTests (PascalCase basename).
+//   - run_* fns are non-leaf (call Typed::parse_* + record_*).
+//   - 1-push (rbx) alignment; r14 spills the returned value across
+//     record_pass (which clobbers rdx).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+
+module ParseTypedValuesTests = structure {
+
+  // -- Fixture bytestrings (all NUL-terminated) --
+  pub let f_int_zero    : [u8; 2]  = "0\0"
+  pub let f_int_42      : [u8; 3]  = "42\0"
+  pub let f_int_empty   : [u8; 1]  = "\0"
+  pub let f_int_bad     : [u8; 3]  = "1a\0"
+
+  pub let f_size_zero   : [u8; 2]  = "0\0"
+  pub let f_size_1k     : [u8; 3]  = "1k\0"
+  pub let f_size_1K     : [u8; 3]  = "1K\0"
+  pub let f_size_2m     : [u8; 3]  = "2m\0"
+  pub let f_size_3g     : [u8; 3]  = "3g\0"
+  pub let f_size_kb_no  : [u8; 4]  = "1kb\0"    // "1kb" is NOT valid at M2
+  pub let f_size_suffix_only : [u8; 2] = "k\0"  // suffix-only rejected
+
+  pub let f_ts_60       : [u8; 3]  = "60\0"
+  pub let f_ts_1s       : [u8; 3]  = "1s\0"
+  pub let f_ts_2m       : [u8; 3]  = "2m\0"
+  pub let f_ts_3h       : [u8; 3]  = "3h\0"
+  pub let f_ts_7d       : [u8; 3]  = "7d\0"
+  pub let f_ts_bad_w    : [u8; 3]  = "1w\0"    // 'w' unsupported at M2
+
+  // ============================================================
+  // case 1  parse_int_u64("0") → (1, 0)
+  // ============================================================
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_int_u64('0') → ok=1, val=0. Spill val to r14 across record_pass because rdx is caller-save. Simplest happy-path smoke — proves parse_int_u64 accepts a single '0' digit and returns 0.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_int_zero];
+        call Typed::parse_int_u64;
+        mov r14, rdx;
+        cmp rax, 1; jne case1_fail;
+        cmp r14, 0; jne case1_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case1_fail:
+        mov rdi, 0x200000001;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 2  parse_int_u64("42") → (1, 42)
+  // ============================================================
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_int_u64('42') → ok=1, val=42. Two-digit accumulator: 4*10 + 2 = 42. Verifies the shl+add multiply-by-10 sequence produces the correct result.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_int_42];
+        call Typed::parse_int_u64;
+        mov r14, rdx;
+        cmp rax, 1; jne case2_fail;
+        cmp r14, 42; jne case2_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case2_fail:
+        mov rdi, 0x200000002;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 3  parse_int_u64("") → (0, 0)  — empty string rejected
+  // ============================================================
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_int_u64('') → ok=0. Empty input (NUL at [0]) fails because digits_seen==0 at NUL. Verifies the digits_seen guard in pi_terminator.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_int_empty];
+        call Typed::parse_int_u64;
+        cmp rax, 0; jne case3_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case3_fail:
+        mov rdi, 0x200000003;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 4  parse_int_u64("1a") → (0, 0)  — non-digit rejected
+  // ============================================================
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_int_u64('1a') → ok=0. Non-digit ('a') after a valid digit ('1') fails at the range-check step (cmp rax, 0x39; jg pi_fail). No partial-parse recovery.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_int_bad];
+        call Typed::parse_int_u64;
+        cmp rax, 0; jne case4_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case4_fail:
+        mov rdi, 0x200000004;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 5  parse_size("0") → (1, 0)
+  // ============================================================
+  pub let run_case5 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('0') → ok=1, bytes=0. Bare mantissa with no suffix → literal bytes. Verifies ps_no_suffix path with mantissa 0 (still valid since digits_seen==1).",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_zero];
+        call Typed::parse_size;
+        mov r14, rdx;
+        cmp rax, 1; jne case5_fail;
+        cmp r14, 0; jne case5_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case5_fail:
+        mov rdi, 0x200000005;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 6  parse_size("1k") → (1, 1024)
+  // ============================================================
+  pub let run_case6 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('1k') → ok=1, bytes=1024. Verifies the 'k' suffix path (shl 10). Cmp against 1024 fits imm32 trivially.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_1k];
+        call Typed::parse_size;
+        mov r14, rdx;
+        cmp rax, 1; jne case6_fail;
+        cmp r14, 1024; jne case6_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case6_fail:
+        mov rdi, 0x200000006;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 7  parse_size("1K") → (1, 1024)  — case-insensitive
+  // ============================================================
+  pub let run_case7 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('1K') → ok=1, bytes=1024. Verifies suffix dispatch accepts both 'k' (0x6B) and 'K' (0x4B) as KiB. Same shift path (shl 10) as case6.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_1K];
+        call Typed::parse_size;
+        mov r14, rdx;
+        cmp rax, 1; jne case7_fail;
+        cmp r14, 1024; jne case7_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case7_fail:
+        mov rdi, 0x200000007;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 8  parse_size("2m") → (1, 2 << 20) = 2097152
+  // ============================================================
+  pub let run_case8 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('2m') → ok=1, bytes=2*1024*1024=2097152. Verifies shl 20 for MiB. Expected value 2097152 fits imm32.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_2m];
+        call Typed::parse_size;
+        mov r14, rdx;
+        cmp rax, 1; jne case8_fail;
+        cmp r14, 2097152; jne case8_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case8_fail:
+        mov rdi, 0x200000008;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 9  parse_size("3g") → (1, 3 << 30) = 3221225472
+  //   3 << 30 = 0xC0000000 = 3221225472, fits in imm32 (unsigned).
+  // ============================================================
+  pub let run_case9 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('3g') → ok=1, bytes=3<<30=3221225472. Verifies shl 30 for GiB. NB: 3<<30 = 0xC0000000, which is > 0x7FFFFFFF; use mov r15, 0xC0000000 (imm32 loads via mov r*d, imm32 zero-extend on x86_64) and cmp r14, r15 (reg-reg).",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;                        // 3 pushes → rsp%16: 8→0
+
+        lea rdi, [rip + f_size_3g];
+        call Typed::parse_size;
+        mov r14, rdx;
+        cmp rax, 1; jne case9_fail;
+        mov r15, 0xC0000000;
+        cmp r14, r15; jne case9_fail;
+
+        call TestHarness::record_pass;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret
+
+      case9_fail:
+        mov rdi, 0x200000009;
+        call TestHarness::record_fail;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // case 10  parse_size("1kb") → (0, 0)  — multi-char suffix M2-invalid
+  // ============================================================
+  pub let run_case10 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('1kb') → ok=0. M2 accepts single-char suffixes only. After consuming '1' then 'k' (jumps to ps_shl_10 → ps_check_terminator), the next byte is 'b' (not NUL) → ps_fail. Verifies the terminator check.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_kb_no];
+        call Typed::parse_size;
+        cmp rax, 0; jne case10_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case10_fail:
+        mov rdi, 0x20000000A;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 11  parse_size("k") → (0, 0)  — suffix without mantissa
+  // ============================================================
+  pub let run_case11 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_size('k') → ok=0. digits_seen==0 at the ps_maybe_suffix branch → jumps to ps_fail. Verifies suffix-only inputs are rejected.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_suffix_only];
+        call Typed::parse_size;
+        cmp rax, 0; jne case11_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case11_fail:
+        mov rdi, 0x20000000B;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 12  parse_timespan("60") → (1, 60)  — bare mantissa = seconds
+  // ============================================================
+  pub let run_case12 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_timespan('60') → ok=1, seconds=60. No suffix → literal seconds. Verifies pt_no_suffix path.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_60];
+        call Typed::parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case12_fail;
+        cmp r14, 60; jne case12_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case12_fail:
+        mov rdi, 0x20000000C;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 13  parse_timespan("1s") → (1, 1)
+  // ============================================================
+  pub let run_case13 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_timespan('1s') → ok=1, seconds=1. Verifies pt_mul_1 (no-op multiplication) suffix path.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_1s];
+        call Typed::parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case13_fail;
+        cmp r14, 1; jne case13_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case13_fail:
+        mov rdi, 0x20000000D;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 14  parse_timespan("2m") → (1, 120)
+  // ============================================================
+  pub let run_case14 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_timespan('2m') → ok=1, seconds=120. Verifies pt_mul_60 sequence (shl 5 + shl 4 + shl 3 + shl 2 accumulate) produces 2*60=120.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_2m];
+        call Typed::parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case14_fail;
+        cmp r14, 120; jne case14_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case14_fail:
+        mov rdi, 0x20000000E;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 15  parse_timespan("3h") → (1, 10800)
+  // ============================================================
+  pub let run_case15 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_timespan('3h') → ok=1, seconds=10800 (3*3600). Verifies pt_mul_3600 shl/add sequence.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_3h];
+        call Typed::parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case15_fail;
+        cmp r14, 10800; jne case15_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case15_fail:
+        mov rdi, 0x20000000F;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 16  parse_timespan("7d") → (1, 604800)
+  //   7*86400 = 604800 fits imm32 (0x93A80).
+  // ============================================================
+  pub let run_case16 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_timespan('7d') → ok=1, seconds=604800 (7*86400). Verifies pt_mul_86400 sequence. Expected fits imm32.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_7d];
+        call Typed::parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case16_fail;
+        cmp r14, 604800; jne case16_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case16_fail:
+        mov rdi, 0x200000010;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case 17  parse_timespan("1w") → (0, 0)  — 'w' unsupported at M2
+  // ============================================================
+  pub let run_case17 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 parse_timespan('1w') → ok=0. 'w' (weeks) is not part of the M2 suffix set {s,m,h,d}. After digit '1' the loop hits 'w' which is not a digit → pt_maybe_suffix; no arm matches → pt_fail. Verifies suffix-set completeness.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_bad_w];
+        call Typed::parse_timespan;
+        cmp rax, 0; jne case17_fail;
+        call TestHarness::record_pass;
+        pop rbx; ret
+      case17_fail:
+        mov rdi, 0x200000011;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+}

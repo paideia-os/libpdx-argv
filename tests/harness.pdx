@@ -1,0 +1,146 @@
+// tests/harness.pdx — libpdx-argv.M4-001
+// Shared test harness: pass/fail tally + fixture-reset helper.
+//
+// Every test module in tests/ writes into the same singleton tally so
+// the driver (tests/smoke_driver.pdx) can report a single final
+// (pass, fail) pair via sys_exit or a diagnostic write.
+//
+// The harness holds no state of its own beyond the counters — each
+// test module owns its .rodata fixtures + .bss argv arrays and
+// prepares them inline. `full_reset` clears ParsedArgs + FlagSpec +
+// SchemaEmit + the harness tally so a driver can invoke it once at
+// _start (or between two independent test batches when investigating
+// a single failure interactively).
+//
+// See design/architecture.md §11 for the M4 test surface + coverage
+// matrix. Upstream: design/tooling/r49-r50-plan.md §5.12 M4-001
+// (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module TestHarness (PascalCase basename).
+//   - record_pass / record_fail are leaf; r11 lea scratch.
+//   - full_reset is non-leaf (calls ParsedArgs::reset + FlagSpec::reset
+//     + SchemaEmit::reset); 1-push prologue (rbx, unused) aligns
+//     rsp%16 to 0 for the three nested calls.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF.
+//   - Byte loads (unused here — pointer/counter qword traffic only).
+
+module TestHarness = structure {
+
+  // Singleton counters. Each test module increments exactly one of
+  // these per test case. The driver reads both at end-of-run and
+  // encodes them into the sys_exit code (low 16 bits = fail count,
+  // next 16 bits = pass count; 0 in low 16 means all-green).
+  pub let mut pass_count : u64 = uninit @align(8)
+  pub let mut fail_count : u64 = uninit @align(8)
+
+  // Last failure marker (test module-id + case number). Set by
+  // record_fail alongside the fail_count++ so an interactive run can
+  // tell WHICH case failed without re-instrumenting every assertion.
+  // Convention: (module_id << 32) | case_number.
+  //   module_id assignments — keep in sync with tests/README.md §3.
+  //     1 = parse_grammar        6 = parse_schema_record
+  //     2 = parse_typed_values   7 = help_backend
+  //     3 = parse_typed_args     8 = schema_emit
+  //     4 = parse_positional     9 = (reserved — parse_mixed)
+  //     5 = parse_vocab
+  pub let mut last_fail_tag : u64 = uninit @align(8)
+
+  // ============================================================
+  // reset_tally()
+  // Signature: () -> () !{mem} @{}
+  // Leaf. Zero the pass/fail counters and clear last_fail_tag. Called
+  // once by the driver at _start.
+  // ============================================================
+  pub let reset_tally : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 TestHarness::reset_tally — zero pass_count / fail_count / last_fail_tag. Leaf; r11 lea scratch; xor rax,rax produces the zero constant.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + pass_count];    mov [r11], rax;
+        lea r11, [rip + fail_count];    mov [r11], rax;
+        lea r11, [rip + last_fail_tag]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================
+  // record_pass()
+  // Signature: () -> () !{mem} @{}
+  // Leaf. Increment pass_count.
+  // ============================================================
+  pub let record_pass : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 TestHarness::record_pass — atomic-free ++ on the singleton pass_count. Tests run sequentially from the driver, so no CAS needed. Leaf; r11 lea scratch; rax scratch for load/add/store.",
+      block: {
+        lea r11, [rip + pass_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================
+  // record_fail(tag)
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = fail tag (module_id << 32 | case_number)
+  // Leaf. Increment fail_count and stash the tag so the driver can
+  // report the last failure. Overwrites any prior last_fail_tag —
+  // callers wanting cumulative failure lists must record them
+  // themselves.
+  // ============================================================
+  pub let record_fail : (u64) -> () !{mem} @{} =
+    fn (tag: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 TestHarness::record_fail — ++fail_count and store the caller-supplied (module_id<<32 | case_number) tag into last_fail_tag. Leaf; r11 lea scratch; rax scratch; rdi passes the tag directly. Overwrite semantics keep the harness free of a growing per-case failure log; interactive debug reruns the driver after gating out prior-passing cases.",
+      block: {
+        lea r11, [rip + fail_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        lea r11, [rip + last_fail_tag];
+        mov [r11], rdi;
+        ret
+      }
+    }
+
+  // ============================================================
+  // full_reset()
+  // Signature: () -> () !{mem} @{}
+  // Non-leaf. Zero ParsedArgs + FlagSpec + SchemaEmit singleton
+  // state so a test can begin from known-clean fixtures. The
+  // harness tally is intentionally NOT reset here — a driver that
+  // wants to zero it calls reset_tally() explicitly.
+  //
+  // Consumer usage (per test case):
+  //   TestHarness::full_reset()
+  //   FlagSpec::register(...)              // per-test registrations
+  //   ...prepare argv...
+  //   let err = Parser::parse_argv(argv, argc)
+  //   ...assert on ParsedArgs...
+  //   TestHarness::record_pass() OR TestHarness::record_fail(tag)
+  //
+  // 1-push prologue (rbx unused; for rsp alignment).
+  // ============================================================
+  pub let full_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 TestHarness::full_reset — sequences ParsedArgs::reset + FlagSpec::reset + SchemaEmit::reset so the next fixture starts from known-clean state. Non-leaf; 1-push (rbx) aligns rsp%16 to 0 for the three nested calls. The tally counters are intentionally not touched — reset_tally is a separate call so tests can advance the tally across multiple full_reset boundaries.",
+      block: {
+        push rbx;
+
+        call ParsedArgs::reset;
+        call FlagSpec::reset;
+        call SchemaEmit::reset;
+
+        pop rbx;
+        ret
+      }
+    }
+}

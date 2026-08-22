@@ -1,10 +1,9 @@
 # libpdx-argv — status
 
 **Wave:** R49 shared library
-**Current milestone:** M3 (semantic-pipe / audit integration) — CLOSED.
-Ready for M4 (parse-correctness matrix + clustered-short-flag rejection
-tests + typed-arg-parse-error diagnostics + --help render round-trip
-via doc).
+**Current milestone:** M4 (tests + smoke) — CLOSED. Ready for M5
+(dual-signed release + .pdxdoc + mirror push; gated on pkg.M4 per
+`design/tooling/r49-r50-plan.md` §5.12).
 
 ## Milestone rollup
 
@@ -18,6 +17,7 @@ via doc).
 | M3-001 (#6)     | alternate invocation: typed schema record -> ParsedArgs            | LANDED |
 | M3-002 (#7)     | --help back-end integration with doc <tool>                        | LANDED |
 | M3-003 (#8)     | --schema prints tool's declared output schemas                     | LANDED |
+| M4-001 (#9)     | parse-correctness matrix + clustered-short + typed diag + --help round-trip | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.12 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
@@ -45,8 +45,9 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
   schema-name table; M3-003).
 - `caps.decl` — libpdx-argv requires no caps of its own; declares the
   `PdxArgvRecord@0.1` wire schema consumed by SchemaInvoke.
-- `tests/` — empty until `libpdx-argv.M4-001` lands the
-  parse-correctness matrix.
+- `tests/` — M4-001 parse-correctness matrix + smoke driver
+  (harness + 8 fixture modules + smoke_driver + README). See
+  `tests/README.md` for the coverage matrix.
 - `.plans/` — per-milestone implementation notes.
 
 ## Consumer wiring (M3)

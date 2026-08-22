@@ -1,0 +1,297 @@
+// tests/parse_typed_args.pdx — libpdx-argv.M4-001
+// Typed flag argument consumption + diagnostic coverage.
+//
+// M2-001 introduced FlagSpec-driven arity: registered typed flags
+// (FKIND_INT/SIZE/TIMESPAN/STR/ENUM) consume argv[i+1] as their value;
+// BOOL/UNKNOWN flags do not. When a typed flag is the last argv entry
+// with no value available, parse_argv sets ERR_MISSING_VALUE (=6).
+//
+// These cases exercise:
+//   1. Typed long-flag consuming argv[i+1] (`--older-than 7d`)
+//   2. Typed short-flag consuming argv[i+1] (`-n 5` where -n is INT)
+//   3. Typed flag with no available value → ERR_MISSING_VALUE
+//   4. Typed short flag with no available value → ERR_MISSING_VALUE
+//   5. Typed flag with inline '=' — parser uses inline value, no
+//      lookahead consumption (fixture: `--older-than=7d`).
+//
+// After each parse, an assertion invokes the appropriate Typed::parse_*
+// on flag_values[k] to verify the value bytestring is decoder-clean.
+//
+// Module id in TestHarness::last_fail_tag: 3
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseTypedArgsTests (PascalCase basename).
+//   - run_* fns non-leaf; 1-push (rbx) prologue.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+
+module ParseTypedArgsTests = structure {
+
+  // FlagSpec name literals (NUL-term).
+  pub let name_older_than : [u8; 11] = "older-than\0"
+  pub let name_n_short    : [u8; 2]  = "n\0"
+
+  // Argv value literals.
+  pub let val_7d          : [u8; 3]  = "7d\0"
+  pub let val_5           : [u8; 2]  = "5\0"
+
+  // Argv assembled forms.
+  pub let f_older_flag    : [u8; 13] = "--older-than\0"
+  pub let f_older_eq      : [u8; 16] = "--older-than=7d\0"
+  pub let f_n_short       : [u8; 3]  = "-n\0"
+
+  // Argv backing arrays.
+  pub let mut argv1 : [u64; 2] = uninit @align(8)
+  pub let mut argv2 : [u64; 1] = uninit @align(8)
+  pub let mut argv3 : [u64; 2] = uninit @align(8)
+  pub let mut argv4 : [u64; 1] = uninit @align(8)
+  pub let mut argv5 : [u64; 1] = uninit @align(8)
+
+  // ============================================================
+  // case1  Typed long consumes lookahead: `--older-than 7d`
+  //   FlagSpec: older-than = FKIND_TIMESPAN(3), id=100
+  //   argv: "--older-than\0", "7d\0"
+  //   Expected: err=0, flag_count=1, id=100, value points at '7d';
+  //             Typed::parse_timespan(value) returns (1, 604800).
+  // ============================================================
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case1 — typed long flag consumes argv[i+1]. Registers older-than as FKIND_TIMESPAN id=100; parses `--older-than 7d`. After parse: id=100 stored, flag_values[k] points at '7d' (which is argv[1] byte-for-byte, no in-place mutation since separator is a space not '='). Additionally invokes Typed::parse_timespan on the stored value to confirm the round-trip encodes 604800.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        call TestHarness::full_reset;
+
+        // FlagSpec::register(name=older-than, kind=FKIND_TIMESPAN=3, id=100)
+        lea rdi, [rip + name_older_than];
+        mov rsi, 3;
+        mov rdx, 100;
+        call FlagSpec::register;
+
+        lea r11, [rip + f_older_flag];
+        lea rbx, [rip + argv1];
+        mov [rbx + 0], r11;
+        lea r11, [rip + val_7d];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + argv1];
+        mov rsi, 2;
+        call Parser::parse_argv;
+        cmp rax, 0; jne case1_fail;
+
+        mov rdi, 100;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32; je case1_fail;
+
+        // value ptr = flag_values[rax] — check first byte is '7'
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0; je case1_fail;
+        mov r15, rdx;                         // preserve value ptr
+
+        // Round-trip: Typed::parse_timespan(value) → (1, 604800)
+        mov rdi, r15;
+        call Typed::parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case1_fail;
+        cmp r14, 604800; jne case1_fail;
+
+        call TestHarness::record_pass;
+        add rsp, 8; pop r15; pop rbx; ret
+
+      case1_fail:
+        mov rdi, 0x300000001;
+        call TestHarness::record_fail;
+        add rsp, 8; pop r15; pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case2  Typed long, no lookahead available: `--older-than`
+  //   Expected: err=ERR_MISSING_VALUE (=6).
+  // ============================================================
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case2 — typed long flag at end of argv → ERR_MISSING_VALUE. Registers older-than as FKIND_TIMESPAN; argv has just `--older-than\\0`. Parser detects no argv[i+1] and sets error_code=6.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + name_older_than];
+        mov rsi, 3;
+        mov rdx, 100;
+        call FlagSpec::register;
+
+        lea r11, [rip + f_older_flag];
+        lea rbx, [rip + argv2];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + argv2];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 6; jne case2_fail;         // ERR_MISSING_VALUE
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      case2_fail:
+        mov rdi, 0x300000002;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case3  Typed long, inline '=' — no lookahead consumption.
+  //   FlagSpec: older-than = FKIND_TIMESPAN(3), id=100
+  //   argv: "--older-than=7d\0"
+  //   Expected: err=0, flag_count=1, id=100, value='7d'.
+  // ============================================================
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case3 — inline '=' skips lookahead. Fixture: `--older-than=7d`. Parser walks name up to '=', writes NUL, sets r14 to value pointer, then when reaching lookup it sees r14!=0 and jumps to store WITHOUT consuming argv[i+1]. Since argc=1 no lookahead is available anyway — but the deliberate skip is what makes single-arg inline form work.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + name_older_than];
+        mov rsi, 3;
+        mov rdx, 100;
+        call FlagSpec::register;
+
+        lea r11, [rip + f_older_eq];
+        lea rbx, [rip + argv5];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + argv5];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0; jne case3_fail;
+
+        mov rdi, 100;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32; je case3_fail;
+
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0; je case3_fail;
+        mov r15, rdx;
+
+        mov rdi, r15;
+        call Typed::parse_timespan;
+        cmp rax, 1; jne case3_fail;
+
+        call TestHarness::record_pass;
+        add rsp, 8; pop r15; pop rbx; ret
+
+      case3_fail:
+        mov rdi, 0x300000003;
+        call TestHarness::record_fail;
+        add rsp, 8; pop r15; pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case4  Typed short consumes lookahead: `-n 5`
+  //   FlagSpec: n = FKIND_INT(2), id=101
+  //   argv: "-n\0", "5\0"
+  //   Expected: err=0, flag_count=1, id=101, value='5';
+  //             Typed::parse_int_u64 returns (1, 5).
+  // ============================================================
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case4 — typed short flag consumes lookahead. Registers 'n' as FKIND_INT id=101; parses `-n 5`. Parser's short-flag branch calls FlagSpec::lookup on 'n', sees kind=INT, consumes argv[i+1]='5' as value. Round-trip parse_int_u64 → 5.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + name_n_short];
+        mov rsi, 2;                          // FKIND_INT
+        mov rdx, 101;
+        call FlagSpec::register;
+
+        lea r11, [rip + f_n_short];
+        lea rbx, [rip + argv3];
+        mov [rbx + 0], r11;
+        lea r11, [rip + val_5];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + argv3];
+        mov rsi, 2;
+        call Parser::parse_argv;
+        cmp rax, 0; jne case4_fail;
+
+        mov rdi, 101;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32; je case4_fail;
+
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0; je case4_fail;
+        mov r15, rdx;
+
+        mov rdi, r15;
+        call Typed::parse_int_u64;
+        mov r14, rdx;
+        cmp rax, 1; jne case4_fail;
+        cmp r14, 5; jne case4_fail;
+
+        call TestHarness::record_pass;
+        add rsp, 8; pop r15; pop rbx; ret
+
+      case4_fail:
+        mov rdi, 0x300000004;
+        call TestHarness::record_fail;
+        add rsp, 8; pop r15; pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case5  Typed short at end of argv → ERR_MISSING_VALUE
+  // ============================================================
+  pub let run_case5 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case5 — typed short flag at end of argv → ERR_MISSING_VALUE. Same pattern as case2 but on the short-flag branch. Registers 'n' as FKIND_INT; argv has just `-n\\0`. Parser sees typed kind, computes i+1=1 >= argc=1, jumps to parse_argv_missing_value.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + name_n_short];
+        mov rsi, 2;
+        mov rdx, 101;
+        call FlagSpec::register;
+
+        lea r11, [rip + f_n_short];
+        lea rbx, [rip + argv4];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + argv4];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 6; jne case5_fail;         // ERR_MISSING_VALUE
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      case5_fail:
+        mov rdi, 0x300000005;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+}

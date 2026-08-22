@@ -612,3 +612,105 @@ compare `schema_count` against their intended count after the batch.
   bump.
 - Per-string-terminator validation on the schema record — M4-001
   test-matrix line.
+
+---
+
+## 11. M4 additions (parse-correctness matrix + smoke driver)
+
+M4 lands a self-contained test tree under `tests/` that exercises
+every public entry the library shipped through M3. Nothing about the
+library's own API changes at M4 — the addition is fixtures + a
+driver that packages the tally into a smoke exit code.
+
+### 11.1 Test-harness shape
+
+`tests/harness.pdx` — module `TestHarness`. Public surface:
+
+| symbol | kind | purpose |
+|--------|------|---------|
+| `pass_count`      | `.bss u64` | incremented by every green case |
+| `fail_count`      | `.bss u64` | incremented by every red case |
+| `last_fail_tag`   | `.bss u64` | `(module_id<<32) \| case_number` of the last failure |
+| `reset_tally()`   | leaf       | zero all three counters |
+| `record_pass()`   | leaf       | `pass_count++` |
+| `record_fail(tag)`| leaf       | `fail_count++`, `last_fail_tag = tag` |
+| `full_reset()`    | non-leaf   | zero `ParsedArgs` + `FlagSpec` + `SchemaEmit` singletons |
+
+The singleton pattern mirrors the library — the caller-owned
+`ParsedArgs*` variant referenced in §3 is a post-M5 concern, and
+until it lands the harness must reset the same singletons every
+test writes into.
+
+### 11.2 Module-id table
+
+Every fixture module owns a module-id used in the `last_fail_tag`
+encoding. IDs 1–9 are reserved so future test additions do not
+reshuffle case numbers.
+
+| ID | Module (file)                            | Cases (M4-001) |
+|----|------------------------------------------|:--:|
+| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 12 |
+| 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 17 |
+| 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
+| 4  | *reserved* (parse_positional_ext)         | —  |
+| 5  | `ParseStdVocabTests` (parse_std_vocab.pdx) | 2  |
+| 6  | `ParseSchemaRecordTests` (parse_schema_record.pdx) | 6  |
+| 7  | `HelpBackendTests` (help_backend.pdx)     | 3  |
+| 8  | `SchemaEmitTests` (schema_emit.pdx)       | 5  |
+| 9  | *reserved* (parse_mixed_ext)              | —  |
+
+Fail-tag encoding: `(module_id << 32) | case_number`. All tag values
+are ≥ 2³², forcing the `mov reg, imm64` encoder path — this is
+deliberate so a smoke run also exercises the R48 imm64 sweep.
+
+### 11.3 Wire-form fixture rationale
+
+`parse_schema_record.pdx` hand-codes 65-byte / 32-byte / 16-byte
+`.rodata` records against the layout in §10.1 (magic + version +
+counts + flag/positional offsets + string table). This is deliberate:
+
+- The test IS the layout pin — any offset drift in `SchemaInvoke`
+  breaks the smoke, which is the correct signal for a coordinated
+  `PdxArgvRecord@0.1` schema-fingerprint negotiation with
+  libpdx-semantic-pipe M2.
+- Rejection cases (bad magic, bad version, short header, oversize
+  count, body-fits fail) cover the five ERR_SCHEMA_* diagnostic
+  paths declared in §10.1.
+
+The happy-path fixture (case1) also drives the alt-invocation
+find_flag_by_id contract: after `SchemaInvoke::parse_from_schema_
+record`, a `--help` stored via the schema-record path is discoverable
+by `ParsedArgs::find_flag_by_id(STD_ID_HELP)` — identical semantics
+to the argv path (see §10.1 postconditions).
+
+### 11.4 Smoke-driver exit code
+
+`tests/smoke_driver.pdx` — `SmokeDriver::_start`:
+
+1. `TestHarness::reset_tally()` — zero counters.
+2. Call every `run_case*` in module order (no reordering — driver
+   order matches tests/README.md).
+3. Pack `(pass_count << 16) | fail_count` and hand to
+   `SysExit::exit(code)`.
+
+`SysExit::exit` is a link-time symbol; the smoke-binary wiring layer
+supplies the actual syscall bridge (analogous to
+`src/user/syscall_shim.pdx` in paideia-os). libpdx-argv itself
+holds no caps and cannot syscall — the driver's job is to package
+the tally; the wiring's job is to hand it out.
+
+A shell wrapper (analogous to `tools/verify-user-tokenizer.sh` in
+paideia-os) that assembles + boots + interprets the exit code lands
+with `pkg.M4` — see the M4→M5 dependency chain in
+`design/tooling/r49-r50-plan.md` §5.12.
+
+### 11.5 What M4 explicitly does not do
+
+- `--help` output byte-diff against a golden `.pdxdoc` render — needs
+  `doc.M2` runnable; libpdx-argv's obligation stops at the argv-
+  synthesis contract (verified in `help_backend.pdx`).
+- Property-based / fuzz driver — M5+; needs pkg wiring.
+- Concurrent multi-parse — M2/M3 ParsedArgs is singleton-scoped.
+- MAX_POS / MAX_FLAGS overflow tests — 32-slot cap is heavily
+  overprovisioned for every observed P0 tool (max 12 flags + 4 pos
+  in `pkg install`); a dedicated stress test is a M4+ stretch.

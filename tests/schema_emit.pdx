@@ -1,0 +1,226 @@
+// tests/schema_emit.pdx — libpdx-argv.M4-001
+// SchemaEmit register/get/reset + SCHEMA_MAX cap.
+//
+// M3-003 landed a 4-call storage-only table for `--schema` emission.
+// These tests exercise the table lifecycle:
+//   1. Empty after reset → count=0, get_name(0)=0.
+//   2. Register then read: count=2, get_name(0)=A, get_name(1)=B.
+//   3. Over-registration silently drops past SCHEMA_MAX=8.
+//   4. get_name out-of-range returns 0.
+//   5. reset() re-zeros count, forgets prior registrations.
+//
+// Module id in TestHarness::last_fail_tag: 8
+//
+// paideia-as compliance
+// ---------------------
+//   - Module SchemaEmitTests (PascalCase basename).
+//   - run_* fns non-leaf; 1-push (rbx) prologue.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+
+module SchemaEmitTests = structure {
+
+  // Sample schema-name literals (NUL-term). Consumers would supply
+  // real-shape names like "PackageManifest@0.1\0"; here we only need
+  // distinct .rodata pointers (SchemaEmit stores raw pointers and
+  // does not dereference them), so single-letter names suffice.
+  pub let sch_a : [u8; 2] = "A\0"
+  pub let sch_b : [u8; 2] = "B\0"
+  pub let sch_c : [u8; 2] = "C\0"
+  pub let sch_d : [u8; 2] = "D\0"
+  pub let sch_e : [u8; 2] = "E\0"
+  pub let sch_f : [u8; 2] = "F\0"
+  pub let sch_g : [u8; 2] = "G\0"
+  pub let sch_h : [u8; 2] = "H\0"
+  pub let sch_i : [u8; 2] = "I\0"    // 9th — dropped past SCHEMA_MAX
+
+  // ============================================================
+  // case1  Empty after reset: count=0, get_name(0)=0.
+  // ============================================================
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 SchemaEmit case1 — empty-after-reset invariant. reset() zeros schema_count; get_count() returns 0; get_name(0) returns 0 (out-of-range because idx >= count).",
+      block: {
+        push rbx;
+
+        call SchemaEmit::reset;
+
+        call SchemaEmit::get_count;
+        cmp rax, 0; jne se1_fail;
+
+        mov rdi, 0;
+        call SchemaEmit::get_name;
+        cmp rax, 0; jne se1_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      se1_fail:
+        mov rdi, 0x800000001;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case2  Register two → count=2, get_name(0)=A, get_name(1)=B.
+  // ============================================================
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 SchemaEmit case2 — register-then-read. Register A + B; count=2; get_name(0) returns &sch_a; get_name(1) returns &sch_b. Uses r15 to preserve expected pointers across the get_name call.",
+      block: {
+        push rbx;
+        push r15;
+
+        call SchemaEmit::reset;
+
+        lea rdi, [rip + sch_a];
+        call SchemaEmit::register;
+
+        lea rdi, [rip + sch_b];
+        call SchemaEmit::register;
+
+        call SchemaEmit::get_count;
+        cmp rax, 2; jne se2_fail;
+
+        mov rdi, 0;
+        call SchemaEmit::get_name;
+        lea r15, [rip + sch_a];
+        cmp rax, r15; jne se2_fail;
+
+        mov rdi, 1;
+        call SchemaEmit::get_name;
+        lea r15, [rip + sch_b];
+        cmp rax, r15; jne se2_fail;
+
+        call TestHarness::record_pass;
+        pop r15; pop rbx; ret
+
+      se2_fail:
+        mov rdi, 0x800000002;
+        call TestHarness::record_fail;
+        pop r15; pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case3  Over-registration drops past SCHEMA_MAX (=8).
+  //   Register nine names; expect count=8 (not 9).
+  // ============================================================
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 SchemaEmit case3 — SCHEMA_MAX enforcement. Register 9 names in sequence; count clamps at 8. Verifies the `cmp rax, 8; jge schema_emit_register_full` guard in SchemaEmit::register. Consumers wanting overflow detection compare count against their call count after the batch (this test is exactly that pattern).",
+      block: {
+        push rbx;
+
+        call SchemaEmit::reset;
+
+        lea rdi, [rip + sch_a]; call SchemaEmit::register;
+        lea rdi, [rip + sch_b]; call SchemaEmit::register;
+        lea rdi, [rip + sch_c]; call SchemaEmit::register;
+        lea rdi, [rip + sch_d]; call SchemaEmit::register;
+        lea rdi, [rip + sch_e]; call SchemaEmit::register;
+        lea rdi, [rip + sch_f]; call SchemaEmit::register;
+        lea rdi, [rip + sch_g]; call SchemaEmit::register;
+        lea rdi, [rip + sch_h]; call SchemaEmit::register;
+        lea rdi, [rip + sch_i]; call SchemaEmit::register;  // dropped
+
+        call SchemaEmit::get_count;
+        cmp rax, 8; jne se3_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      se3_fail:
+        mov rdi, 0x800000003;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case4  get_name out-of-range returns 0.
+  //   Register 1; get_name(1) (idx == count) → 0.
+  //   Register 1; get_name(7) (idx >> count, still < SCHEMA_MAX) → 0.
+  //   Register 1; get_name(99) (idx > SCHEMA_MAX) → 0.
+  // ============================================================
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 SchemaEmit case4 — get_name out-of-range returns 0. Three sub-checks: idx==count (boundary), idx<SCHEMA_MAX but > count, idx>SCHEMA_MAX. The guard is `cmp rdi, rax; jge schema_emit_get_name_oor` so all three paths converge on the OOR arm.",
+      block: {
+        push rbx;
+
+        call SchemaEmit::reset;
+        lea rdi, [rip + sch_a];
+        call SchemaEmit::register;
+
+        // count=1; idx=1 is OOR
+        mov rdi, 1;
+        call SchemaEmit::get_name;
+        cmp rax, 0; jne se4_fail;
+
+        // idx=7 (< SCHEMA_MAX=8, but > count=1) OOR
+        mov rdi, 7;
+        call SchemaEmit::get_name;
+        cmp rax, 0; jne se4_fail;
+
+        // idx=99 (> SCHEMA_MAX) OOR
+        mov rdi, 99;
+        call SchemaEmit::get_name;
+        cmp rax, 0; jne se4_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      se4_fail:
+        mov rdi, 0x800000004;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case5  reset forgets prior registrations.
+  //   Register 3; reset; count=0; register 1; count=1; get_name(0) = new.
+  // ============================================================
+  pub let run_case5 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 SchemaEmit case5 — reset semantics. After N registrations then reset(), get_count returns 0; the next register writes at slot 0; get_name(0) returns that new pointer. Verifies reset actually zeros schema_count (and consumers can therefore re-run their startup sequence idempotently).",
+      block: {
+        push rbx;
+        push r15;
+
+        call SchemaEmit::reset;
+        lea rdi, [rip + sch_a]; call SchemaEmit::register;
+        lea rdi, [rip + sch_b]; call SchemaEmit::register;
+        lea rdi, [rip + sch_c]; call SchemaEmit::register;
+
+        call SchemaEmit::reset;
+        call SchemaEmit::get_count;
+        cmp rax, 0; jne se5_fail;
+
+        lea rdi, [rip + sch_d];
+        call SchemaEmit::register;
+
+        call SchemaEmit::get_count;
+        cmp rax, 1; jne se5_fail;
+
+        mov rdi, 0;
+        call SchemaEmit::get_name;
+        lea r15, [rip + sch_d];
+        cmp rax, r15; jne se5_fail;
+
+        call TestHarness::record_pass;
+        pop r15; pop rbx; ret
+
+      se5_fail:
+        mov rdi, 0x800000005;
+        call TestHarness::record_fail;
+        pop r15; pop rbx; ret
+      }
+    }
+}

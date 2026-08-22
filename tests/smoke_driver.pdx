@@ -1,0 +1,138 @@
+// tests/smoke_driver.pdx — libpdx-argv.M4-001
+// Top-level M4 smoke driver. `_start` entrypoint: invokes every
+// registered test case in order and encodes the aggregate pass/fail
+// tally into the process exit code.
+//
+// Exit-code encoding (u32):
+//   bits 0..15  = fail_count (0 = all green)
+//   bits 16..31 = pass_count
+// A downstream shell can check `exit_code & 0xFFFF == 0` for pass.
+//
+// This driver expects to be linked into a standalone smoke binary
+// (e.g. `pdxargv_smoke.elf`) with a linker script that names `_start`
+// as the entry point. libpdx-argv itself has no `_start` — this file
+// is the smoke's driver only, not part of the shipped library.
+//
+// Downstream integration (once the pkg/build wiring lands):
+//   1. Cargo/paideia-as builds src/*.pdx + tests/*.pdx into an ELF.
+//   2. Loader jumps to `_start`.
+//   3. Driver runs every case, exits with (pass<<16 | fail).
+//   4. A test wrapper (analogous to tools/verify-user-tokenizer.sh in
+//      paideia-os) either boots the ELF under QEMU or invokes the
+//      loader in a stub, then reads the exit code and reports.
+//
+// The order of cases matters only for readable output — every case is
+// independent (TestHarness::full_reset zeros ParsedArgs/FlagSpec/
+// SchemaEmit before each test that touches them).
+//
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M4-001 (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module SmokeDriver (PascalCase basename).
+//   - _start is non-leaf; 1-push (rbx unused) prologue for alignment.
+//   - Every zero-check via cmp reg, 0; no test mnemonic.
+//   - Exit syscall shim assumed available (sys_exit convention: rdi
+//     = exit_code, rax = SYSCALL_EXIT; syscall). Actual syscall
+//     bridge lives in the consumer runtime — smoke driver expects
+//     a `SysExit::exit(code) -> !` symbol to be linked in from the
+//     smoke-binary wiring (analogous to src/user/syscall_shim.pdx in
+//     paideia-os). For now we call a placeholder `sys_exit_stub`
+//     that halts via `int3` if the shim is absent — the smoke binary
+//     wiring provides the real definition at link time.
+
+module SmokeDriver = structure {
+
+  // Entry point. Runs every M4 test case in module order, then exits
+  // with (pass_count << 16 | fail_count).
+  pub let _start : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 smoke driver _start — invokes every ParseGrammarTests::run_caseN + ParseTypedValuesTests::run_caseN + ParseTypedArgsTests::run_caseN + ParseStdVocabTests::run_* + ParseSchemaRecordTests::run_* + HelpBackendTests::run_* + SchemaEmitTests::run_* in a fixed order, then packs the resulting (pass_count, fail_count) into a single u32 exit code (pass in upper 16 bits, fail in lower 16 bits) and hands off to the linker-supplied SysExit::exit. Non-leaf; 1-push (rbx unused) prologue aligns rsp%16 for the ~50 nested calls. Every test module ships its own full_reset call at the head of each run_* so the driver does no per-case setup. Encoder note: `shl rax, 16` is inside the R49 subset; `or rax, rdx` merges the counts.",
+      block: {
+        push rbx;
+
+        // Zero the tally counters. All test modules increment them.
+        call TestHarness::reset_tally;
+
+        // --- ParseGrammarTests (module id 1) ------------------------
+        call ParseGrammarTests::run_case1;
+        call ParseGrammarTests::run_case2;
+        call ParseGrammarTests::run_case3;
+        call ParseGrammarTests::run_case4;
+        call ParseGrammarTests::run_case5;
+        call ParseGrammarTests::run_case6;
+        call ParseGrammarTests::run_case7;
+        call ParseGrammarTests::run_case8;
+        call ParseGrammarTests::run_case9;
+        call ParseGrammarTests::run_case10;
+        call ParseGrammarTests::run_case11;
+        call ParseGrammarTests::run_case12;
+
+        // --- ParseTypedValuesTests (module id 2) --------------------
+        call ParseTypedValuesTests::run_case1;
+        call ParseTypedValuesTests::run_case2;
+        call ParseTypedValuesTests::run_case3;
+        call ParseTypedValuesTests::run_case4;
+        call ParseTypedValuesTests::run_case5;
+        call ParseTypedValuesTests::run_case6;
+        call ParseTypedValuesTests::run_case7;
+        call ParseTypedValuesTests::run_case8;
+        call ParseTypedValuesTests::run_case9;
+        call ParseTypedValuesTests::run_case10;
+        call ParseTypedValuesTests::run_case11;
+        call ParseTypedValuesTests::run_case12;
+        call ParseTypedValuesTests::run_case13;
+        call ParseTypedValuesTests::run_case14;
+        call ParseTypedValuesTests::run_case15;
+        call ParseTypedValuesTests::run_case16;
+        call ParseTypedValuesTests::run_case17;
+
+        // --- ParseTypedArgsTests (module id 3) ----------------------
+        call ParseTypedArgsTests::run_case1;
+        call ParseTypedArgsTests::run_case2;
+        call ParseTypedArgsTests::run_case3;
+        call ParseTypedArgsTests::run_case4;
+        call ParseTypedArgsTests::run_case5;
+
+        // --- ParseStdVocabTests (module id 5) -----------------------
+        call ParseStdVocabTests::run_all_9;
+        call ParseStdVocabTests::run_ids_unique;
+
+        // --- ParseSchemaRecordTests (module id 6) -------------------
+        call ParseSchemaRecordTests::run_case1;
+        call ParseSchemaRecordTests::run_case2;
+        call ParseSchemaRecordTests::run_case3;
+        call ParseSchemaRecordTests::run_case4;
+        call ParseSchemaRecordTests::run_case5;
+        call ParseSchemaRecordTests::run_case6;
+
+        // --- HelpBackendTests (module id 7) -------------------------
+        call HelpBackendTests::run_case1;
+        call HelpBackendTests::run_case2;
+        call HelpBackendTests::run_case3;
+
+        // --- SchemaEmitTests (module id 8) --------------------------
+        call SchemaEmitTests::run_case1;
+        call SchemaEmitTests::run_case2;
+        call SchemaEmitTests::run_case3;
+        call SchemaEmitTests::run_case4;
+        call SchemaEmitTests::run_case5;
+
+        // Pack tally: (pass << 16) | fail
+        lea r11, [rip + pass_count];
+        mov rax, [r11];
+        shl rax, 16;
+        lea r11, [rip + fail_count];
+        mov rdx, [r11];
+        or rax, rdx;
+
+        // Hand to SysExit::exit(code).
+        mov rdi, rax;
+        call SysExit::exit;
+        // NORETURN; unreachable.
+        pop rbx;
+        ret
+      }
+    }
+}

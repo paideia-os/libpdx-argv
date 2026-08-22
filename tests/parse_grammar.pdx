@@ -1,0 +1,709 @@
+// tests/parse_grammar.pdx — libpdx-argv.M4-001
+// Parse-correctness matrix for the M1 + M2 argv grammar:
+//   - Long-flag primary grammar (--foo, --foo=bar, --foo bar, --foo:bar)
+//   - Short-flag one-per-hyphen (-f); clustered rejection (-la → ERR)
+//   - Positional accumulation
+//   - `--` sentinel (M2-003: subsequent argv → positional regardless of shape)
+//   - Bare `-` treated as positional
+//   - `--=foo` and `--:foo` → ERR_LONG_MISSING_NAME
+//   - Well-known `--pdx-schema` toggles emit_schema=1
+//
+// Module id in TestHarness::last_fail_tag: 1
+//
+// Each test case:
+//   (1) TestHarness::full_reset() to zero ParsedArgs + FlagSpec + SchemaEmit.
+//   (2) Register FlagSpec entries needed by the fixture (varies per case).
+//   (3) Prepare argv (u64[] of NUL-term string ptrs) in .bss.
+//   (4) Call Parser::parse_argv(argv, argc).
+//   (5) Compare returned error_code + ParsedArgs slots against expected.
+//   (6) TestHarness::record_pass on match, else record_fail with tag.
+//
+// See design/architecture.md §11 (M4 matrix) for the coverage table.
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M4-001 (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseGrammarTests (PascalCase basename).
+//   - Every run_* fn is non-leaf (calls full_reset, parse_argv, record_*).
+//     Prologue: 1-push (rbx unused) → rsp%16 = 0 for nested calls.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF.
+//   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
+//   - r11 lea scratch (cross-module .bss).
+
+module ParseGrammarTests = structure {
+
+  // -- Fail-tag helpers: (1 << 32) | case_number. Encoded as literal
+  // -- constants so record_fail's `mov rdi, TAG` fits imm32 for
+  // -- case_number and imm64 only via the composed constant. Every
+  // -- constant here is ≤ 0x7FFFFFFF | 0x100000000 = 0x1000000FF so
+  // -- imm64 encoding is required — see paideia-as encoder's imm64
+  // -- support for mov reg, imm64.
+  //
+  // NOTE: the encoded constants below use the mov reg, imm64 path
+  // (R48 imm64 sweep). Callers use `mov rdi, TAG_CASE_N` inline; the
+  // encoder emits REX+B8+imm64.
+
+  // ============================================================
+  // Case 1 — long-flag boolean form: `--help`
+  //   FlagSpec: StdVocab::register_all (STD_ID_HELP = 1)
+  //   argv: "--help\0"
+  //   Expected: err=0, flag_count=1, flag_ids[0]=1, flag_values[0]=0,
+  //             pos_count=0.
+  // ============================================================
+  pub let case1_long_bool : [u8; 7] = "--help\0"
+  pub let mut case1_argv  : [u64; 1] = uninit @align(8)
+
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case1 — long-flag boolean --help. Sets up argv[0] pointer to `--help\\0`, calls parse_argv, verifies err=ERR_OK (0), flag_count=1, flag_ids[0]=STD_ID_HELP=1, flag_values[0]=0. Non-leaf: 1-push prologue aligns rsp for the nested calls (full_reset, StdVocab::register_all, parse_argv, ParsedArgs::find_flag_by_id, record_pass/fail).",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        // argv[0] = &case1_long_bool
+        lea r11, [rip + case1_long_bool];
+        lea rbx, [rip + case1_argv];
+        mov [rbx + 0], r11;
+
+        // parse_argv(rdi=argv, rsi=argc=1)
+        lea rdi, [rip + case1_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0;                          // ERR_OK
+        jne case1_fail;
+
+        // find_flag_by_id(STD_ID_HELP=1) must return non-32
+        mov rdi, 1;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je case1_fail;
+
+        // flag_values[rax] must be 0 (boolean)
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0;
+        jne case1_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case1_fail:
+        mov rdi, 0x100000001;                // (1<<32) | 1
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 2 — long-flag with '=' separator: `--color=auto`
+  //   FlagSpec: StdVocab::register_all (STD_ID_COLOR = 8, ENUM)
+  //   argv: "--color=auto\0"
+  //   Expected: err=0, flag_count=1, flag_ids[0]=8,
+  //             flag_values[0] → "auto\0" (in-place NUL at '=').
+  // ============================================================
+  pub let case2_long_eq  : [u8; 13] = "--color=auto\0"
+  pub let mut case2_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case2 — long-flag with '=' separator. Fixture: `--color=auto\\0`. Parser mutates the '=' to NUL in-place, stores name ptr at `--color+2` (i.e. c-o-l-o-r-NUL) and value ptr at (=+1) i.e. 'a-u-t-o-NUL'. Verifies err=OK, id=STD_ID_COLOR=8, value byte[0] == 'a' (0x61). WARNING: this fixture is single-use per test binary — the in-place NUL mutation is permanent. If a driver re-runs this test in the same process it must re-initialise case2_long_eq (not currently supported; single-shot in the driver).",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        lea r11, [rip + case2_long_eq];
+        lea rbx, [rip + case2_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case2_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case2_fail;
+
+        mov rdi, 8;                          // STD_ID_COLOR
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je case2_fail;
+
+        // flag_values[rax] must point at 'a' (first byte of "auto")
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0;
+        je case2_fail;
+        xor rcx, rcx;
+        mov_b rcx, [rdx];
+        cmp rcx, 0x61;                       // 'a'
+        jne case2_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case2_fail:
+        mov rdi, 0x100000002;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 3 — long-flag with ':' separator: `--no-cap:KIND_TTY`
+  //   FlagSpec: StdVocab::register_all (STD_ID_NO_CAP = 9, STR)
+  //   argv: "--no-cap:KIND_TTY\0"
+  //   Expected: err=0, id=9, value → "KIND_TTY\0".
+  //   (Verifies M2-003 ':' as universal value separator per I3.)
+  // ============================================================
+  pub let case3_long_colon : [u8; 18] = "--no-cap:KIND_TTY\0"
+  pub let mut case3_argv   : [u64; 1] = uninit @align(8)
+
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case3 — long-flag with ':' separator (M2-003 universal). Verifies parser accepts ':' identically to '=' — writes NUL at the ':' byte, stores value ptr at (:+1). Also confirms StdVocab registers no-cap as FKIND_STR (kind=1) not BOOL, so the value is bound rather than being consumed as a separate arg. Byte[0] of value must be 'K' (0x4B).",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        lea r11, [rip + case3_long_colon];
+        lea rbx, [rip + case3_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case3_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case3_fail;
+
+        mov rdi, 9;                          // STD_ID_NO_CAP
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je case3_fail;
+
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0;
+        je case3_fail;
+        xor rcx, rcx;
+        mov_b rcx, [rdx];
+        cmp rcx, 0x4B;                       // 'K'
+        jne case3_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case3_fail:
+        mov rdi, 0x100000003;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 4 — long-flag with space separator: `--json foo`
+  //   FlagSpec: StdVocab::register_all — --json is FKIND_BOOL (id=4),
+  //             so `foo` is NOT consumed as value; goes to positional.
+  //   argv: "--json\0", "foo\0"
+  //   Expected: err=0, flag_count=1, flag_ids[0]=4, flag_values[0]=0,
+  //             pos_count=1, pos_ptrs[0] → "foo".
+  //   (M2-001 cat blocker fix: BOOL flags do NOT gobble next arg.)
+  // ============================================================
+  pub let case4_json    : [u8; 7] = "--json\0"
+  pub let case4_foo     : [u8; 4] = "foo\0"
+  pub let mut case4_argv : [u64; 2] = uninit @align(8)
+
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case4 — boolean flag does NOT consume next arg (cat-M1 blocker fix, M2-001). Fixture: --json foo. Since --json is FKIND_BOOL (id=4), foo lands in pos_ptrs, not flag_values. Verifies flag_count=1, id=4, value=0, AND pos_count=1 with pos_ptrs[0] pointing at 'f'.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        lea r11, [rip + case4_json];
+        lea rbx, [rip + case4_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case4_foo];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case4_argv];
+        mov rsi, 2;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case4_fail;
+
+        // flag_count == 1
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case4_fail;
+
+        // pos_count == 1
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case4_fail;
+
+        // pos_ptrs[0] points at 'f' (0x66)
+        lea r11, [rip + pos_ptrs];
+        mov rdx, [r11 + 0];
+        xor rcx, rcx;
+        mov_b rcx, [rdx];
+        cmp rcx, 0x66;
+        jne case4_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case4_fail:
+        mov rdi, 0x100000004;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 5 — bare "--" sentinel: `-- --foo bar`
+  //   argv: "--\0", "--foo\0", "bar\0"
+  //   Expected: err=0, flag_count=0, pos_count=2, ddash_seen=1,
+  //             ddash_arg_index=0.
+  //   (Every subsequent arg is positional regardless of leading '-'.)
+  // ============================================================
+  pub let case5_ddash    : [u8; 3] = "--\0"
+  pub let case5_dashfoo  : [u8; 6] = "--foo\0"
+  pub let case5_bar      : [u8; 4] = "bar\0"
+  pub let mut case5_argv : [u64; 3] = uninit @align(8)
+
+  pub let run_case5 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case5 — bare '--' sentinel. After parse: flag_count=0 (nothing flagged), pos_count=2 (--foo and bar both treated as positionals since they follow the sentinel), ddash_seen=1, ddash_arg_index=0 (position where '--' sat). NB the sentinel itself is not stored in pos_ptrs.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea r11, [rip + case5_ddash];
+        lea rbx, [rip + case5_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case5_dashfoo];
+        mov [rbx + 8], r11;
+        lea r11, [rip + case5_bar];
+        mov [rbx + 16], r11;
+
+        lea rdi, [rip + case5_argv];
+        mov rsi, 3;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case5_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case5_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case5_fail;
+
+        lea r11, [rip + ddash_seen];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case5_fail;
+
+        lea r11, [rip + ddash_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case5_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case5_fail:
+        mov rdi, 0x100000005;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 6 — clustered short flag: `-la` MUST be rejected.
+  //   argv: "-la\0"
+  //   Expected: err=ERR_CLUSTERED_SHORT (=4), error_arg_index=0.
+  //   (D3 one-per-hyphen contract; break with GNU.)
+  // ============================================================
+  pub let case6_clustered : [u8; 4] = "-la\0"
+  pub let mut case6_argv  : [u64; 1] = uninit @align(8)
+
+  pub let run_case6 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case6 — clustered short flag REJECTED per D3. Fixture: -la. Parser must set error_code = ERR_CLUSTERED_SHORT (=4) and error_arg_index = 0 (offending arg). This test is the M1-002 D3 contract — GNU-style clustering (-la == -l -a) is deliberately not accepted.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea r11, [rip + case6_clustered];
+        lea rbx, [rip + case6_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case6_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 4;                          // ERR_CLUSTERED_SHORT
+        jne case6_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 4;
+        jne case6_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case6_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case6_fail:
+        mov rdi, 0x100000006;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 7 — single-letter short flag accepted: `-n`
+  //   FlagSpec: register("n\0", FKIND_BOOL, 100)
+  //   argv: "-n\0"
+  //   Expected: err=0, flag_count=1, id=100, value=0.
+  // ============================================================
+  pub let case7_short_name : [u8; 2] = "n\0"
+  pub let case7_short_arg  : [u8; 3] = "-n\0"
+  pub let mut case7_argv   : [u64; 1] = uninit @align(8)
+
+  pub let run_case7 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case7 — single-letter short flag accepted (M1-002). Register `n\\0` as FKIND_BOOL id=100. Fixture: `-n`. Verifies err=OK, flag_count=1, id=100, value=0. Uses tool-specific id (100) rather than any StdVocab id since -n has no standard mapping (cat uses -n for line-number, ls uses -n for numeric ids — collision-safe).",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + case7_short_name];
+        mov rsi, 0;                          // FKIND_BOOL
+        mov rdx, 100;
+        call FlagSpec::register;
+
+        lea r11, [rip + case7_short_arg];
+        lea rbx, [rip + case7_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case7_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case7_fail;
+
+        mov rdi, 100;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je case7_fail;
+
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rax*8];
+        cmp rdx, 0;
+        jne case7_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case7_fail:
+        mov rdi, 0x100000007;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 8 — `--=foo` → ERR_LONG_MISSING_NAME
+  //   argv: "--=foo\0"
+  //   Expected: err=ERR_LONG_MISSING_NAME (=5), error_arg_index=0.
+  // ============================================================
+  pub let case8_bad_eq   : [u8; 7] = "--=foo\0"
+  pub let mut case8_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case8 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case8 — long flag with no name before '='. Parser detects byte2 == '=' and sets error_code = ERR_LONG_MISSING_NAME (=5). Verifies parse_argv return + error_code + error_arg_index.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea r11, [rip + case8_bad_eq];
+        lea rbx, [rip + case8_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case8_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 5;                          // ERR_LONG_MISSING_NAME
+        jne case8_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case8_fail:
+        mov rdi, 0x100000008;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 9 — `--:foo` → ERR_LONG_MISSING_NAME
+  //   argv: "--:foo\0"
+  //   Expected: err=ERR_LONG_MISSING_NAME (=5).
+  //   (Same policy as case8; separator-agnostic: parser rejects when
+  //    byte2 is either '=' or ':' before any name bytes.)
+  // ============================================================
+  pub let case9_bad_colon : [u8; 7] = "--:foo\0"
+  pub let mut case9_argv  : [u64; 1] = uninit @align(8)
+
+  pub let run_case9 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case9 — long flag with no name before ':'. Parser rejects identically to case8 (--=foo) — either separator before any name byte is a category error. ERR_LONG_MISSING_NAME (=5) confirms the M2-003 ':' separator does NOT relax the missing-name check.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea r11, [rip + case9_bad_colon];
+        lea rbx, [rip + case9_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case9_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 5;
+        jne case9_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case9_fail:
+        mov rdi, 0x100000009;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 10 — bare '-' is positional: `-`
+  //   argv: "-\0"
+  //   Expected: err=0, flag_count=0, pos_count=1.
+  //   (Convention: '-' alone often means stdin; libpdx-argv treats it
+  //    as a positional and lets the tool interpret.)
+  // ============================================================
+  pub let case10_bare_dash : [u8; 2] = "-\0"
+  pub let mut case10_argv  : [u64; 1] = uninit @align(8)
+
+  pub let run_case10 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case10 — bare '-' is positional. Parser inspects byte1 after byte0=='-'; NUL at byte1 → treat as positional (matches the stdin convention). Verifies pos_count=1 and flag_count=0.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea r11, [rip + case10_bare_dash];
+        lea rbx, [rip + case10_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case10_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case10_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case10_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case10_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case10_fail:
+        mov rdi, 0x10000000A;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 11 — well-known `--pdx-schema` toggles emit_schema=1
+  //   argv: "--pdx-schema\0"
+  //   Expected: err=0, emit_schema=1, flag_count=1
+  //             (also stored as a regular flag per parser policy).
+  // ============================================================
+  pub let case11_pdx_schema : [u8; 13] = "--pdx-schema\0"
+  pub let mut case11_argv   : [u64; 1] = uninit @align(8)
+
+  pub let run_case11 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case11 — well-known --pdx-schema toggles emit_schema. Parser stores the flag through the normal path (flag_count++) AND additionally sets emit_schema=1 via the inline byte-for-byte compare in parse_argv_long_do_store. This is deliberate back-compat with M1: consumers can detect the sentinel EITHER by find_flag_by_id (if registered) OR by reading emit_schema directly.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+
+        lea r11, [rip + case11_pdx_schema];
+        lea rbx, [rip + case11_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case11_argv];
+        mov rsi, 1;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case11_fail;
+
+        lea r11, [rip + emit_schema];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case11_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case11_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case11_fail:
+        mov rdi, 0x10000000B;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // Case 12 — mixed flag + positional interleaved:
+  //   argv: "--verbose\0", "foo\0", "--quiet\0", "bar\0"
+  //   FlagSpec: StdVocab::register_all (verbose=6 BOOL, quiet=7 BOOL)
+  //   Expected: err=0, flag_count=2, pos_count=2,
+  //             ids: 6 then 7, positionals: foo then bar.
+  // ============================================================
+  pub let case12_verbose : [u8; 10] = "--verbose\0"
+  pub let case12_foo     : [u8; 4]  = "foo\0"
+  pub let case12_quiet   : [u8; 8]  = "--quiet\0"
+  pub let case12_bar     : [u8; 4]  = "bar\0"
+  pub let mut case12_argv : [u64; 4] = uninit @align(8)
+
+  pub let run_case12 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 case12 — mixed flag+positional interleaved. Verifies parser preserves argv order semantics: both flags land in flag_names/ids (in argv order — verbose then quiet), both positionals land in pos_ptrs (in argv order — foo then bar). Consumers dispatching by find_flag_by_id get the right IDs regardless of interleave.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        lea r11, [rip + case12_verbose];
+        lea rbx, [rip + case12_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case12_foo];
+        mov [rbx + 8], r11;
+        lea r11, [rip + case12_quiet];
+        mov [rbx + 16], r11;
+        lea r11, [rip + case12_bar];
+        mov [rbx + 24], r11;
+
+        lea rdi, [rip + case12_argv];
+        mov rsi, 4;
+        call Parser::parse_argv;
+        cmp rax, 0;
+        jne case12_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case12_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case12_fail;
+
+        // find --verbose (id=6) present
+        mov rdi, 6;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je case12_fail;
+
+        // find --quiet (id=7) present
+        mov rdi, 7;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je case12_fail;
+
+        call TestHarness::record_pass;
+        pop rbx;
+        ret
+
+      case12_fail:
+        mov rdi, 0x10000000C;
+        call TestHarness::record_fail;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -1,0 +1,175 @@
+// tests/parse_std_vocab.pdx — libpdx-argv.M4-001
+// I3 9-flag standard-vocabulary sweep.
+//
+// M2-002 shipped `StdVocab::register_all()` which registers all nine
+// I3 flags with FlagSpec. This test exercises the full vocabulary in a
+// single parse call — every flag appears in argv, every id is
+// discoverable via ParsedArgs::find_flag_by_id, and the two non-boolean
+// flags (--color, --no-cap) carry their expected values.
+//
+// Module id in TestHarness::last_fail_tag: 5
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseStdVocabTests (PascalCase basename).
+//   - run_all is non-leaf; 1-push (rbx) prologue.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+
+module ParseStdVocabTests = structure {
+
+  // -- Argv entries for the full sweep (9 flags — 7 bool + color + no-cap).
+  pub let a_help    : [u8; 7]  = "--help\0"
+  pub let a_version : [u8; 10] = "--version\0"
+  pub let a_dry_run : [u8; 10] = "--dry-run\0"
+  pub let a_json    : [u8; 7]  = "--json\0"
+  pub let a_schema  : [u8; 9]  = "--schema\0"
+  pub let a_verbose : [u8; 10] = "--verbose\0"
+  pub let a_quiet   : [u8; 8]  = "--quiet\0"
+  pub let a_color   : [u8; 13] = "--color=auto\0"
+  pub let a_no_cap  : [u8; 18] = "--no-cap:KIND_TTY\0"
+
+  pub let mut argv_all : [u64; 9] = uninit @align(8)
+
+  // ============================================================
+  // run_all_9()
+  //   FlagSpec: StdVocab::register_all()
+  //   argv (in registration order): 9 flags, all seen once.
+  //   Expected: err=0, flag_count=9, pos_count=0,
+  //             find_flag_by_id returns non-32 for ids 1..9.
+  // ============================================================
+  pub let run_all_9 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 std vocab sweep — parse all 9 I3 flags in a single argv. Verifies StdVocab::register_all wires the correct id/kind pairs (help→1/BOOL, version→2/BOOL, dry-run→3/BOOL, json→4/BOOL, schema→5/BOOL, verbose→6/BOOL, quiet→7/BOOL, color→8/ENUM, no-cap→9/STR) and that Parser handles the interspersed value forms (color's '=' + no-cap's ':') correctly. Uses find_flag_by_id iteratively for ids 1..9; failure at any id short-circuits to the fail tag.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        // Fill argv_all[0..9] with the nine flag pointers.
+        lea rbx, [rip + argv_all];
+        lea r11, [rip + a_help];    mov [rbx + 0],  r11;
+        lea r11, [rip + a_version]; mov [rbx + 8],  r11;
+        lea r11, [rip + a_dry_run]; mov [rbx + 16], r11;
+        lea r11, [rip + a_json];    mov [rbx + 24], r11;
+        lea r11, [rip + a_schema];  mov [rbx + 32], r11;
+        lea r11, [rip + a_verbose]; mov [rbx + 40], r11;
+        lea r11, [rip + a_quiet];   mov [rbx + 48], r11;
+        lea r11, [rip + a_color];   mov [rbx + 56], r11;
+        lea r11, [rip + a_no_cap];  mov [rbx + 64], r11;
+
+        lea rdi, [rip + argv_all];
+        mov rsi, 9;
+        call Parser::parse_argv;
+        cmp rax, 0; jne sv_fail;
+
+        // flag_count == 9
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 9; jne sv_fail;
+
+        // pos_count == 0
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 0; jne sv_fail;
+
+        // Verify every id 1..9 is discoverable. Use r15 as loop counter.
+        mov r15, 1;
+      sv_loop:
+        cmp r15, 9;
+        jg sv_ok;
+        mov rdi, r15;
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32;
+        je sv_fail;
+        add r15, 1;
+        jmp sv_loop;
+
+      sv_ok:
+        call TestHarness::record_pass;
+        add rsp, 8; pop r15; pop rbx; ret
+
+      sv_fail:
+        mov rdi, 0x500000001;
+        call TestHarness::record_fail;
+        add rsp, 8; pop r15; pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // run_ids_unique()
+  //   After StdVocab::register_all, verify FlagSpec::lookup returns
+  //   distinct ids for each of the 9 std names (no accidental collision
+  //   between STD_NAME_JSON and STD_NAME_HELP etc.).
+  //   Loops the 9 names, reads (kind, id) via FlagSpec::lookup, checks
+  //   id equals its expected slot (1..9).
+  // ============================================================
+  pub let name_help_ref    : [u8; 5] = "help\0"
+  pub let name_version_ref : [u8; 8] = "version\0"
+  pub let name_dry_run_ref : [u8; 8] = "dry-run\0"
+  pub let name_json_ref    : [u8; 5] = "json\0"
+  pub let name_schema_ref  : [u8; 7] = "schema\0"
+  pub let name_verbose_ref : [u8; 8] = "verbose\0"
+  pub let name_quiet_ref   : [u8; 6] = "quiet\0"
+  pub let name_color_ref   : [u8; 6] = "color\0"
+  pub let name_no_cap_ref  : [u8; 7] = "no-cap\0"
+
+  pub let run_ids_unique : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 std vocab id-unique probe — after StdVocab::register_all, FlagSpec::lookup('help')→id=1, ('version')→id=2, and so on through ('no-cap')→id=9. Verifies no two std names share an id and that register_all ran in the documented order. Individual lookup checks avoid a loop because each name is a distinct .rodata pointer.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        lea rdi, [rip + name_help_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 1; jne iu_fail;
+
+        lea rdi, [rip + name_version_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 2; jne iu_fail;
+
+        lea rdi, [rip + name_dry_run_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 3; jne iu_fail;
+
+        lea rdi, [rip + name_json_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 4; jne iu_fail;
+
+        lea rdi, [rip + name_schema_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 5; jne iu_fail;
+
+        lea rdi, [rip + name_verbose_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 6; jne iu_fail;
+
+        lea rdi, [rip + name_quiet_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 7; jne iu_fail;
+
+        lea rdi, [rip + name_color_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 8; jne iu_fail;
+
+        lea rdi, [rip + name_no_cap_ref];
+        call FlagSpec::lookup;
+        cmp rdx, 9; jne iu_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      iu_fail:
+        mov rdi, 0x500000002;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+}

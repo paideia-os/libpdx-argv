@@ -1,0 +1,141 @@
+// tests/help_backend.pdx — libpdx-argv.M4-001
+// HelpBackend::fill_doc_argv round-trip + DOC_TOOL_NAME identity.
+//
+// M3-002 wired --help back into `doc <tool>`. The library-side surface
+// is minimal — a public [u8; 4] symbol and one argv-fill primitive.
+// These tests verify:
+//   1. DOC_TOOL_NAME byte-for-byte equals "doc\0".
+//   2. After fill_doc_argv(argv, tool_name_ptr):
+//        argv[0] == &DOC_TOOL_NAME
+//        argv[1] == tool_name_ptr (byte-for-byte the caller-supplied ptr)
+//   3. The synthesized argv[0] is stable across multiple calls (same
+//      .rodata address every time, byte-for-byte).
+//
+// Module id in TestHarness::last_fail_tag: 7
+//
+// paideia-as compliance
+// ---------------------
+//   - Module HelpBackendTests (PascalCase basename).
+//   - run_* fns non-leaf; 1-push (rbx) prologue.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+
+module HelpBackendTests = structure {
+
+  // Caller-owned argv scratch for fill_doc_argv.
+  pub let mut argv_scratch : [u64; 2] = uninit @align(8)
+
+  // A representative tool name for the round-trip. (Consumers pass
+  // their own tool_name literal — cat, pkg, ls, etc.)
+  pub let sample_tool_name : [u8; 4] = "cat\0"
+
+  // ============================================================
+  // case1  DOC_TOOL_NAME byte identity.
+  //   Verifies bytes 0..3 of DOC_TOOL_NAME are 'd','o','c','\0'.
+  // ============================================================
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 HelpBackend case1 — DOC_TOOL_NAME byte identity. Confirms the [u8; 4] literal is exactly {'d','o','c',0}. Any drift here would break consumer argv[0] stability (audit-record joins on shell-side rely on byte-for-byte match) and change the shared string's tool-recognition semantics.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + DOC_TOOL_NAME];
+        xor rax, rax; mov_b rax, [rbx + 0]; cmp rax, 0x64; jne hb1_fail;  // 'd'
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x6F; jne hb1_fail;  // 'o'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x63; jne hb1_fail;  // 'c'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0;    jne hb1_fail;  // NUL
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      hb1_fail:
+        mov rdi, 0x700000001;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case2  fill_doc_argv round-trip.
+  //   After fill_doc_argv(&argv_scratch, &sample_tool_name):
+  //     argv_scratch[0] equals &DOC_TOOL_NAME
+  //     argv_scratch[1] equals &sample_tool_name
+  // ============================================================
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 HelpBackend case2 — fill_doc_argv round-trip. Calls fill_doc_argv with argv_scratch + sample_tool_name; verifies both slots equal their expected pointer values byte-for-byte. Uses `lea r15, [rip + XXX]; cmp qword_slot, r15` because the tool_name_ptr may not fit imm32 (depends on layout). r15 spilled across the record_pass call via a 2-push prologue.",
+      block: {
+        push rbx;
+        push r15;
+
+        lea rdi, [rip + argv_scratch];
+        lea rsi, [rip + sample_tool_name];
+        call HelpBackend::fill_doc_argv;
+
+        // argv_scratch[0] must equal &DOC_TOOL_NAME
+        lea r15, [rip + DOC_TOOL_NAME];
+        lea rbx, [rip + argv_scratch];
+        mov rax, [rbx + 0];
+        cmp rax, r15; jne hb2_fail;
+
+        // argv_scratch[1] must equal &sample_tool_name
+        lea r15, [rip + sample_tool_name];
+        mov rax, [rbx + 8];
+        cmp rax, r15; jne hb2_fail;
+
+        call TestHarness::record_pass;
+        pop r15; pop rbx; ret
+
+      hb2_fail:
+        mov rdi, 0x700000002;
+        call TestHarness::record_fail;
+        pop r15; pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // case3  argv[0] stability across repeated calls.
+  //   Two back-to-back fill_doc_argv calls must produce the identical
+  //   argv[0] byte-for-byte. (Trivially true given fill_doc_argv is
+  //   pure and reads DOC_TOOL_NAME by rip-relative lea; the test
+  //   documents the contract for downstream shell audit-record joins.)
+  // ============================================================
+  pub let mut argv_scratch2 : [u64; 2] = uninit @align(8)
+
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 HelpBackend case3 — argv[0] stability. Two independent fill_doc_argv calls write into two independent argv scratches. argv[0] slot must equal in both — the parameter that varies (rsi = tool_name_ptr) does not affect slot 0. Verifies the module doesn't accidentally use rsi for the argv[0] address.",
+      block: {
+        push rbx;
+        push r15;
+
+        lea rdi, [rip + argv_scratch];
+        lea rsi, [rip + sample_tool_name];
+        call HelpBackend::fill_doc_argv;
+
+        lea rdi, [rip + argv_scratch2];
+        lea rsi, [rip + sample_tool_name];   // same tool_name
+        call HelpBackend::fill_doc_argv;
+
+        // both argv[0]s must equal each other AND equal &DOC_TOOL_NAME.
+        lea rbx, [rip + argv_scratch];
+        mov rax, [rbx + 0];
+        lea r15, [rip + argv_scratch2];
+        mov rdx, [r15 + 0];
+        cmp rax, rdx; jne hb3_fail;
+
+        lea r15, [rip + DOC_TOOL_NAME];
+        cmp rax, r15; jne hb3_fail;
+
+        call TestHarness::record_pass;
+        pop r15; pop rbx; ret
+
+      hb3_fail:
+        mov rdi, 0x700000003;
+        call TestHarness::record_fail;
+        pop r15; pop rbx; ret
+      }
+    }
+}

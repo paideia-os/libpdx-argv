@@ -1,0 +1,277 @@
+// tests/parse_schema_record.pdx — libpdx-argv.M4-001
+// SchemaInvoke wire-form matrix — exercises the M3-001 alternate
+// invocation path from libpdx-semantic-pipe (typed record → ParsedArgs).
+//
+// Cases cover:
+//   1. Happy path: valid record with 1 flag + 1 positional.
+//   2. Bad magic → ERR_SCHEMA_BAD_MAGIC (=7).
+//   3. Bad version → ERR_SCHEMA_UNSUPPORTED_VERSION (=8).
+//   4. Short header → ERR_SCHEMA_BAD_LAYOUT (=9).
+//   5. flag_count > MAX_FLAGS → ERR_SCHEMA_BAD_LAYOUT (=9).
+//   6. Body-fits gate: record_len < header+arrays → ERR_SCHEMA_BAD_LAYOUT.
+//
+// The records are pre-baked in .rodata as fixed-size byte arrays; the
+// test declares them with the exact byte-for-byte content the parser
+// consumes. See design/architecture.md §10.1 for the wire form and
+// §11 for the M4 test rationale.
+//
+// Wire layout (v1):
+//   offset  size  meaning
+//   0       8     magic "PDXARGV\0" = 50 44 58 41 52 47 56 00
+//   8       8     version = 1
+//   16      8     flag_count
+//   24      8     pos_count
+//   32      —     flag entries (16 B each: name_off, value_off)
+//   next    —     positional entries (8 B each: pos_off)
+//   rest    —     string table (opaque)
+//
+// Module id in TestHarness::last_fail_tag: 6
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseSchemaRecordTests (PascalCase basename).
+//   - Byte-array literals for records use explicit \xNN escapes where
+//     needed for non-ASCII bytes (magic + version + counts qwords).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+
+module ParseSchemaRecordTests = structure {
+
+  // ============================================================
+  // Case 1 — Happy path.
+  //   Record: 1 flag (--help), 1 positional ("foo").
+  //
+  //   Layout (bytes):
+  //     0..7   "PDXARGV\0"
+  //     8..15  version=1 LE   → 01 00 00 00 00 00 00 00
+  //     16..23 flag_count=1   → 01 00 00 00 00 00 00 00
+  //     24..31 pos_count=1    → 01 00 00 00 00 00 00 00
+  //     32..47 flag entry:  name_off=56 (0x38), value_off=0
+  //             → 38 00 00 00 00 00 00 00, 00 00 00 00 00 00 00 00
+  //     48..55 positional entry: pos_off=61 (0x3D)
+  //             → 3D 00 00 00 00 00 00 00
+  //     56..60 "help\0"  (5 bytes)
+  //     61..64 "foo\0"   (4 bytes)
+  //
+  //   Total record size: 65 bytes.
+  //
+  // Note: this byte-level record encoding is fragile — any change to
+  // the wire layout (§10.1) requires updating the offsets and bytes
+  // here in lock-step. That fragility is deliberate: the test is what
+  // pins the layout in place across schema-fingerprint negotiations.
+  // ============================================================
+  pub let case1_rec : [u8; 65] = "\
+PDXARGV\0\
+\x01\0\0\0\0\0\0\0\
+\x01\0\0\0\0\0\0\0\
+\x01\0\0\0\0\0\0\0\
+\x38\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0\
+\x3D\0\0\0\0\0\0\0\
+help\0\
+foo\0"
+
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 schema-record case1 — happy path. Feeds a 65-byte v1 record with 1 flag (--help) and 1 positional (foo) to SchemaInvoke::parse_from_schema_record. Verifies ERR_OK, flag_count=1, pos_count=1, id=STD_ID_HELP via find_flag_by_id after StdVocab::register_all. The wire-form fixture also anchors the offsets so any future layout change breaks this test loudly.",
+      block: {
+        push rbx;
+
+        call TestHarness::full_reset;
+        call StdVocab::register_all;
+
+        lea rdi, [rip + case1_rec];
+        mov rsi, 65;
+        call SchemaInvoke::parse_from_schema_record;
+        cmp rax, 0; jne sr1_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne sr1_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1; jne sr1_fail;
+
+        mov rdi, 1;                          // STD_ID_HELP
+        call ParsedArgs::find_flag_by_id;
+        cmp rax, 32; je sr1_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      sr1_fail:
+        mov rdi, 0x600000001;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // Case 2 — Bad magic. First byte 'X' instead of 'P'.
+  //   Expected: ERR_SCHEMA_BAD_MAGIC (=7), error_arg_index=0.
+  // ============================================================
+  pub let case2_rec : [u8; 32] = "\
+XDXARGV\0\
+\x01\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0"
+
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 schema-record case2 — bad magic. First magic byte 'X' (0x58) instead of 'P' (0x50). Parser's inline byte compare fires at offset 0. Verifies rax=ERR_SCHEMA_BAD_MAGIC=7. Record is a well-formed 32-byte header otherwise so the parser reaches the magic compare (not the header-size gate).",
+      block: {
+        push rbx;
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + case2_rec];
+        mov rsi, 32;
+        call SchemaInvoke::parse_from_schema_record;
+        cmp rax, 7; jne sr2_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      sr2_fail:
+        mov rdi, 0x600000002;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // Case 3 — Unsupported version. Version qword = 99.
+  //   Expected: ERR_SCHEMA_UNSUPPORTED_VERSION (=8).
+  // ============================================================
+  pub let case3_rec : [u8; 32] = "\
+PDXARGV\0\
+\x63\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0"
+
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 schema-record case3 — unsupported version. Magic OK, version=99 (0x63) != SCHEMA_VERSION_V1=1. Parser's qword compare after magic fires. Verifies rax=ERR_SCHEMA_UNSUPPORTED_VERSION=8.",
+      block: {
+        push rbx;
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + case3_rec];
+        mov rsi, 32;
+        call SchemaInvoke::parse_from_schema_record;
+        cmp rax, 8; jne sr3_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      sr3_fail:
+        mov rdi, 0x600000003;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // Case 4 — Short header. record_len=16 (< SCHEMA_HEADER_SIZE=32).
+  //   Expected: ERR_SCHEMA_BAD_LAYOUT (=9).
+  //   (Trips the very first size gate before any byte inspection.)
+  // ============================================================
+  pub let case4_rec : [u8; 16] = "\
+PDXARGV\0\
+\x01\0\0\0\0\0\0\0"
+
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 schema-record case4 — short header. record_len=16 < SCHEMA_HEADER_SIZE=32. Parser's first gate (cmp r12, 32; jl schema_bad_layout_header) fires immediately. Verifies rax=ERR_SCHEMA_BAD_LAYOUT=9.",
+      block: {
+        push rbx;
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + case4_rec];
+        mov rsi, 16;
+        call SchemaInvoke::parse_from_schema_record;
+        cmp rax, 9; jne sr4_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      sr4_fail:
+        mov rdi, 0x600000004;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // Case 5 — flag_count exceeds MAX_FLAGS.
+  //   Record header: magic + version + flag_count=33 + pos_count=0.
+  //   Expected: ERR_SCHEMA_BAD_LAYOUT (=9).
+  // ============================================================
+  pub let case5_rec : [u8; 32] = "\
+PDXARGV\0\
+\x01\0\0\0\0\0\0\0\
+\x21\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0"
+
+  pub let run_case5 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 schema-record case5 — flag_count exceeds MAX_FLAGS. Header has magic+version OK, but flag_count=33 (0x21) > 32. Parser's `cmp r9, 32; jg schema_bad_layout_header` fires. Verifies rax=ERR_SCHEMA_BAD_LAYOUT=9.",
+      block: {
+        push rbx;
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + case5_rec];
+        mov rsi, 32;
+        call SchemaInvoke::parse_from_schema_record;
+        cmp rax, 9; jne sr5_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      sr5_fail:
+        mov rdi, 0x600000005;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+
+  // ============================================================
+  // Case 6 — Body-fits gate. header claims 1 flag + 1 pos (min 32 +
+  //   16 + 8 = 56 bytes) but record_len only 40. Parser must reject.
+  //   Header content = same as case1's first 32 bytes but the caller
+  //   passes record_len=40 (below the required minimum of 56).
+  // ============================================================
+  pub let case6_rec : [u8; 40] = "\
+PDXARGV\0\
+\x01\0\0\0\0\0\0\0\
+\x01\0\0\0\0\0\0\0\
+\x01\0\0\0\0\0\0\0\
+\0\0\0\0\0\0\0\0"
+
+  pub let run_case6 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 schema-record case6 — body-fits gate. Header declares flag_count=1 and pos_count=1, so minimum body size = 32 header + 16 flag_entry + 8 pos_entry = 56 bytes. Caller supplies record_len=40, tripping the body-fits check (`cmp r12, r8; jl schema_bad_layout_header`). Verifies rax=ERR_SCHEMA_BAD_LAYOUT=9. Note the fixture is 40 bytes physically but the check is on the supplied length parameter — the parser trusts len over storage size, exactly as designed.",
+      block: {
+        push rbx;
+        call TestHarness::full_reset;
+
+        lea rdi, [rip + case6_rec];
+        mov rsi, 40;
+        call SchemaInvoke::parse_from_schema_record;
+        cmp rax, 9; jne sr6_fail;
+
+        call TestHarness::record_pass;
+        pop rbx; ret
+
+      sr6_fail:
+        mov rdi, 0x600000006;
+        call TestHarness::record_fail;
+        pop rbx; ret
+      }
+    }
+}
