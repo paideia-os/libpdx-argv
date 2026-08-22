@@ -1,0 +1,130 @@
+// src/std_vocab.pdx — libpdx-argv.M2-002
+// StdVocab: the I3 9-flag standard vocabulary.
+//
+// Per `design/tooling/plan.md` I3, every paideia-os user tool
+// implements the following long flags with identical semantics:
+//
+//   --help          structured help, paginated, hyperlinked into doc
+//   --version       semver + build hash + signing key fingerprint
+//   --dry-run       preview effect without executing side-effects
+//   --json          emit schema stream as JSON on stdout
+//   --schema        print the tool's output schema definition and exit
+//   --verbose       additional diagnostic output on stderr
+//   --quiet         suppress non-error stderr
+//   --color=...     color emission policy (auto|always|never)
+//   --no-cap:...    strip the named capability before exec
+//
+// StdVocab::register_all() registers all nine with FlagSpec so the
+// Parser knows their arity and the consumer can dispatch by
+// ParsedArgs::flag_ids[k] rather than by name compare. Short-form
+// aliases (`-h`, `-v`, etc.) are NOT registered here — they collide
+// with per-tool short-flag vocabulary (cat uses `-n` for line numbers;
+// grep uses `-v` for invert-match). Consumers register whichever
+// short-form aliases they choose.
+//
+// The names are stored as [u8; N] literals in .rodata with an explicit
+// trailing NUL so FlagSpec::lookup's inline strcmp can find the
+// terminator. Byte-lengths match the underlying string + 1 for NUL.
+//
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M2-002 (paideia-os)
+// and design/tooling/plan.md §4.1 I3.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module StdVocab (PascalCase basename).
+//   - register_all is non-leaf (calls FlagSpec::register 9 times);
+//     3-push callee-save prologue (rbx unused here but pushed to
+//     satisfy the alignment invariant for the nested calls). Actually
+//     zero callee-save preserved values are needed — a 1-push aligns
+//     the stack (rsp%16: 8 → 0), which is what we do.
+//   - No test mnemonic; no cmp instructions in this module.
+
+module StdVocab = structure {
+  // -- Numeric IDs for the 9 standard flags. Consumers use these with
+  // -- ParsedArgs::find_flag_by_id(). IDs 1..9 are reserved for
+  // -- StdVocab; tool-specific IDs must start at 100 (an arbitrary
+  // -- convention that leaves room for M3+ additions to StdVocab
+  // -- without ID reassignment).
+  pub let STD_ID_HELP    : u64 = 1
+  pub let STD_ID_VERSION : u64 = 2
+  pub let STD_ID_DRY_RUN : u64 = 3
+  pub let STD_ID_JSON    : u64 = 4
+  pub let STD_ID_SCHEMA  : u64 = 5
+  pub let STD_ID_VERBOSE : u64 = 6
+  pub let STD_ID_QUIET   : u64 = 7
+  pub let STD_ID_COLOR   : u64 = 8
+  pub let STD_ID_NO_CAP  : u64 = 9
+
+  // -- The 9 standard flag names, each NUL-terminated so FlagSpec's
+  // -- inline strcmp finds a terminator. Byte-length = strlen + 1.
+  // -- Names match the I3 spelling exactly — no aliases.
+  pub let STD_NAME_HELP    : [u8; 5]  = "help\0"
+  pub let STD_NAME_VERSION : [u8; 8]  = "version\0"
+  pub let STD_NAME_DRY_RUN : [u8; 8]  = "dry-run\0"
+  pub let STD_NAME_JSON    : [u8; 5]  = "json\0"
+  pub let STD_NAME_SCHEMA  : [u8; 7]  = "schema\0"
+  pub let STD_NAME_VERBOSE : [u8; 8]  = "verbose\0"
+  pub let STD_NAME_QUIET   : [u8; 6]  = "quiet\0"
+  pub let STD_NAME_COLOR   : [u8; 6]  = "color\0"
+  pub let STD_NAME_NO_CAP  : [u8; 7]  = "no-cap\0"
+
+  // ============================================================
+  // register_all()
+  // Signature: () -> () !{mem} @{}
+  //
+  // Registers all 9 standard flags with FlagSpec. Requires
+  // FlagSpec::reset() to have run first (or a fresh table).
+  // Idempotent only if FlagSpec::reset preceded — a second call
+  // without reset appends 9 more entries (and hits SPEC_MAX at 18
+  // registrations if not reset).
+  //
+  // Six of nine are FKIND_BOOL (--help, --version, --dry-run, --json,
+  // --schema, --verbose, --quiet — seven actually). Actually the
+  // breakdown is:
+  //   FKIND_BOOL : help, version, dry-run, json, schema, verbose, quiet
+  //   FKIND_ENUM : color   (auto|always|never)
+  //   FKIND_STR  : no-cap  (a KIND name; opaque to libpdx-argv)
+  //
+  // Non-leaf. 1-push prologue (rbx) aligns rsp%16 to 0 for the nested
+  // FlagSpec::register calls. rbx is not otherwise used — pushed
+  // purely for alignment.
+  // ============================================================
+  pub let register_all : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-002 StdVocab::register_all — registers the I3 9-flag standard vocabulary with FlagSpec via nine calls to FlagSpec::register. Non-leaf; 1-push prologue (rbx, unused, for rsp alignment) → rsp%16: 8 → 0 for the nested calls. rdi/rsi/rdx are set per call to (name_ptr, kind, id). Six/seven of the flags are FKIND_BOOL; color is FKIND_ENUM; no-cap is FKIND_STR. Consumers that only need a subset (e.g. a tool with no --color) can pay the ~1µs cost of the extra registrations or register selected flags individually.",
+      block: {
+        push rbx;                                // align rsp
+
+        lea rdi, [rip + STD_NAME_HELP];    mov rsi, 0;    mov rdx, 1;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_VERSION]; mov rsi, 0;    mov rdx, 2;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_DRY_RUN]; mov rsi, 0;    mov rdx, 3;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_JSON];    mov rsi, 0;    mov rdx, 4;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_SCHEMA];  mov rsi, 0;    mov rdx, 5;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_VERBOSE]; mov rsi, 0;    mov rdx, 6;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_QUIET];   mov rsi, 0;    mov rdx, 7;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_COLOR];   mov rsi, 5;    mov rdx, 8;
+        call FlagSpec::register;
+
+        lea rdi, [rip + STD_NAME_NO_CAP];  mov rsi, 1;    mov rdx, 9;
+        call FlagSpec::register;
+
+        pop rbx;
+        ret
+      }
+    }
+}
