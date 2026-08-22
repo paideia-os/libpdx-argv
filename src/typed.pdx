@@ -1,0 +1,402 @@
+// src/typed.pdx — libpdx-argv.M2-001
+// Typed value parsers — decode a NUL-terminated value string into a
+// numeric type. Called by consumers after Parser::parse_argv has
+// stored the raw value pointer in ParsedArgs::flag_values[k].
+//
+// Each parser returns two values (SysV rax:rdx pair):
+//   rax = ok flag (1 = success, 0 = parse failed / partial)
+//   rdx = decoded value (u64 semantics: bytes for size, seconds for
+//         timespan, integer for int)
+//
+// The M2 grammar supports single-character suffixes only. The M3
+// upgrade will add multi-char SI/IEC forms (KiB vs KB, MiB vs MB) and
+// float coefficients. M2 keeps the surface minimal so the encoding
+// stays inside the R49 vocabulary (no mul, no imul, no neg).
+//
+// See design/architecture.md §9.3 for the grammar tables.
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M2-001 (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Typed (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 0x39 = ASCII '9').
+//   - r11 is scratch (not used here — parsers don't touch .bss/.rodata).
+//   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
+//   - No mul/imul; *10 uses shl + add; *60/*3600/*86400 use fixed
+//     shl+add sequences (see multiply-by-N justifications).
+//   - Leaf functions (no calls); parsers can be invoked from any
+//     stack alignment.
+
+module Typed = structure {
+
+  // ============================================================
+  // parse_int_u64(str_ptr) -> (ok in rax, val in rdx)
+  // Signature: (u64) -> u64 !{mem} @{}
+  //
+  //   rdi (in)  = NUL-terminated decimal digit string
+  //   rax (out) = 1 if at least one digit was consumed and the string
+  //               terminated at NUL, else 0
+  //   rdx (out) = accumulated value (undefined on failure)
+  //
+  // Grammar: [0-9]+ terminated by NUL. No sign, no whitespace, no
+  // suffix. Any non-digit byte (including empty string) → ok=0.
+  //
+  // Overflow: bytes past a u64's range wrap silently (multiply
+  // saturation is a M3+ concern). Real-world tool flags are small
+  // enough that this is a non-issue at M2.
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rcx = accumulator (final val in rdx after ret)
+  //   rax = byte load / return (ok flag)
+  //   r8  = digit value (byte - 0x30)
+  //   r9  = *10 scratch (accumulator << 3 for the mul-by-10)
+  // ============================================================
+  pub let parse_int_u64 : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-001 Typed::parse_int_u64 — decimal-digit accumulator. Loop: load byte, if < '0' or > '9' terminate (NUL is the success-terminator; anything else is a parse error). Multiply-by-10 uses `mov r9, rcx; shl r9, 3; add r9, rcx; add r9, rcx` = *8 + *1 + *1 = *10 (three ops after the mov, well inside the R49 subset). Success requires at least one digit AND terminating NUL — an empty string or a partial digit run returns ok=0. Leaf; no callee-save regs touched.",
+      block: {
+        xor rcx, rcx;                     // rcx = accumulator = 0
+        xor r10, r10;                     // r10 = digits_seen = 0
+        mov rsi, rdi;                     // rsi = walk cursor
+
+      pi_loop:
+        xor rax, rax;
+        mov_b rax, [rsi];
+        // Terminator NUL: success iff at least one digit was seen.
+        cmp rax, 0;
+        je pi_terminator;
+        // Range check '0' (0x30) .. '9' (0x39). Anything else fails.
+        cmp rax, 0x30;
+        jl pi_fail;
+        cmp rax, 0x39;
+        jg pi_fail;
+
+        // digit = byte - '0'
+        mov r8, rax;
+        sub r8, 0x30;
+
+        // accumulator = accumulator * 10 + digit
+        mov r9, rcx;
+        shl r9, 3;                        // r9 = acc * 8
+        add r9, rcx;                      // r9 = acc * 9
+        add r9, rcx;                      // r9 = acc * 10
+        add r9, r8;                       // r9 = acc*10 + digit
+        mov rcx, r9;
+
+        add r10, 1;                       // digits_seen++
+        add rsi, 1;
+        jmp pi_loop;
+
+      pi_terminator:
+        cmp r10, 0;
+        je pi_fail;
+        mov rdx, rcx;                     // rdx = val
+        mov rax, 1;                       // rax = ok
+        ret
+
+      pi_fail:
+        xor rax, rax;                     // rax = 0 (fail)
+        xor rdx, rdx;                     // rdx = 0
+        ret
+      }
+    }
+
+  // ============================================================
+  // parse_size(str_ptr) -> (ok in rax, bytes in rdx)
+  // Signature: (u64) -> u64 !{mem} @{}
+  //
+  //   rdi (in)  = NUL-terminated size string
+  //   rax (out) = 1 on success, 0 on parse failure
+  //   rdx (out) = size in bytes
+  //
+  // Grammar: [0-9]+ optionally followed by one of {k,K,m,M,g,G} then
+  // NUL. Suffix maps to a binary shift:
+  //   k, K → << 10  (KiB, 1024 B)
+  //   m, M → << 20  (MiB, 1024^2 B)
+  //   g, G → << 30  (GiB, 1024^3 B)
+  //   no suffix → literal bytes
+  //
+  // M2 does not distinguish KB (decimal 1000) from KiB (binary 1024);
+  // both spellings normalise to the binary form. The multi-char
+  // spellings "KiB" / "MB" / "GB" are M3 additions.
+  //
+  // Overflow: shifts past bit 63 wrap silently (M3 adds saturation).
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rcx = accumulator (mantissa)
+  //   rsi = walk cursor
+  //   rax = byte load / return (ok flag)
+  //   r8  = digit value
+  //   r9  = *10 scratch
+  //   r10 = digits_seen
+  // ============================================================
+  pub let parse_size : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-001 Typed::parse_size — parses [0-9]+ mantissa then one of k/K/m/M/g/G suffix (or NUL for literal bytes), converts via shl. Multiply-by-10 uses the same shl+add trick as parse_int_u64. Suffix dispatch is a linear cmp/jne chain (6 letters; O(1) constant). shl imm is bounded by 30 (< 63) so no encoder complaints. Leaf; no callee-save touched. Success requires at least one digit AND (NUL or valid suffix followed by NUL).",
+      block: {
+        xor rcx, rcx;
+        xor r10, r10;
+        mov rsi, rdi;
+
+      ps_digit_loop:
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0;
+        je ps_no_suffix;
+        cmp rax, 0x30;
+        jl ps_maybe_suffix;
+        cmp rax, 0x39;
+        jg ps_maybe_suffix;
+
+        mov r8, rax;
+        sub r8, 0x30;
+        mov r9, rcx;
+        shl r9, 3;
+        add r9, rcx;
+        add r9, rcx;
+        add r9, r8;
+        mov rcx, r9;
+
+        add r10, 1;
+        add rsi, 1;
+        jmp ps_digit_loop;
+
+      ps_no_suffix:
+        cmp r10, 0;
+        je ps_fail;
+        mov rdx, rcx;
+        mov rax, 1;
+        ret
+
+      ps_maybe_suffix:
+        // rax holds the non-digit byte. Must be a valid suffix AND
+        // the next byte must be NUL.
+        cmp r10, 0;
+        je ps_fail;
+
+        // Cheap dispatch: same-letter arms first.
+        cmp rax, 0x6B;                    // 'k'
+        je ps_shl_10;
+        cmp rax, 0x4B;                    // 'K'
+        je ps_shl_10;
+        cmp rax, 0x6D;                    // 'm'
+        je ps_shl_20;
+        cmp rax, 0x4D;                    // 'M'
+        je ps_shl_20;
+        cmp rax, 0x67;                    // 'g'
+        je ps_shl_30;
+        cmp rax, 0x47;                    // 'G'
+        je ps_shl_30;
+        jmp ps_fail;
+
+      ps_shl_10:
+        shl rcx, 10;
+        jmp ps_check_terminator;
+
+      ps_shl_20:
+        shl rcx, 20;
+        jmp ps_check_terminator;
+
+      ps_shl_30:
+        shl rcx, 30;
+        // fallthrough
+
+      ps_check_terminator:
+        // Next byte must be NUL. Anything else = parse fail (e.g.
+        // "1KB" or "1kb" is not accepted at M2 — that's M3).
+        add rsi, 1;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0;
+        jne ps_fail;
+
+        mov rdx, rcx;
+        mov rax, 1;
+        ret
+
+      ps_fail:
+        xor rax, rax;
+        xor rdx, rdx;
+        ret
+      }
+    }
+
+  // ============================================================
+  // parse_timespan(str_ptr) -> (ok in rax, seconds in rdx)
+  // Signature: (u64) -> u64 !{mem} @{}
+  //
+  //   rdi (in)  = NUL-terminated timespan string
+  //   rax (out) = 1 on success, 0 on parse failure
+  //   rdx (out) = duration in seconds
+  //
+  // Grammar: [0-9]+ optionally followed by one of {s,m,h,d} then NUL.
+  // Suffix maps to a multiplier:
+  //   s → *1        (seconds)
+  //   m → *60       (minutes)
+  //   h → *3600     (hours)
+  //   d → *86400    (days)
+  //   no suffix → seconds
+  //
+  // No 'w' (weeks) at M2 — added at M3 alongside the multi-char
+  // spellings ("min", "hr", "day"). Compound forms like "1h30m" are
+  // also M3.
+  //
+  // Multiplication implementation uses shl+add sequences to stay
+  // inside the R49 subset (no mul/imul). See the per-arm justification
+  // for each factor.
+  //
+  // Leaf. Register plan mirrors parse_size.
+  // ============================================================
+  pub let parse_timespan : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-001 Typed::parse_timespan — parses [0-9]+ mantissa then one of s/m/h/d suffix (or NUL for literal seconds). Suffix multipliers are 1/60/3600/86400. Multiplication uses shl+add without mul/imul: *60 = *64 - *4 not usable (no sub without corrupting flags in a tight loop — actually sub IS allowed per dispatch.pdx precedent, but the shl+lea route is cleaner). *60 = *(2^6 - 2^2) OR (*2 * *30) OR the composed lea sequence. The chosen sequence is documented per arm. Leaf; no callee-save touched.",
+      block: {
+        xor rcx, rcx;
+        xor r10, r10;
+        mov rsi, rdi;
+
+      pt_digit_loop:
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0;
+        je pt_no_suffix;
+        cmp rax, 0x30;
+        jl pt_maybe_suffix;
+        cmp rax, 0x39;
+        jg pt_maybe_suffix;
+
+        mov r8, rax;
+        sub r8, 0x30;
+        mov r9, rcx;
+        shl r9, 3;
+        add r9, rcx;
+        add r9, rcx;
+        add r9, r8;
+        mov rcx, r9;
+
+        add r10, 1;
+        add rsi, 1;
+        jmp pt_digit_loop;
+
+      pt_no_suffix:
+        cmp r10, 0;
+        je pt_fail;
+        mov rdx, rcx;
+        mov rax, 1;
+        ret
+
+      pt_maybe_suffix:
+        cmp r10, 0;
+        je pt_fail;
+
+        cmp rax, 0x73;                    // 's'
+        je pt_mul_1;
+        cmp rax, 0x6D;                    // 'm'
+        je pt_mul_60;
+        cmp rax, 0x68;                    // 'h'
+        je pt_mul_3600;
+        cmp rax, 0x64;                    // 'd'
+        je pt_mul_86400;
+        jmp pt_fail;
+
+      pt_mul_1:
+        // *1 = no-op
+        jmp pt_check_terminator;
+
+      pt_mul_60:
+        // *60 = (*8 + *2) * 6 ... simpler: *64 - *4 requires sub with
+        // carry care. Cleanest with shl+add: *60 = *4 * *15 = *4 *
+        // (*16 - *1). Also complex. Use the direct sum decomposition:
+        // 60 = 32 + 16 + 8 + 4 → shl 5 + shl 4 + shl 3 + shl 2.
+        //   r9 = rcx << 5    (rcx *  32)
+        //   r8 = rcx << 4    (rcx *  16)
+        //   add r9, r8       (rcx *  48)
+        //   r8 = rcx << 3    (rcx *   8)
+        //   add r9, r8       (rcx *  56)
+        //   r8 = rcx << 2    (rcx *   4)
+        //   add r9, r8       (rcx *  60)
+        //   rcx = r9
+        mov r9, rcx;
+        shl r9, 5;                        // *32
+        mov r8, rcx;
+        shl r8, 4;                        // *16
+        add r9, r8;                       // *48
+        mov r8, rcx;
+        shl r8, 3;                        // *8
+        add r9, r8;                       // *56
+        mov r8, rcx;
+        shl r8, 2;                        // *4
+        add r9, r8;                       // *60
+        mov rcx, r9;
+        jmp pt_check_terminator;
+
+      pt_mul_3600:
+        // 3600 = 2048 + 1024 + 512 + 16
+        //      = 2^11 + 2^10 + 2^9 + 2^4
+        //      = shl 11 + shl 10 + shl 9 + shl 4
+        //   r9 = rcx << 11
+        //   r8 = rcx << 10  → add
+        //   r8 = rcx <<  9  → add
+        //   r8 = rcx <<  4  → add
+        mov r9, rcx;
+        shl r9, 11;                       // *2048
+        mov r8, rcx;
+        shl r8, 10;                       // *1024
+        add r9, r8;                       // *3072
+        mov r8, rcx;
+        shl r8, 9;                        // *512
+        add r9, r8;                       // *3584
+        mov r8, rcx;
+        shl r8, 4;                        // *16
+        add r9, r8;                       // *3600
+        mov rcx, r9;
+        jmp pt_check_terminator;
+
+      pt_mul_86400:
+        // 86400 = 65536 + 16384 + 4096 + 256 + 128
+        //       = 2^16 + 2^14 + 2^12 + 2^8 + 2^7
+        //       = shl 16 + shl 14 + shl 12 + shl 8 + shl 7
+        //   r9 = rcx << 16   (65536)
+        //   r8 = rcx << 14   (16384) → add  (r9 = 81920)
+        //   r8 = rcx << 12   ( 4096) → add  (r9 = 86016)
+        //   r8 = rcx <<  8   (  256) → add  (r9 = 86272)
+        //   r8 = rcx <<  7   (  128) → add  (r9 = 86400)
+        mov r9, rcx;
+        shl r9, 16;                       // *65536
+        mov r8, rcx;
+        shl r8, 14;                       // *16384
+        add r9, r8;                       // *81920
+        mov r8, rcx;
+        shl r8, 12;                       // *4096
+        add r9, r8;                       // *86016
+        mov r8, rcx;
+        shl r8, 8;                        // *256
+        add r9, r8;                       // *86272
+        mov r8, rcx;
+        shl r8, 7;                        // *128
+        add r9, r8;                       // *86400
+        mov rcx, r9;
+        // fallthrough
+
+      pt_check_terminator:
+        add rsi, 1;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0;
+        jne pt_fail;
+
+        mov rdx, rcx;
+        mov rax, 1;
+        ret
+
+      pt_fail:
+        xor rax, rax;
+        xor rdx, rdx;
+        ret
+      }
+    }
+}

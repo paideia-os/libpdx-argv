@@ -1,0 +1,190 @@
+// src/flag_spec.pdx — libpdx-argv.M2-001
+// FlagSpec: declarative registration table that binds a long-flag
+// name (or a short-flag one-letter name) to a value kind and a
+// caller-chosen numeric ID.
+//
+// The Parser consults FlagSpec::lookup during parse_argv to decide:
+//   (a) whether a flag consumes argv[i+1] as its value (BOOL / UNKNOWN:
+//       no; typed: yes, required — else ERR_MISSING_VALUE), and
+//   (b) what id/kind pair to store into ParsedArgs::flag_ids /
+//       flag_kinds alongside the raw value pointer.
+//
+// See design/architecture.md §9 for the full M2 API and rationale.
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M2-001 (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module FlagSpec (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max value seen: 32 = SPEC_MAX,
+//     and 0xFF for FKIND_UNKNOWN in the parser).
+//   - r11 is scratch (used in every lea for cross-module bases).
+//   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
+//   - register() and reset() are leaf; lookup() is leaf (does not call
+//     other functions — it inlines the strcmp).
+
+module FlagSpec = structure {
+  // -- Value kinds. Registered flags declare their argument type here. -
+  // The parser reads these constants to decide whether a flag needs a
+  // value (anything != FKIND_BOOL requires one). Consumers read
+  // ParsedArgs::flag_kinds[k] to know which Typed::parse_* to invoke.
+  pub let FKIND_BOOL     : u64 = 0
+  pub let FKIND_STR      : u64 = 1
+  pub let FKIND_INT      : u64 = 2
+  pub let FKIND_TIMESPAN : u64 = 3
+  pub let FKIND_SIZE     : u64 = 4
+  pub let FKIND_ENUM     : u64 = 5
+  // Sentinel returned by lookup() when a name is not registered. The
+  // parser treats FKIND_UNKNOWN identically to FKIND_BOOL (no lookahead)
+  // so tools that never register any flags still get the safe
+  // "unregistered flags are boolean" behaviour that the cat M1 report
+  // called out as the blocking gap in libpdx-argv M1.
+  pub let FKIND_UNKNOWN  : u64 = 0xFF
+
+  pub let SPEC_MAX : u64 = 32
+
+  // Singleton storage. Reset by FlagSpec::reset(); registrations
+  // accumulate via FlagSpec::register(name, kind, id).
+  pub let mut spec_names : [u64; 32] = uninit @align(8)  // NUL-term name ptr
+  pub let mut spec_kinds : [u64; 32] = uninit @align(8)  // FKIND_* constant
+  pub let mut spec_ids   : [u64; 32] = uninit @align(8)  // caller-chosen id
+  pub let mut spec_count : u64       = uninit @align(8)
+
+  // ============================================================
+  // reset() — clear the registration table.
+  // Signature: () -> () !{mem} @{}
+  // Leaf. No arguments.
+  //
+  // Consumer usage:
+  //   FlagSpec::reset()
+  //   StdVocab::register_all()           // 9 std flags
+  //   FlagSpec::register(name, kind, id) // tool-specific flags
+  //   ParsedArgs::reset()
+  //   Parser::parse_argv(argv, argc)
+  // ============================================================
+  pub let reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-001 FlagSpec::reset — zero spec_count so the next FlagSpec::register writes at slot 0. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + spec_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================
+  // register(name_ptr, kind, id)
+  // Signature: (u64, u64, u64) -> () !{mem} @{}
+  //   rdi = name_ptr (NUL-terminated string)
+  //   rsi = kind (FKIND_* constant, 0..5)
+  //   rdx = id (caller-chosen; 0 reserved for "unregistered")
+  //
+  // Appends (name, kind, id) at slot spec_count and increments
+  // spec_count. Silently no-ops past SPEC_MAX; callers that need
+  // overflow detection can compare spec_count against SPEC_MAX
+  // before the call.
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = spec_count / scratch
+  //   r11 = lea scratch for cross-module .bss bases
+  // ============================================================
+  pub let register : (u64, u64, u64) -> () !{mem} @{} =
+    fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-001 FlagSpec::register — appends (name, kind, id) at spec_count and increments. Leaf; r11 for lea; rax as spec_count/scratch. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF).",
+      block: {
+        lea r11, [rip + spec_count];
+        mov rax, [r11];
+        cmp rax, 32;                       // SPEC_MAX
+        jge register_full;
+
+        lea r11, [rip + spec_names];
+        mov [r11 + rax*8], rdi;
+        lea r11, [rip + spec_kinds];
+        mov [r11 + rax*8], rsi;
+        lea r11, [rip + spec_ids];
+        mov [r11 + rax*8], rdx;
+
+        add rax, 1;
+        lea r11, [rip + spec_count];
+        mov [r11], rax;
+
+      register_full:
+        ret
+      }
+    }
+
+  // ============================================================
+  // lookup(name_ptr) -> (kind in rax, id in rdx)
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   rdi (in)  = name_ptr (NUL-terminated)
+  //   rax (out) = kind (FKIND_UNKNOWN if not registered)
+  //   rdx (out) = id (0 if not registered)
+  //
+  // Iterates spec_count entries and compares name_ptr against
+  // spec_names[i] byte-by-byte until both hit NUL (match) or diverge
+  // (miss). The multi-return convention (kind in rax, id in rdx) is
+  // SysV-legal because rax:rdx is the 128-bit return-slot pair. Callers
+  // must treat rdx as clobbered on any call to lookup.
+  //
+  // Leaf (inlines the strcmp; no nested calls).
+  //
+  // Register plan (all caller-save; leaf):
+  //   rcx = outer loop index i
+  //   r10 = spec_count upper bound (hoisted once)
+  //   rsi = spec_names table base (hoisted once)
+  //   r8  = inner walk cursor: candidate name
+  //   r9  = inner walk cursor: input name (copy of rdi)
+  //   rax = byte-load / return (kind)
+  //   rdx = byte-load / return (id)
+  //   r11 = lea scratch (for the match-path kinds/ids loads)
+  // ============================================================
+  pub let lookup : (u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-001 FlagSpec::lookup — linear scan of the registration table returning (kind in rax, id in rdx). O(SPEC_MAX) worst case, at most 32 strcmp probes per parsed flag. Leaf; only caller-save regs. Byte loads use xor+mov_b per #1248. Miss returns FKIND_UNKNOWN=0xFF and id=0 so parser can treat unregistered flags as boolean (the fix for the cat M1 blocker: `cat -n foo.txt` no longer binds `foo.txt` to `-n`). rax/rdx as multi-return exploits SysV's rax:rdx pair; callers save/restore rdx across this call if needed.",
+      block: {
+        xor rcx, rcx;                     // rcx = i = 0
+        lea r11, [rip + spec_count];
+        mov r10, [r11];                   // r10 = spec_count
+        lea rsi, [rip + spec_names];      // rsi = &spec_names[0]
+
+      lookup_loop_head:
+        cmp rcx, r10;
+        jge lookup_not_found;
+
+        mov r8, [rsi + rcx*8];            // r8 = spec_names[i]
+        mov r9, rdi;                      // r9 = input name
+
+      lookup_strcmp_head:
+        xor rax, rax; mov_b rax, [r8];
+        xor rdx, rdx; mov_b rdx, [r9];
+        cmp rax, rdx;
+        jne lookup_advance;
+        cmp rax, 0;
+        je lookup_found;
+        add r8, 1;
+        add r9, 1;
+        jmp lookup_strcmp_head;
+
+      lookup_advance:
+        add rcx, 1;
+        jmp lookup_loop_head;
+
+      lookup_found:
+        // Match at index rcx. Load kind + id and return.
+        lea r11, [rip + spec_kinds];
+        mov rax, [r11 + rcx*8];           // rax = kind
+        lea r11, [rip + spec_ids];
+        mov rdx, [r11 + rcx*8];           // rdx = id
+        ret
+
+      lookup_not_found:
+        mov rax, 0xFF;                    // FKIND_UNKNOWN
+        xor rdx, rdx;                     // id = 0
+        ret
+      }
+    }
+}

@@ -193,3 +193,222 @@ paideia-as ≥ v0.33 is required by the module encoder (needed for the
 `mov_b` narrow-load mnemonic and for the `@align` attribute on `.bss`
 slots). Older paideia-as revisions predate the #1248 mitigation and
 should not be used to build libpdx-argv.
+
+---
+
+## 9. M2 additions (typed flags, standard vocabulary, positional list)
+
+M2 lands three cross-cutting extensions on top of the M1 record and
+state machine. Each is scoped to one file addition or one file edit
+and can be reasoned about independently. Consumers written against
+M1 (there are none in-tree today — cat and rm deliberately delayed
+until M2, per their `.plans/m1-002-notes.md`) migrate by adding
+FlagSpec registrations at their tool's `_start`; the ParsedArgs
+record shape is a superset of the M1 shape, so no reads change.
+
+### 9.1 FlagSpec module (M2-001)
+
+New file: `src/flag_spec.pdx`. A declarative registration table binding
+a long-flag or short-flag name (NUL-terminated string) to a value kind
+and a caller-chosen numeric ID. The parser consults it during argv
+walking to decide arity; consumers read the same table indirectly
+through `ParsedArgs::flag_ids[k]` and `flag_kinds[k]` after the parse.
+
+**Value kinds** (`FKIND_*` constants):
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `FKIND_BOOL`     | 0    | Arity 0 — never consumes a value (`-n`, `--help`) |
+| `FKIND_STR`      | 1    | Arity 1 — opaque string (`--output foo.log`) |
+| `FKIND_INT`      | 2    | Arity 1 — decoded via `Typed::parse_int_u64` |
+| `FKIND_TIMESPAN` | 3    | Arity 1 — decoded via `Typed::parse_timespan` |
+| `FKIND_SIZE`     | 4    | Arity 1 — decoded via `Typed::parse_size` |
+| `FKIND_ENUM`     | 5    | Arity 1 — one of a caller-defined set (`--color=auto`) |
+| `FKIND_UNKNOWN`  | 0xFF | Returned by `lookup` on miss; parser treats as `FKIND_BOOL` |
+
+**API surface** (three entry points, all in `FlagSpec` module):
+
+```
+FlagSpec::reset()                        // clear the table
+FlagSpec::register(name_ptr, kind, id)   // append (name, kind, id)
+FlagSpec::lookup(name_ptr) -> (kind, id) // rax = kind, rdx = id
+```
+
+`register` silently drops past `SPEC_MAX = 32`; callers that need
+overflow detection compare `spec_count` against `SPEC_MAX` before the
+call. `lookup` is a linear scan (O(SPEC_MAX)) with an inline strcmp;
+one call per parsed flag.
+
+**Cat-M1 blocker fix.** The M1 parser always consumed `argv[i+1]` as
+a value for short flags when it did not start with `-` or NUL — under
+that rule `cat -n foo.txt` bound `foo.txt` to `-n` and left
+`pos_count == 0`. In M2 the parser calls `FlagSpec::lookup`; unknown
+names (including short flags a tool has not registered) return
+`FKIND_UNKNOWN` which the parser treats identically to `FKIND_BOOL`
+(no lookahead). Tools that need typed short flags register them
+explicitly with `FKIND_INT` / `FKIND_STR` / etc.
+
+### 9.2 Standard vocabulary (M2-002)
+
+New file: `src/std_vocab.pdx`. The I3 9-flag vocabulary from
+`design/tooling/plan.md`:
+
+| ID | Name        | Kind        |
+|----|-------------|-------------|
+| 1  | `help`      | BOOL        |
+| 2  | `version`   | BOOL        |
+| 3  | `dry-run`   | BOOL        |
+| 4  | `json`      | BOOL        |
+| 5  | `schema`    | BOOL        |
+| 6  | `verbose`   | BOOL        |
+| 7  | `quiet`     | BOOL        |
+| 8  | `color`     | ENUM (`auto`|`always`|`never`) |
+| 9  | `no-cap`    | STR (a KIND name) |
+
+`StdVocab::register_all()` registers all nine with a single call. IDs
+1..9 are reserved for the standard vocabulary; tool-specific IDs must
+start at 100 (an arbitrary convention that leaves room for M3+
+additions without renumbering).
+
+**Short-form aliases are NOT registered by `StdVocab::register_all`.**
+`-h` for help and `-v` for verbose collide with common per-tool short
+flags (cat's `-n`, grep's `-v` for invert-match, ls's `-h` for
+human-readable). Consumers register whichever short aliases they want
+via explicit `FlagSpec::register` calls.
+
+**`--color=<value>`** is a `FKIND_ENUM` flag. The parser stores the
+raw value pointer in `flag_values[k]`; the consumer validates the
+value against its enumerated set (e.g. by inline strcmp against
+`"auto"`, `"always"`, `"never"`).
+
+**`--no-cap:<name>`** uses `:` as the value separator per I3. The
+parser accepts both `=` and `:` as separators for every long flag
+(universal, not conditional on the flag name), so `--no-cap:KIND_TTY`
+parses as name `"no-cap"`, value `"KIND_TTY"`.
+
+### 9.3 Typed value parsers (M2-001)
+
+New file: `src/typed.pdx`. Three leaf parsers, each returning a
+two-value `(ok, val)` pair via the SysV `rax:rdx` return-slot pair:
+
+```
+Typed::parse_int_u64(str_ptr)   -> (rax=ok, rdx=val)
+Typed::parse_size(str_ptr)      -> (rax=ok, rdx=bytes)
+Typed::parse_timespan(str_ptr)  -> (rax=ok, rdx=seconds)
+```
+
+**`parse_int_u64` grammar.** `[0-9]+` terminated by NUL. Empty string
+or any non-digit byte before NUL sets `ok = 0`. Multiplication by 10
+uses `shl+add` (`acc*8 + acc + acc = acc*10`) — no `mul`/`imul` needed
+(both are outside the R49 subset).
+
+**`parse_size` grammar.** `[0-9]+` mantissa optionally followed by one
+of `{k,K,m,M,g,G}` then NUL. Suffix semantics (binary units only at
+M2 — M3 adds multi-char `KiB`/`MB`/`GB` spellings):
+
+| Suffix | Multiplier | Shift |
+|--------|------------|-------|
+| (none) | 1 | 0 |
+| `k`, `K` | 1024 (KiB) | `shl 10` |
+| `m`, `M` | 1024² (MiB) | `shl 20` |
+| `g`, `G` | 1024³ (GiB) | `shl 30` |
+
+**`parse_timespan` grammar.** `[0-9]+` mantissa optionally followed by
+one of `{s,m,h,d}` then NUL. Suffix multipliers (`w` for weeks, and
+compound forms like `1h30m`, are M3):
+
+| Suffix | Meaning | Multiplier |
+|--------|---------|------------|
+| (none) or `s` | seconds | 1 |
+| `m` | minutes | 60 |
+| `h` | hours   | 3600 |
+| `d` | days    | 86400 |
+
+The multipliers are implemented as fixed `shl+add` sequences (see the
+per-arm justifications in `typed.pdx`). This keeps the encoded
+instruction set inside the R49 subset — no `mul`, no `imul`, no `neg`.
+
+### 9.4 ParsedArgs record extensions
+
+Four new slots + one new error code:
+
+| slot             | type       | added at | meaning |
+|------------------|------------|----------|---------|
+| `flag_ids`       | `[u64;32]` | M2-002 | ID from FlagSpec::lookup (0 if unregistered) |
+| `flag_kinds`     | `[u64;32]` | M2-001 | Kind from FlagSpec::lookup (FKIND_UNKNOWN if not) |
+| `ddash_seen`     | `u64`      | M2-003 | 1 iff `--` sentinel was seen |
+| `ddash_arg_index`| `u64`      | M2-003 | argv index of `--` (valid iff ddash_seen == 1) |
+| `ERR_MISSING_VALUE = 6` | — | M2-001 | typed flag with no value available |
+
+New helper: `ParsedArgs::find_flag_by_id(id) -> k`. Iterates
+`flag_count` entries and returns the storage index whose `flag_ids[k]`
+matches the caller-supplied id, or `MAX_FLAGS` (=32) on miss. Consumer
+usage:
+
+```
+let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_HELP)
+if k != 32 { /* --help was seen — dispatch help + exit */ }
+```
+
+### 9.5 `--` sentinel (M2-003)
+
+The parser tracks a single-bit sentinel: once `--` is seen at
+`argv[i]`, `ddash_seen` is set to 1, `ddash_arg_index` to `i`, and the
+loop head unconditionally routes every subsequent `argv[j]` to the
+positional branch — regardless of whether it starts with `-`, is bare
+`-`, or looks like `--foo`. The sentinel itself is not stored in
+`pos_ptrs` (its role is metadata; consumers that want to reconstruct
+the original argv position of the sentinel read `ddash_arg_index`).
+
+### 9.6 Parser register-plan change (M2-001)
+
+The M1 parser was leaf; every register was caller-save. M2 makes it
+non-leaf (one `call FlagSpec::lookup` per parsed flag). The register
+plan shifts loop state into callee-save regs and adds a prologue:
+
+```
+push rbx   ; rsp%16: 8 → 0
+push rbp   ; rsp%16: 0 → 8
+push r12   ; rsp%16: 8 → 0
+push r13   ; rsp%16: 0 → 8
+push r14   ; rsp%16: 8 → 0
+push r15   ; rsp%16: 0 → 8
+sub  rsp, 8 ; rsp%16: 8 → 0
+; body ...
+add  rsp, 8
+pop r15
+pop r14
+pop r13
+pop r12
+pop rbp
+pop rbx
+ret
+```
+
+Callee-save assignments during the body:
+
+- `rbx` = argv base (was M1's `r9`)
+- `rbp` = name pointer preserved across `FlagSpec::lookup`
+- `r12` = argc (was M1's `r10`)
+- `r13` = loop index `i` (was M1's `r8`)
+- `r14` = value pointer preserved across the call (0 = boolean)
+- `r15` = id returned by `lookup`, preserved for the store sequence
+
+Caller-save `rax` holds the kind between the lookup return and the
+store; every intermediate op deliberately avoids touching `rax` so
+the flag_kinds write can consume it directly (see the two `cmp rax,
+...` branches after the `mov r15, rdx` line).
+
+### 9.7 What M2 explicitly does not do
+
+- Multi-char suffixes (`KiB`, `MiB`, `min`, `hour`) — M3.
+- Compound timespans (`1h30m`, `7d12h`) — M3.
+- Negative integers / signed ints — M3.
+- Comparison operators (`--size > 1MB`) — M3 or later; the `>` and
+  `1MB` are separate argv entries at M2, and the tool's own DSL
+  layer decodes them.
+- Alternate invocation path: typed schema record → ParsedArgs — M3-001.
+- `--help` back-end integration with `doc <tool>` — M3-002.
+- `--schema` printing the tool's declared output schemas — M3-003.
+- Semantic-pipe emission — M3-001.
+- Signed release + `.pdxdoc` — M5-001.

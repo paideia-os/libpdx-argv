@@ -1,22 +1,27 @@
-// src/parsed_args.pdx — libpdx-argv.M1-001
+// src/parsed_args.pdx — libpdx-argv.M1-001 + M2-001 + M2-002 + M2-003
 // ParsedArgs record: singleton .bss storage for one parse_argv() call.
-// See design/architecture.md §2–§3 for layout rationale and storage model.
+// See design/architecture.md §2–§3 (M1 record shape) and §9 (M2
+// additions: typed flags, standard vocabulary, positional-list).
 // Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os).
 
 module ParsedArgs = structure {
   // --- Error codes (0 = OK). Consumers pattern-match on these. ---------
+  // Existing (M1):
   pub let ERR_OK                : u64 = 0
   pub let ERR_FLAG_OVERFLOW     : u64 = 1
   pub let ERR_POS_OVERFLOW      : u64 = 2
-  pub let ERR_UNKNOWN_ARG_FORM  : u64 = 3   // set by M1-001 for a short flag; M1-002 replaces with SHORT-flag handling
+  pub let ERR_UNKNOWN_ARG_FORM  : u64 = 3   // reserved; not currently set
   pub let ERR_CLUSTERED_SHORT   : u64 = 4   // set by M1-002 for -la et al
   pub let ERR_LONG_MISSING_NAME : u64 = 5   // "--" or "--=foo"
+  // Added by M2-001 (typed flags):
+  pub let ERR_MISSING_VALUE     : u64 = 6   // typed flag reached EOL without a value
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32
   pub let MAX_POS   : u64 = 32
 
   // --- Singleton storage (bootstrap-scope; M4 migrates to caller-owned). -
+  // Existing (M1) slots:
   pub let mut flag_names        : [u64; 32] = uninit @align(8)
   pub let mut flag_values       : [u64; 32] = uninit @align(8)
   pub let mut flag_count        : u64       = uninit @align(8)
@@ -26,14 +31,28 @@ module ParsedArgs = structure {
   pub let mut error_arg_index   : u64       = uninit @align(8)  // set by parser on error
   pub let mut emit_schema       : u64       = uninit @align(8)  // 1 iff --pdx-schema seen
 
-  // reset() — clear the counters, the error, and the schema flag.
-  // The flag_names / flag_values / pos_ptrs arrays are consumed by index
-  // up to flag_count / pos_count, so stale trailing entries are
-  // unreachable and do not need zeroing.
+  // Added by M2-001 / M2-002: per-flag kind + id populated from
+  // FlagSpec::lookup during parse. Unregistered flags land as
+  // flag_kinds[k] = FKIND_UNKNOWN (0xFF) and flag_ids[k] = 0.
+  pub let mut flag_ids          : [u64; 32] = uninit @align(8)
+  pub let mut flag_kinds        : [u64; 32] = uninit @align(8)
+
+  // Added by M2-003: `--` sentinel discipline.
+  //   ddash_seen == 0  → no `--` in argv; ddash_arg_index is undefined.
+  //   ddash_seen == 1  → `--` was seen at argv[ddash_arg_index]; every
+  //                      argv[i] with i > ddash_arg_index went into
+  //                      pos_ptrs regardless of its first byte.
+  pub let mut ddash_seen        : u64       = uninit @align(8)
+  pub let mut ddash_arg_index   : u64       = uninit @align(8)
+
+  // reset() — clear the M1 + M2 bookkeeping slots.
+  // The flag_names / flag_values / flag_ids / flag_kinds / pos_ptrs
+  // arrays are consumed by index up to flag_count / pos_count, so
+  // stale trailing entries are unreachable and do not need zeroing.
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M1-001: zero the four bookkeeping slots so parse_argv starts from a known-empty ParsedArgs. r11 is scratch (paideia-as conformance). rax=0 is the value written into each slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result.",
+      justification: "libpdx-argv.M1-001 + M2 additions: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count.",
       block: {
         xor rax, rax;                            // rax = 0
         lea r11, [rip + flag_count];      mov [r11], rax;
@@ -41,6 +60,61 @@ module ParsedArgs = structure {
         lea r11, [rip + error_code];      mov [r11], rax;
         lea r11, [rip + error_arg_index]; mov [r11], rax;
         lea r11, [rip + emit_schema];     mov [r11], rax;
+        lea r11, [rip + ddash_seen];      mov [r11], rax;
+        lea r11, [rip + ddash_arg_index]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // find_flag_by_id(id) -> k   [where k = flag index, or MAX_FLAGS = 32
+  //                             if not seen]
+  //
+  // Consumer usage:
+  //   let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_HELP)
+  //   if k != 32 { ... --help was seen ... }
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  // rdi (in)  = target id (0 = "no id / unregistered" — never matches
+  //             registered flags, so passing 0 always returns 32)
+  // rax (out) = k (0..flag_count-1) if a flag with that id was stored;
+  //             else 32 (== MAX_FLAGS).
+  //
+  // Leaf. Iterates flag_count entries once. O(MAX_FLAGS) worst case.
+  //
+  // Register plan (all caller-save; leaf):
+  //   rcx = loop index i
+  //   rax = flag_count upper bound / return value
+  //   r8  = flag_ids table base (hoisted once — never touched across
+  //         iterations)
+  //   r11 = scratch (only used briefly to load flag_count)
+  //   rdx = per-iteration flag_ids[i]
+  pub let find_flag_by_id : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M2-002 find_flag_by_id — linear scan over the flag_ids table returning the storage index k, or MAX_FLAGS (=32) if the id was never registered against a seen flag. Leaf; only caller-save regs used. r8 hoists the flag_ids base so the loop body issues one indexed load per probe. Return uses `mov rax, 32` which fits ≤ 0x7FFFFFFF trivially. Never faults: the loop bound (flag_count, read once at head) is ≤ MAX_FLAGS by construction (Parser enforces the cap before every write into flag_ids).",
+      block: {
+        xor rcx, rcx;                            // rcx = i = 0
+        lea r11, [rip + flag_count];
+        mov rax, [r11];                          // rax = flag_count
+        lea r8, [rip + flag_ids];                // r8  = &flag_ids[0]
+
+      ffbi_loop:
+        cmp rcx, rax;
+        jge ffbi_not_found;
+
+        mov rdx, [r8 + rcx*8];                   // rdx = flag_ids[i]
+        cmp rdx, rdi;
+        je ffbi_found;
+
+        add rcx, 1;
+        jmp ffbi_loop;
+
+      ffbi_found:
+        mov rax, rcx;
+        ret
+
+      ffbi_not_found:
+        mov rax, 32;                             // MAX_FLAGS
         ret
       }
     }

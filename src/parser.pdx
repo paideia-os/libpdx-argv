@@ -1,19 +1,48 @@
-// src/parser.pdx — libpdx-argv.M1-001 + M1-002
+// src/parser.pdx — libpdx-argv.M1-001 + M1-002 + M2-001 + M2-002 + M2-003
 // Parser: entry point parse_argv(argv, argc) → error_code.
-// M1-001 grammar: long flags (--foo, --foo=bar, --foo bar), positionals,
-//                 and the well-known --pdx-schema flag (sets emit_schema).
-// M1-002 adds:    short flags one-per-hyphen (-f accepted; -la rejected
-//                 with ERR_CLUSTERED_SHORT per D3 in design/tooling/plan.md).
 //
-// See design/architecture.md §4 for the state-machine spec and §6 for the
-// paideia-as encoding constraints this module observes.
-// Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os).
+// M1 grammar (unchanged interpretation):
+//   long flags  : --foo, --foo=bar, --foo bar
+//   short flags : one letter per hyphen (-f); -la rejected
+//   positional  : any arg not classified as a flag
+//   sentinel    : --pdx-schema sets emit_schema=1 (libpdx-argv debug)
 //
-// Cross-module symbols read/written (all in ParsedArgs .bss):
-//   flag_names, flag_values, flag_count, pos_ptrs, pos_count,
-//   error_code, error_arg_index, emit_schema
-// Resolved by unqualified linker name — the same pattern dispatch.pdx uses
-// to read Tokenizer::argc / argv_buf in src/user/*.pdx (paideia-os).
+// M2 additions:
+//   M2-001 typed flags — Parser calls FlagSpec::lookup(name) to
+//     decide whether to consume argv[i+1] as a value. Boolean and
+//     unregistered flags NEVER consume; typed flags ALWAYS consume
+//     (error if none available). Fixes the cat-M1 blocker where
+//     `cat -n foo.txt` incorrectly bound `foo.txt` to `-n`.
+//   M2-002 standard vocabulary — parser writes ParsedArgs::flag_ids[k]
+//     and flag_kinds[k] alongside the raw pointer so consumers can
+//     dispatch by ID rather than name compare. See StdVocab.
+//   M2-003 positional-argument list — `--` sentinel handling. Once
+//     `--` is seen at argv[i], every argv[j > i] is treated as a
+//     positional regardless of its first byte. The parser also
+//     accepts `:` as a value separator (in addition to `=`) so
+//     `--no-cap:KIND_TTY` parses as name="no-cap", value="KIND_TTY".
+//
+// See design/architecture.md §4 (M1 state machine) and §9 (M2
+// extensions). Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12
+// (paideia-os).
+//
+// Cross-module symbols read/written (all resolved by unqualified name):
+//   ParsedArgs: flag_names, flag_values, flag_count, pos_ptrs,
+//               pos_count, error_code, error_arg_index, emit_schema,
+//               flag_ids, flag_kinds, ddash_seen, ddash_arg_index
+//   FlagSpec::  lookup (called via qualified name)
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Parser (PascalCase basename).
+//   - No test mnemonic; every zero-check uses cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 0xFF for FKIND_UNKNOWN,
+//     and 32 for the overflow checks; single-byte ASCII for chars).
+//   - r11 is scratch (used in every lea for cross-module .bss bases).
+//   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
+//   - SysV push/pop parity: 6 pushes (rbx, rbp, r12, r13, r14, r15)
+//     + sub rsp, 8 = 7 slots on stack after the return address, so
+//     rsp%16 = 0 at every nested call site. Epilogue mirrors exactly.
 
 module Parser = structure {
 
@@ -21,144 +50,201 @@ module Parser = structure {
   //   rdi = argv (u64* array of NUL-terminated arg pointers)
   //   rsi = argc (count of entries in argv)
   //   rax = 0 (ERR_OK) on success, else one of the ERR_* codes in
-  //         ParsedArgs. On error the offending arg index is also recorded
-  //         to ParsedArgs::error_arg_index for the diagnostic renderer.
+  //         ParsedArgs. On error the offending arg index is also
+  //         recorded to ParsedArgs::error_arg_index for the
+  //         diagnostic renderer.
   //
-  // Register plan (all caller-save; leaf function — no callee-save touched):
-  //   r8  = i          (arg loop counter)
-  //   r9  = argv       (base pointer copy of rdi)
-  //   r10 = argc       (copy of rsi)
-  //   r11 = scratch    (paideia-as reserved scratch; used for every LEA)
-  //   rax = byte load  (post xor rax,rax per #1248 mitigation) / return
-  //   rcx = walk cursor within current arg / value pointer
-  //   rdx = current argv[i] pointer
+  // Non-leaf (calls FlagSpec::lookup once per flag).
+  //
+  // Register plan (callee-save preserved via 6-push + 8-byte pad):
+  //   rbx = argv base pointer
+  //   rbp = temporary name ptr / other spill (preserved across
+  //         FlagSpec::lookup calls)
+  //   r12 = argc
+  //   r13 = i (loop counter; may be incremented mid-iteration when
+  //         a typed flag consumes argv[i+1])
+  //   r14 = value ptr for the flag currently being stored
+  //         (0 = boolean; else pointer into argv-owned memory)
+  //   r15 = id from FlagSpec::lookup for the flag currently being
+  //         stored (0 = unregistered)
+  //
+  // Scratch (caller-save; may be trashed across call FlagSpec::lookup):
+  //   rax = byte load / lookup return kind / return value
+  //   rcx = walk cursor / storage slot index
+  //   rdx = argv[i] pointer (reloaded from [rbx + r13*8] as needed)
+  //   rdi = arg to FlagSpec::lookup
+  //   rsi = unused
+  //   r8, r9, r10 = ephemeral compute
+  //   r11 = lea scratch for cross-module .bss bases
   pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M1-001 + M1-002 parse_argv entry point. Long-flag grammar per design/architecture.md §4: --foo / --foo=bar / --foo bar lookahead. Short-flag grammar per §5: -f accepted (single letter + NUL, with same lookahead rule as long flags); -la or any two-or-more-character run after '-' rejected with ERR_CLUSTERED_SHORT (D3 one-per-hyphen contract). Positional args go into pos_ptrs. Well-known --pdx-schema flag sets ParsedArgs::emit_schema=1 in addition to normal flag storage. paideia-as conformance: cross-module writes via lea r11,[rip+sym]+mov; byte loads always preceded by xor rax,rax; every cmp reg,imm ≤ 0x7FFFFFFF; no test mnemonic; r11 scratch. Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-argv.M2 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration).",
       block: {
-        // ---- prologue ---------------------------------------------------
-        mov r9, rdi;                    // r9 = argv base
-        mov r10, rsi;                   // r10 = argc
-        xor r8, r8;                     // r8 = i = 0
+        // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                       // rbx = argv base
+        mov r12, rsi;                       // r12 = argc
+        xor r13, r13;                       // r13 = i = 0
 
       parse_argv_loop_head:
-        cmp r8, r10;
+        cmp r13, r12;
         jge parse_argv_done_ok;
 
-        mov rdx, [r9 + r8*8];           // rdx = argv[i]
+        mov rdx, [rbx + r13*8];             // rdx = argv[i]
 
-        // byte0 = rdx[0]. '-' == 0x2D.
+        // -- ddash sentinel gate: if `--` was seen, every arg is positional
+        lea r11, [rip + ddash_seen];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne parse_argv_positional;
+
+        // -- Classify by argv[i][0]
         xor rax, rax;
         mov_b rax, [rdx];
-        cmp rax, 0x2D;
+        cmp rax, 0x2D;                      // '-'
         je parse_argv_maybe_flag;
         jmp parse_argv_positional;
 
       parse_argv_maybe_flag:
-        // byte1 = rdx[1]. '-' == 0x2D; NUL == 0.
+        // Byte1 check: 0x2D = another '-' (long or ddash), NUL = bare '-'
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0x2D;
-        je parse_argv_long_flag;
+        je parse_argv_maybe_long_or_ddash;
         cmp rax, 0;
-        je parse_argv_positional;       // bare "-" is a positional
+        je parse_argv_positional;           // bare "-" is a positional
         jmp parse_argv_short_flag;
 
-      parse_argv_long_flag:
-        // byte2 = rdx[2]. Must be a name char — reject NUL and '='.
+      parse_argv_maybe_long_or_ddash:
+        // Byte2 check.
+        //   NUL → bare "--" (M2-003 sentinel: set ddash_seen + advance)
+        //   '=' or ':' → "--=..." / "--:..." — LONG_MISSING_NAME
+        //   else → long-flag body
         xor rax, rax;
         mov_b rax, [rdx + 2];
         cmp rax, 0;
+        je parse_argv_set_ddash;
+        cmp rax, 0x3D;
         je parse_argv_long_missing_name;
-        cmp rax, 0x3D;                  // '=' == 0x3D
+        cmp rax, 0x3A;
         je parse_argv_long_missing_name;
+        jmp parse_argv_long_flag_body;
 
-        // Walk cursor from rdx+2 looking for '=' or NUL.
-        mov rcx, rdx;
-        add rcx, 2;                     // rcx = walk cursor = name start
+      parse_argv_set_ddash:
+        // Record the sentinel and skip storing it. Every subsequent
+        // argv[j] takes the ddash gate at loop head.
+        mov rax, 1;
+        lea r11, [rip + ddash_seen];
+        mov [r11], rax;
+        mov rax, r13;
+        lea r11, [rip + ddash_arg_index];
+        mov [r11], rax;
+        jmp parse_argv_advance_loop;
+
+      parse_argv_long_flag_body:
+        // rdx = arg ptr, valid. Preserve the name pointer (rdx + 2)
+        // in rbp so it survives the FlagSpec::lookup call. Walk from
+        // rbp looking for '=', ':', or NUL.
+        mov rbp, rdx;
+        add rbp, 2;                         // rbp = name ptr
+
+        mov rcx, rbp;                       // walk cursor
+        xor r14, r14;                       // value ptr = 0
 
       parse_argv_walk_name:
         xor rax, rax;
         mov_b rax, [rcx];
         cmp rax, 0;
-        je parse_argv_name_no_value;
-        cmp rax, 0x3D;
-        je parse_argv_name_eq_value;
+        je parse_argv_name_no_eq;
+        cmp rax, 0x3D;                      // '='
+        je parse_argv_name_has_sep;
+        cmp rax, 0x3A;                      // ':'
+        je parse_argv_name_has_sep;
         add rcx, 1;
         jmp parse_argv_walk_name;
 
-      parse_argv_name_eq_value:
-        // In-place null-terminate the '=' byte. value = rcx + 1.
+      parse_argv_name_has_sep:
+        // In-place null-terminate at the separator; value = cursor + 1.
         xor rax, rax;
         mov_b [rcx], rax;
-        add rcx, 1;
-        jmp parse_argv_store_long_flag;
+        mov r14, rcx;
+        add r14, 1;
+        // fallthrough to lookup
 
-      parse_argv_name_no_value:
-        // Name already NUL-terminated. Check argv[i+1] for lookahead.
-        mov rax, r8;
-        add rax, 1;
-        cmp rax, r10;
-        jge parse_argv_no_lookahead;
+      parse_argv_name_no_eq:
+        // Either r14 = 0 (no inline value; will consult lookup for
+        // arity) or r14 = value ptr (from = or : form).
+        mov rdi, rbp;                       // rdi = name ptr
+        call FlagSpec::lookup;              // rax=kind, rdx=id
+        mov r15, rdx;                       // r15 = id (preserved for store)
+        // rax = kind (preserved through the arity checks below since
+        // those touch r14/r10/r12/r13/r14 not rax)
 
-        mov rcx, [r9 + rax*8];          // rcx = argv[i+1] candidate value
+        cmp r14, 0;
+        jne parse_argv_long_do_store;       // value already set
 
-        xor rax, rax;
-        mov_b rax, [rcx];
-        cmp rax, 0;
-        je parse_argv_no_lookahead;     // empty string → not a value
-        cmp rax, 0x2D;
-        je parse_argv_no_lookahead;     // starts with '-' → not a value
+        cmp rax, 0;                         // FKIND_BOOL
+        je parse_argv_long_do_store;
+        cmp rax, 0xFF;                      // FKIND_UNKNOWN
+        je parse_argv_long_do_store;
 
-        // Consume argv[i+1] as value. Advance i by an extra step so the
-        // outer loop's add r8,1 lands us past both args.
-        add r8, 1;
-        jmp parse_argv_store_long_flag;
+        // Typed flag, no inline value → consume argv[i+1] as value.
+        mov r10, r13;
+        add r10, 1;
+        cmp r10, r12;
+        jge parse_argv_missing_value;
 
-      parse_argv_no_lookahead:
-        xor rcx, rcx;                   // value = 0 (boolean flag)
-        jmp parse_argv_store_long_flag;
+        mov r14, [rbx + r10*8];             // r14 = argv[i+1]
+        add r13, 1;                         // consume argv[i+1]
 
-      parse_argv_store_long_flag:
-        // Entry contract: rdx = arg ptr (name lives at rdx+2), rcx = value
-        // pointer (or 0 for boolean flag).
+      parse_argv_long_do_store:
+        // Store into ParsedArgs.
+        //   rbp = name ptr, r14 = value ptr (0 for boolean),
+        //   r15 = id, rax = kind (still valid from the lookup return —
+        //   the paths above deliberately avoid clobbering rax).
         lea r11, [rip + flag_count];
-        mov rax, [r11];
-        cmp rax, 32;                    // ParsedArgs::MAX_FLAGS
+        mov rcx, [r11];
+        cmp rcx, 32;                        // MAX_FLAGS
         jge parse_argv_flag_overflow;
 
-        // name = rdx + 2 (skip the "--" prefix). Mutate rdx in place —
-        // no further read of rdx as arg ptr occurs below this point on
-        // this iteration.
-        add rdx, 2;
-
         lea r11, [rip + flag_names];
-        mov [r11 + rax*8], rdx;         // flag_names[k] = name ptr
-
+        mov [r11 + rcx*8], rbp;
         lea r11, [rip + flag_values];
-        mov [r11 + rax*8], rcx;         // flag_values[k] = value ptr
+        mov [r11 + rcx*8], r14;
+        lea r11, [rip + flag_ids];
+        mov [r11 + rcx*8], r15;
+        lea r11, [rip + flag_kinds];
+        mov [r11 + rcx*8], rax;
 
-        add rax, 1;
+        add rcx, 1;
         lea r11, [rip + flag_count];
-        mov [r11], rax;
+        mov [r11], rcx;
 
-        // Well-known flag detection: if name equals "pdx-schema"
-        // (byte-exact, length 10 + NUL), set emit_schema = 1. Inline
-        // byte compare — libpdx-argv predates any strcmp helper. Any
-        // mismatch falls through to parse_argv_advance_loop with
-        // emit_schema left untouched.
-        xor rax, rax; mov_b rax, [rdx + 0];  cmp rax, 0x70; jne parse_argv_advance_loop;  // 'p'
-        xor rax, rax; mov_b rax, [rdx + 1];  cmp rax, 0x64; jne parse_argv_advance_loop;  // 'd'
-        xor rax, rax; mov_b rax, [rdx + 2];  cmp rax, 0x78; jne parse_argv_advance_loop;  // 'x'
-        xor rax, rax; mov_b rax, [rdx + 3];  cmp rax, 0x2D; jne parse_argv_advance_loop;  // '-'
-        xor rax, rax; mov_b rax, [rdx + 4];  cmp rax, 0x73; jne parse_argv_advance_loop;  // 's'
-        xor rax, rax; mov_b rax, [rdx + 5];  cmp rax, 0x63; jne parse_argv_advance_loop;  // 'c'
-        xor rax, rax; mov_b rax, [rdx + 6];  cmp rax, 0x68; jne parse_argv_advance_loop;  // 'h'
-        xor rax, rax; mov_b rax, [rdx + 7];  cmp rax, 0x65; jne parse_argv_advance_loop;  // 'e'
-        xor rax, rax; mov_b rax, [rdx + 8];  cmp rax, 0x6D; jne parse_argv_advance_loop;  // 'm'
-        xor rax, rax; mov_b rax, [rdx + 9];  cmp rax, 0x61; jne parse_argv_advance_loop;  // 'a'
-        xor rax, rax; mov_b rax, [rdx + 10]; cmp rax, 0;    jne parse_argv_advance_loop;  // NUL
+        // -- Well-known --pdx-schema inline compare (M1 back-compat) --
+        // If name (rbp) equals "pdx-schema\0" byte-for-byte, set
+        // emit_schema=1. Any mismatch falls through to advance.
+        // This runs in addition to (not instead of) the FlagSpec-based
+        // storage above — a consumer that registers --pdx-schema still
+        // sees flag_ids[k] populated AND emit_schema toggled.
+        xor rax, rax; mov_b rax, [rbp + 0];  cmp rax, 0x70; jne parse_argv_advance_loop;  // 'p'
+        xor rax, rax; mov_b rax, [rbp + 1];  cmp rax, 0x64; jne parse_argv_advance_loop;  // 'd'
+        xor rax, rax; mov_b rax, [rbp + 2];  cmp rax, 0x78; jne parse_argv_advance_loop;  // 'x'
+        xor rax, rax; mov_b rax, [rbp + 3];  cmp rax, 0x2D; jne parse_argv_advance_loop;  // '-'
+        xor rax, rax; mov_b rax, [rbp + 4];  cmp rax, 0x73; jne parse_argv_advance_loop;  // 's'
+        xor rax, rax; mov_b rax, [rbp + 5];  cmp rax, 0x63; jne parse_argv_advance_loop;  // 'c'
+        xor rax, rax; mov_b rax, [rbp + 6];  cmp rax, 0x68; jne parse_argv_advance_loop;  // 'h'
+        xor rax, rax; mov_b rax, [rbp + 7];  cmp rax, 0x65; jne parse_argv_advance_loop;  // 'e'
+        xor rax, rax; mov_b rax, [rbp + 8];  cmp rax, 0x6D; jne parse_argv_advance_loop;  // 'm'
+        xor rax, rax; mov_b rax, [rbp + 9];  cmp rax, 0x61; jne parse_argv_advance_loop;  // 'a'
+        xor rax, rax; mov_b rax, [rbp + 10]; cmp rax, 0;    jne parse_argv_advance_loop;  // NUL
 
         mov rax, 1;
         lea r11, [rip + emit_schema];
@@ -166,70 +252,69 @@ module Parser = structure {
         jmp parse_argv_advance_loop;
 
       parse_argv_short_flag:
-        // Entry contract: rdx = arg ptr, rdx[0]='-', rdx[1]=letter (not
-        // '-' and not NUL — those were already routed by parse_argv_maybe_
-        // flag). Check byte2: NUL → single-letter short flag; anything
-        // else → clustered → ERR_CLUSTERED_SHORT per D3.
+        // rdx = arg ptr; rdx[0]='-'; rdx[1] is neither '-' nor NUL.
+        // Check byte2: NUL → single-letter short flag; else clustered.
         xor rax, rax;
         mov_b rax, [rdx + 2];
         cmp rax, 0;
         jne parse_argv_short_clustered;
 
-        // Single short flag. Same value-lookahead rule as long flags.
-        mov rax, r8;
-        add rax, 1;
-        cmp rax, r10;
-        jge parse_argv_short_no_lookahead;
+        // Single-letter short flag. Name = rdx + 1 (a 1-char + NUL
+        // string that is a valid C-style string for FlagSpec::lookup).
+        mov rbp, rdx;
+        add rbp, 1;                         // rbp = name ptr
+        xor r14, r14;                       // value = 0
 
-        mov rcx, [r9 + rax*8];
-        xor rax, rax;
-        mov_b rax, [rcx];
-        cmp rax, 0;
-        je parse_argv_short_no_lookahead;
-        cmp rax, 0x2D;
-        je parse_argv_short_no_lookahead;
+        mov rdi, rbp;
+        call FlagSpec::lookup;              // rax=kind, rdx=id
+        mov r15, rdx;
 
-        add r8, 1;                      // consume argv[i+1] as value
-        jmp parse_argv_store_short_flag;
+        cmp rax, 0;                         // FKIND_BOOL
+        je parse_argv_short_do_store;
+        cmp rax, 0xFF;                      // FKIND_UNKNOWN
+        je parse_argv_short_do_store;
 
-      parse_argv_short_no_lookahead:
-        xor rcx, rcx;
-        jmp parse_argv_store_short_flag;
+        // Typed short flag → consume argv[i+1] as value.
+        mov r10, r13;
+        add r10, 1;
+        cmp r10, r12;
+        jge parse_argv_missing_value;
 
-      parse_argv_store_short_flag:
-        // rdx = arg ptr (name = rdx+1, a NUL-terminated 1-char string).
-        // rcx = value ptr (or 0). Short flags do not participate in the
-        // --pdx-schema well-known compare — that flag is long-only.
+        mov r14, [rbx + r10*8];
+        add r13, 1;
+
+      parse_argv_short_do_store:
         lea r11, [rip + flag_count];
-        mov rax, [r11];
-        cmp rax, 32;                    // ParsedArgs::MAX_FLAGS
+        mov rcx, [r11];
+        cmp rcx, 32;
         jge parse_argv_flag_overflow;
 
-        add rdx, 1;                     // name = rdx + 1 (skip '-')
-
         lea r11, [rip + flag_names];
-        mov [r11 + rax*8], rdx;
-
+        mov [r11 + rcx*8], rbp;
         lea r11, [rip + flag_values];
-        mov [r11 + rax*8], rcx;
+        mov [r11 + rcx*8], r14;
+        lea r11, [rip + flag_ids];
+        mov [r11 + rcx*8], r15;
+        lea r11, [rip + flag_kinds];
+        mov [r11 + rcx*8], rax;
 
-        add rax, 1;
+        add rcx, 1;
         lea r11, [rip + flag_count];
-        mov [r11], rax;
+        mov [r11], rcx;
         jmp parse_argv_advance_loop;
 
       parse_argv_short_clustered:
-        mov rax, 4;                     // ERR_CLUSTERED_SHORT
+        mov rax, 4;                         // ERR_CLUSTERED_SHORT
         jmp parse_argv_fail;
 
       parse_argv_positional:
         lea r11, [rip + pos_count];
         mov rax, [r11];
-        cmp rax, 32;                    // ParsedArgs::MAX_POS
+        cmp rax, 32;                        // MAX_POS
         jge parse_argv_pos_overflow;
 
         lea r11, [rip + pos_ptrs];
-        mov [r11 + rax*8], rdx;         // pos_ptrs[m] = argv[i]
+        mov [r11 + rax*8], rdx;             // pos_ptrs[m] = argv[i]
 
         add rax, 1;
         lea r11, [rip + pos_count];
@@ -237,35 +322,54 @@ module Parser = structure {
         jmp parse_argv_advance_loop;
 
       parse_argv_advance_loop:
-        add r8, 1;
+        add r13, 1;
         jmp parse_argv_loop_head;
 
       parse_argv_long_missing_name:
-        mov rax, 5;                     // ERR_LONG_MISSING_NAME
+        mov rax, 5;                         // ERR_LONG_MISSING_NAME
         jmp parse_argv_fail;
 
       parse_argv_flag_overflow:
-        mov rax, 1;                     // ERR_FLAG_OVERFLOW
+        mov rax, 1;                         // ERR_FLAG_OVERFLOW
         jmp parse_argv_fail;
 
       parse_argv_pos_overflow:
-        mov rax, 2;                     // ERR_POS_OVERFLOW
+        mov rax, 2;                         // ERR_POS_OVERFLOW
+        jmp parse_argv_fail;
+
+      parse_argv_missing_value:
+        mov rax, 6;                         // ERR_MISSING_VALUE
         jmp parse_argv_fail;
 
       parse_argv_fail:
-        // rax = error code. Record it + the offending arg index for the
-        // consumer's stderr diagnostic. Return rax so the caller sees the
-        // error without a second load.
+        // rax = error code. Record error_code + error_arg_index, then
+        // restore callee-save regs and return rax.
         lea r11, [rip + error_code];
         mov [r11], rax;
         lea r11, [rip + error_arg_index];
-        mov [r11], r8;
+        mov [r11], r13;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
         ret
 
       parse_argv_done_ok:
-        xor rax, rax;                   // ERR_OK
+        xor rax, rax;                       // ERR_OK
         lea r11, [rip + error_code];
         mov [r11], rax;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
         ret
       }
     }
