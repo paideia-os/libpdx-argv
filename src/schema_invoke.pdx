@@ -225,7 +225,7 @@ module SchemaInvoke = structure {
       schema_flag_no_value:
         // Call FlagSpec::lookup(name_ptr).
         mov rdi, rbp;
-        call FlagSpec::lookup;              // rax=kind, rdx=id
+        call lookup;              // rax=kind, rdx=id
         mov r15, rdx;                       // r15 = id (preserved)
         // rax = kind (preserved for the store below — no arm here
         // clobbers rax before the flag_kinds write).
@@ -344,7 +344,7 @@ module SchemaInvoke = structure {
         pop r12;
         pop rbp;
         pop rbx;
-        ret
+        ret;
       }
     }
 }

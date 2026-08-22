@@ -71,7 +71,7 @@ module ParsedArgs = structure {
         lea r11, [rip + emit_schema];     mov [r11], rax;
         lea r11, [rip + ddash_seen];      mov [r11], rax;
         lea r11, [rip + ddash_arg_index]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -120,11 +120,11 @@ module ParsedArgs = structure {
 
       ffbi_found:
         mov rax, rcx;
-        ret
+        ret;
 
       ffbi_not_found:
         mov rax, 32;                             // MAX_FLAGS
-        ret
+        ret;
       }
     }
 }

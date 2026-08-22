@@ -86,7 +86,7 @@ module SchemaEmit = structure {
         xor rax, rax;
         lea r11, [rip + schema_count];
         mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -122,7 +122,7 @@ module SchemaEmit = structure {
         mov [r11], rax;
 
       schema_emit_register_full:
-        ret
+        ret;
       }
     }
 
@@ -142,7 +142,7 @@ module SchemaEmit = structure {
       block: {
         lea r11, [rip + schema_count];
         mov rax, [r11];
-        ret
+        ret;
       }
     }
 
@@ -169,11 +169,11 @@ module SchemaEmit = structure {
 
         lea r11, [rip + schema_names];
         mov rax, [r11 + rdi*8];
-        ret
+        ret;
 
       schema_emit_get_name_oor:
         xor rax, rax;                       // 0 = out of range
-        ret
+        ret;
       }
     }
 }

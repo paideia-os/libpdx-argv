@@ -94,12 +94,12 @@ module Typed = structure {
         je pi_fail;
         mov rdx, rcx;                     // rdx = val
         mov rax, 1;                       // rax = ok
-        ret
+        ret;
 
       pi_fail:
         xor rax, rax;                     // rax = 0 (fail)
         xor rdx, rdx;                     // rdx = 0
-        ret
+        ret;
       }
     }
 
@@ -169,7 +169,7 @@ module Typed = structure {
         je ps_fail;
         mov rdx, rcx;
         mov rax, 1;
-        ret
+        ret;
 
       ps_maybe_suffix:
         // rax holds the non-digit byte. Must be a valid suffix AND
@@ -215,12 +215,12 @@ module Typed = structure {
 
         mov rdx, rcx;
         mov rax, 1;
-        ret
+        ret;
 
       ps_fail:
         xor rax, rax;
         xor rdx, rdx;
-        ret
+        ret;
       }
     }
 
@@ -287,7 +287,7 @@ module Typed = structure {
         je pt_fail;
         mov rdx, rcx;
         mov rax, 1;
-        ret
+        ret;
 
       pt_maybe_suffix:
         cmp r10, 0;
@@ -391,12 +391,12 @@ module Typed = structure {
 
         mov rdx, rcx;
         mov rax, 1;
-        ret
+        ret;
 
       pt_fail:
         xor rax, rax;
         xor rdx, rdx;
-        ret
+        ret;
       }
     }
 }

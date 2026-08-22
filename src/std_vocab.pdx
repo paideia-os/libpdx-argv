@@ -97,34 +97,34 @@ module StdVocab = structure {
         push rbx;                                // align rsp
 
         lea rdi, [rip + STD_NAME_HELP];    mov rsi, 0;    mov rdx, 1;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_VERSION]; mov rsi, 0;    mov rdx, 2;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_DRY_RUN]; mov rsi, 0;    mov rdx, 3;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_JSON];    mov rsi, 0;    mov rdx, 4;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_SCHEMA];  mov rsi, 0;    mov rdx, 5;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_VERBOSE]; mov rsi, 0;    mov rdx, 6;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_QUIET];   mov rsi, 0;    mov rdx, 7;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_COLOR];   mov rsi, 5;    mov rdx, 8;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + STD_NAME_NO_CAP];  mov rsi, 1;    mov rdx, 9;
-        call FlagSpec::register;
+        call register;
 
         pop rbx;
-        ret
+        ret;
       }
     }
 }

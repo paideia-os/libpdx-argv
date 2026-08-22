@@ -70,7 +70,7 @@ module FlagSpec = structure {
         xor rax, rax;
         lea r11, [rip + spec_count];
         mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -112,7 +112,7 @@ module FlagSpec = structure {
         mov [r11], rax;
 
       register_full:
-        ret
+        ret;
       }
     }
 
@@ -179,12 +179,12 @@ module FlagSpec = structure {
         mov rax, [r11 + rcx*8];           // rax = kind
         lea r11, [rip + spec_ids];
         mov rdx, [r11 + rcx*8];           // rdx = id
-        ret
+        ret;
 
       lookup_not_found:
         mov rax, 0xFF;                    // FKIND_UNKNOWN
         xor rdx, rdx;                     // id = 0
-        ret
+        ret;
       }
     }
 }

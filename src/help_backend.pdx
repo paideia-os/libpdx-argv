@@ -86,7 +86,7 @@ module HelpBackend = structure {
         lea r11, [rip + DOC_TOOL_NAME];
         mov [rdi + 0], r11;                 // argv_slots[0] = &DOC_TOOL_NAME
         mov [rdi + 8], rsi;                 // argv_slots[1] = tool_name_ptr
-        ret
+        ret;
       }
     }
 }
