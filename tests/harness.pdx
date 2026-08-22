@@ -27,7 +27,7 @@
 //   - Every cmp reg, imm ≤ 0x7FFFFFFF.
 //   - Byte loads (unused here — pointer/counter qword traffic only).
 
-module TestHarness = structure {
+module Harness = structure {
 
   // Singleton counters. Each test module increments exactly one of
   // these per test case. The driver reads both at end-of-run and
@@ -63,7 +63,7 @@ module TestHarness = structure {
         lea r11, [rip + pass_count];    mov [r11], rax;
         lea r11, [rip + fail_count];    mov [r11], rax;
         lea r11, [rip + last_fail_tag]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -81,7 +81,7 @@ module TestHarness = structure {
         mov rax, [r11];
         add rax, 1;
         mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -106,7 +106,7 @@ module TestHarness = structure {
 
         lea r11, [rip + last_fail_tag];
         mov [r11], rdi;
-        ret
+        ret;
       }
     }
 
@@ -135,12 +135,12 @@ module TestHarness = structure {
       block: {
         push rbx;
 
-        call ParsedArgs::reset;
-        call FlagSpec::reset;
-        call SchemaEmit::reset;
+        call reset;
+        call reset;
+        call reset;
 
         pop rbx;
-        ret
+        ret;
       }
     }
 }

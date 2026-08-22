@@ -15,7 +15,7 @@
 //   - run_all is non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module ParseStdVocabTests = structure {
+module ParseStdVocab = structure {
 
   // -- Argv entries for the full sweep (9 flags — 7 bool + color + no-cap).
   pub let a_help    : [u8; 7]  = "--help\0"
@@ -46,8 +46,8 @@ module ParseStdVocabTests = structure {
         push r15;
         sub rsp, 8;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         // Fill argv_all[0..9] with the nine flag pointers.
         lea rbx, [rip + argv_all];
@@ -63,7 +63,7 @@ module ParseStdVocabTests = structure {
 
         lea rdi, [rip + argv_all];
         mov rsi, 9;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0; jne sv_fail;
 
         // flag_count == 9
@@ -82,20 +82,20 @@ module ParseStdVocabTests = structure {
         cmp r15, 9;
         jg sv_ok;
         mov rdi, r15;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je sv_fail;
         add r15, 1;
         jmp sv_loop;
 
       sv_ok:
-        call TestHarness::record_pass;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_pass;
+        add rsp, 8; pop r15; pop rbx; ret;
 
       sv_fail:
         mov rdi, 0x500000001;
-        call TestHarness::record_fail;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_fail;
+        add rsp, 8; pop r15; pop rbx; ret;
       }
     }
 
@@ -124,52 +124,52 @@ module ParseStdVocabTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         lea rdi, [rip + name_help_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 1; jne iu_fail;
 
         lea rdi, [rip + name_version_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 2; jne iu_fail;
 
         lea rdi, [rip + name_dry_run_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 3; jne iu_fail;
 
         lea rdi, [rip + name_json_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 4; jne iu_fail;
 
         lea rdi, [rip + name_schema_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 5; jne iu_fail;
 
         lea rdi, [rip + name_verbose_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 6; jne iu_fail;
 
         lea rdi, [rip + name_quiet_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 7; jne iu_fail;
 
         lea rdi, [rip + name_color_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 8; jne iu_fail;
 
         lea rdi, [rip + name_no_cap_ref];
-        call FlagSpec::lookup;
+        call lookup;
         cmp rdx, 9; jne iu_fail;
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       iu_fail:
         mov rdi, 0x500000002;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 }

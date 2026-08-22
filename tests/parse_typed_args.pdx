@@ -25,7 +25,7 @@
 //   - run_* fns non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module ParseTypedArgsTests = structure {
+module ParseTypedArgs = structure {
 
   // FlagSpec name literals (NUL-term).
   pub let name_older_than : [u8; 11] = "older-than\0"
@@ -63,13 +63,13 @@ module ParseTypedArgsTests = structure {
         push r15;
         sub rsp, 8;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         // FlagSpec::register(name=older-than, kind=FKIND_TIMESPAN=3, id=100)
         lea rdi, [rip + name_older_than];
         mov rsi, 3;
         mov rdx, 100;
-        call FlagSpec::register;
+        call register;
 
         lea r11, [rip + f_older_flag];
         lea rbx, [rip + argv1];
@@ -79,11 +79,11 @@ module ParseTypedArgsTests = structure {
 
         lea rdi, [rip + argv1];
         mov rsi, 2;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0; jne case1_fail;
 
         mov rdi, 100;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32; je case1_fail;
 
         // value ptr = flag_values[rax] — check first byte is '7'
@@ -94,18 +94,18 @@ module ParseTypedArgsTests = structure {
 
         // Round-trip: Typed::parse_timespan(value) → (1, 604800)
         mov rdi, r15;
-        call Typed::parse_timespan;
+        call parse_timespan;
         mov r14, rdx;
         cmp rax, 1; jne case1_fail;
         cmp r14, 604800; jne case1_fail;
 
-        call TestHarness::record_pass;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_pass;
+        add rsp, 8; pop r15; pop rbx; ret;
 
       case1_fail:
         mov rdi, 0x300000001;
-        call TestHarness::record_fail;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_fail;
+        add rsp, 8; pop r15; pop rbx; ret;
       }
     }
 
@@ -120,12 +120,12 @@ module ParseTypedArgsTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea rdi, [rip + name_older_than];
         mov rsi, 3;
         mov rdx, 100;
-        call FlagSpec::register;
+        call register;
 
         lea r11, [rip + f_older_flag];
         lea rbx, [rip + argv2];
@@ -133,16 +133,16 @@ module ParseTypedArgsTests = structure {
 
         lea rdi, [rip + argv2];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 6; jne case2_fail;         // ERR_MISSING_VALUE
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       case2_fail:
         mov rdi, 0x300000002;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 
@@ -161,12 +161,12 @@ module ParseTypedArgsTests = structure {
         push r15;
         sub rsp, 8;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea rdi, [rip + name_older_than];
         mov rsi, 3;
         mov rdx, 100;
-        call FlagSpec::register;
+        call register;
 
         lea r11, [rip + f_older_eq];
         lea rbx, [rip + argv5];
@@ -174,11 +174,11 @@ module ParseTypedArgsTests = structure {
 
         lea rdi, [rip + argv5];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0; jne case3_fail;
 
         mov rdi, 100;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32; je case3_fail;
 
         lea r11, [rip + flag_values];
@@ -187,16 +187,16 @@ module ParseTypedArgsTests = structure {
         mov r15, rdx;
 
         mov rdi, r15;
-        call Typed::parse_timespan;
+        call parse_timespan;
         cmp rax, 1; jne case3_fail;
 
-        call TestHarness::record_pass;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_pass;
+        add rsp, 8; pop r15; pop rbx; ret;
 
       case3_fail:
         mov rdi, 0x300000003;
-        call TestHarness::record_fail;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_fail;
+        add rsp, 8; pop r15; pop rbx; ret;
       }
     }
 
@@ -216,12 +216,12 @@ module ParseTypedArgsTests = structure {
         push r15;
         sub rsp, 8;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea rdi, [rip + name_n_short];
         mov rsi, 2;                          // FKIND_INT
         mov rdx, 101;
-        call FlagSpec::register;
+        call register;
 
         lea r11, [rip + f_n_short];
         lea rbx, [rip + argv3];
@@ -231,11 +231,11 @@ module ParseTypedArgsTests = structure {
 
         lea rdi, [rip + argv3];
         mov rsi, 2;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0; jne case4_fail;
 
         mov rdi, 101;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32; je case4_fail;
 
         lea r11, [rip + flag_values];
@@ -244,18 +244,18 @@ module ParseTypedArgsTests = structure {
         mov r15, rdx;
 
         mov rdi, r15;
-        call Typed::parse_int_u64;
+        call parse_int_u64;
         mov r14, rdx;
         cmp rax, 1; jne case4_fail;
         cmp r14, 5; jne case4_fail;
 
-        call TestHarness::record_pass;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_pass;
+        add rsp, 8; pop r15; pop rbx; ret;
 
       case4_fail:
         mov rdi, 0x300000004;
-        call TestHarness::record_fail;
-        add rsp, 8; pop r15; pop rbx; ret
+        call record_fail;
+        add rsp, 8; pop r15; pop rbx; ret;
       }
     }
 
@@ -269,12 +269,12 @@ module ParseTypedArgsTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea rdi, [rip + name_n_short];
         mov rsi, 2;
         mov rdx, 101;
-        call FlagSpec::register;
+        call register;
 
         lea r11, [rip + f_n_short];
         lea rbx, [rip + argv4];
@@ -282,16 +282,16 @@ module ParseTypedArgsTests = structure {
 
         lea rdi, [rip + argv4];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 6; jne case5_fail;         // ERR_MISSING_VALUE
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       case5_fail:
         mov rdi, 0x300000005;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 }

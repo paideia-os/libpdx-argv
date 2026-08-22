@@ -19,7 +19,7 @@
 //   - run_* fns non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module HelpBackendTests = structure {
+module HelpBackend = structure {
 
   // Caller-owned argv scratch for fill_doc_argv.
   pub let mut argv_scratch : [u64; 2] = uninit @align(8)
@@ -45,13 +45,13 @@ module HelpBackendTests = structure {
         xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x63; jne hb1_fail;  // 'c'
         xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0;    jne hb1_fail;  // NUL
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       hb1_fail:
         mov rdi, 0x700000001;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 
@@ -71,7 +71,7 @@ module HelpBackendTests = structure {
 
         lea rdi, [rip + argv_scratch];
         lea rsi, [rip + sample_tool_name];
-        call HelpBackend::fill_doc_argv;
+        call fill_doc_argv;
 
         // argv_scratch[0] must equal &DOC_TOOL_NAME
         lea r15, [rip + DOC_TOOL_NAME];
@@ -84,13 +84,13 @@ module HelpBackendTests = structure {
         mov rax, [rbx + 8];
         cmp rax, r15; jne hb2_fail;
 
-        call TestHarness::record_pass;
-        pop r15; pop rbx; ret
+        call record_pass;
+        pop r15; pop rbx; ret;
 
       hb2_fail:
         mov rdi, 0x700000002;
-        call TestHarness::record_fail;
-        pop r15; pop rbx; ret
+        call record_fail;
+        pop r15; pop rbx; ret;
       }
     }
 
@@ -113,11 +113,11 @@ module HelpBackendTests = structure {
 
         lea rdi, [rip + argv_scratch];
         lea rsi, [rip + sample_tool_name];
-        call HelpBackend::fill_doc_argv;
+        call fill_doc_argv;
 
         lea rdi, [rip + argv_scratch2];
         lea rsi, [rip + sample_tool_name];   // same tool_name
-        call HelpBackend::fill_doc_argv;
+        call fill_doc_argv;
 
         // both argv[0]s must equal each other AND equal &DOC_TOOL_NAME.
         lea rbx, [rip + argv_scratch];
@@ -129,13 +129,13 @@ module HelpBackendTests = structure {
         lea r15, [rip + DOC_TOOL_NAME];
         cmp rax, r15; jne hb3_fail;
 
-        call TestHarness::record_pass;
-        pop r15; pop rbx; ret
+        call record_pass;
+        pop r15; pop rbx; ret;
 
       hb3_fail:
         mov rdi, 0x700000003;
-        call TestHarness::record_fail;
-        pop r15; pop rbx; ret
+        call record_fail;
+        pop r15; pop rbx; ret;
       }
     }
 }

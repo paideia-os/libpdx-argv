@@ -17,7 +17,7 @@
 //   - run_* fns non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module SchemaEmitTests = structure {
+module SchemaEmit = structure {
 
   // Sample schema-name literals (NUL-term). Consumers would supply
   // real-shape names like "PackageManifest@0.1\0"; here we only need
@@ -43,22 +43,22 @@ module SchemaEmitTests = structure {
       block: {
         push rbx;
 
-        call SchemaEmit::reset;
+        call reset;
 
-        call SchemaEmit::get_count;
+        call get_count;
         cmp rax, 0; jne se1_fail;
 
         mov rdi, 0;
-        call SchemaEmit::get_name;
+        call get_name;
         cmp rax, 0; jne se1_fail;
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       se1_fail:
         mov rdi, 0x800000001;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 
@@ -73,34 +73,34 @@ module SchemaEmitTests = structure {
         push rbx;
         push r15;
 
-        call SchemaEmit::reset;
+        call reset;
 
         lea rdi, [rip + sch_a];
-        call SchemaEmit::register;
+        call register;
 
         lea rdi, [rip + sch_b];
-        call SchemaEmit::register;
+        call register;
 
-        call SchemaEmit::get_count;
+        call get_count;
         cmp rax, 2; jne se2_fail;
 
         mov rdi, 0;
-        call SchemaEmit::get_name;
+        call get_name;
         lea r15, [rip + sch_a];
         cmp rax, r15; jne se2_fail;
 
         mov rdi, 1;
-        call SchemaEmit::get_name;
+        call get_name;
         lea r15, [rip + sch_b];
         cmp rax, r15; jne se2_fail;
 
-        call TestHarness::record_pass;
-        pop r15; pop rbx; ret
+        call record_pass;
+        pop r15; pop rbx; ret;
 
       se2_fail:
         mov rdi, 0x800000002;
-        call TestHarness::record_fail;
-        pop r15; pop rbx; ret
+        call record_fail;
+        pop r15; pop rbx; ret;
       }
     }
 
@@ -115,28 +115,28 @@ module SchemaEmitTests = structure {
       block: {
         push rbx;
 
-        call SchemaEmit::reset;
+        call reset;
 
-        lea rdi, [rip + sch_a]; call SchemaEmit::register;
-        lea rdi, [rip + sch_b]; call SchemaEmit::register;
-        lea rdi, [rip + sch_c]; call SchemaEmit::register;
-        lea rdi, [rip + sch_d]; call SchemaEmit::register;
-        lea rdi, [rip + sch_e]; call SchemaEmit::register;
-        lea rdi, [rip + sch_f]; call SchemaEmit::register;
-        lea rdi, [rip + sch_g]; call SchemaEmit::register;
-        lea rdi, [rip + sch_h]; call SchemaEmit::register;
-        lea rdi, [rip + sch_i]; call SchemaEmit::register;  // dropped
+        lea rdi, [rip + sch_a]; call register;
+        lea rdi, [rip + sch_b]; call register;
+        lea rdi, [rip + sch_c]; call register;
+        lea rdi, [rip + sch_d]; call register;
+        lea rdi, [rip + sch_e]; call register;
+        lea rdi, [rip + sch_f]; call register;
+        lea rdi, [rip + sch_g]; call register;
+        lea rdi, [rip + sch_h]; call register;
+        lea rdi, [rip + sch_i]; call register;  // dropped
 
-        call SchemaEmit::get_count;
+        call get_count;
         cmp rax, 8; jne se3_fail;
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       se3_fail:
         mov rdi, 0x800000003;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 
@@ -153,32 +153,32 @@ module SchemaEmitTests = structure {
       block: {
         push rbx;
 
-        call SchemaEmit::reset;
+        call reset;
         lea rdi, [rip + sch_a];
-        call SchemaEmit::register;
+        call register;
 
         // count=1; idx=1 is OOR
         mov rdi, 1;
-        call SchemaEmit::get_name;
+        call get_name;
         cmp rax, 0; jne se4_fail;
 
         // idx=7 (< SCHEMA_MAX=8, but > count=1) OOR
         mov rdi, 7;
-        call SchemaEmit::get_name;
+        call get_name;
         cmp rax, 0; jne se4_fail;
 
         // idx=99 (> SCHEMA_MAX) OOR
         mov rdi, 99;
-        call SchemaEmit::get_name;
+        call get_name;
         cmp rax, 0; jne se4_fail;
 
-        call TestHarness::record_pass;
-        pop rbx; ret
+        call record_pass;
+        pop rbx; ret;
 
       se4_fail:
         mov rdi, 0x800000004;
-        call TestHarness::record_fail;
-        pop rbx; ret
+        call record_fail;
+        pop rbx; ret;
       }
     }
 
@@ -194,33 +194,33 @@ module SchemaEmitTests = structure {
         push rbx;
         push r15;
 
-        call SchemaEmit::reset;
-        lea rdi, [rip + sch_a]; call SchemaEmit::register;
-        lea rdi, [rip + sch_b]; call SchemaEmit::register;
-        lea rdi, [rip + sch_c]; call SchemaEmit::register;
+        call reset;
+        lea rdi, [rip + sch_a]; call register;
+        lea rdi, [rip + sch_b]; call register;
+        lea rdi, [rip + sch_c]; call register;
 
-        call SchemaEmit::reset;
-        call SchemaEmit::get_count;
+        call reset;
+        call get_count;
         cmp rax, 0; jne se5_fail;
 
         lea rdi, [rip + sch_d];
-        call SchemaEmit::register;
+        call register;
 
-        call SchemaEmit::get_count;
+        call get_count;
         cmp rax, 1; jne se5_fail;
 
         mov rdi, 0;
-        call SchemaEmit::get_name;
+        call get_name;
         lea r15, [rip + sch_d];
         cmp rax, r15; jne se5_fail;
 
-        call TestHarness::record_pass;
-        pop r15; pop rbx; ret
+        call record_pass;
+        pop r15; pop rbx; ret;
 
       se5_fail:
         mov rdi, 0x800000005;
-        call TestHarness::record_fail;
-        pop r15; pop rbx; ret
+        call record_fail;
+        pop r15; pop rbx; ret;
       }
     }
 }

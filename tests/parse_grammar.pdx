@@ -31,7 +31,7 @@
 //   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
 //   - r11 lea scratch (cross-module .bss).
 
-module ParseGrammarTests = structure {
+module ParseGrammar = structure {
 
   // -- Fail-tag helpers: (1 << 32) | case_number. Encoded as literal
   // -- constants so record_fail's `mov rdi, TAG` fits imm32 for
@@ -61,8 +61,8 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         // argv[0] = &case1_long_bool
         lea r11, [rip + case1_long_bool];
@@ -72,13 +72,13 @@ module ParseGrammarTests = structure {
         // parse_argv(rdi=argv, rsi=argc=1)
         lea rdi, [rip + case1_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;                          // ERR_OK
         jne case1_fail;
 
         // find_flag_by_id(STD_ID_HELP=1) must return non-32
         mov rdi, 1;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je case1_fail;
 
@@ -88,15 +88,15 @@ module ParseGrammarTests = structure {
         cmp rdx, 0;
         jne case1_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case1_fail:
         mov rdi, 0x100000001;                // (1<<32) | 1
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -117,8 +117,8 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         lea r11, [rip + case2_long_eq];
         lea rbx, [rip + case2_argv];
@@ -126,12 +126,12 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case2_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case2_fail;
 
         mov rdi, 8;                          // STD_ID_COLOR
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je case2_fail;
 
@@ -145,15 +145,15 @@ module ParseGrammarTests = structure {
         cmp rcx, 0x61;                       // 'a'
         jne case2_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case2_fail:
         mov rdi, 0x100000002;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -174,8 +174,8 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         lea r11, [rip + case3_long_colon];
         lea rbx, [rip + case3_argv];
@@ -183,12 +183,12 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case3_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case3_fail;
 
         mov rdi, 9;                          // STD_ID_NO_CAP
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je case3_fail;
 
@@ -201,15 +201,15 @@ module ParseGrammarTests = structure {
         cmp rcx, 0x4B;                       // 'K'
         jne case3_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case3_fail:
         mov rdi, 0x100000003;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -233,8 +233,8 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         lea r11, [rip + case4_json];
         lea rbx, [rip + case4_argv];
@@ -244,7 +244,7 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case4_argv];
         mov rsi, 2;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case4_fail;
 
@@ -268,15 +268,15 @@ module ParseGrammarTests = structure {
         cmp rcx, 0x66;
         jne case4_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case4_fail:
         mov rdi, 0x100000004;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -299,7 +299,7 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea r11, [rip + case5_ddash];
         lea rbx, [rip + case5_argv];
@@ -311,7 +311,7 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case5_argv];
         mov rsi, 3;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case5_fail;
 
@@ -335,15 +335,15 @@ module ParseGrammarTests = structure {
         cmp rax, 0;
         jne case5_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case5_fail:
         mov rdi, 0x100000005;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -363,7 +363,7 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea r11, [rip + case6_clustered];
         lea rbx, [rip + case6_argv];
@@ -371,7 +371,7 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case6_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 4;                          // ERR_CLUSTERED_SHORT
         jne case6_fail;
 
@@ -385,15 +385,15 @@ module ParseGrammarTests = structure {
         cmp rax, 0;
         jne case6_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case6_fail:
         mov rdi, 0x100000006;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -414,12 +414,12 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea rdi, [rip + case7_short_name];
         mov rsi, 0;                          // FKIND_BOOL
         mov rdx, 100;
-        call FlagSpec::register;
+        call register;
 
         lea r11, [rip + case7_short_arg];
         lea rbx, [rip + case7_argv];
@@ -427,12 +427,12 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case7_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case7_fail;
 
         mov rdi, 100;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je case7_fail;
 
@@ -441,15 +441,15 @@ module ParseGrammarTests = structure {
         cmp rdx, 0;
         jne case7_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case7_fail:
         mov rdi, 0x100000007;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -468,7 +468,7 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea r11, [rip + case8_bad_eq];
         lea rbx, [rip + case8_argv];
@@ -476,19 +476,19 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case8_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 5;                          // ERR_LONG_MISSING_NAME
         jne case8_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case8_fail:
         mov rdi, 0x100000008;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -509,7 +509,7 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea r11, [rip + case9_bad_colon];
         lea rbx, [rip + case9_argv];
@@ -517,19 +517,19 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case9_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 5;
         jne case9_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case9_fail:
         mov rdi, 0x100000009;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -550,7 +550,7 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea r11, [rip + case10_bare_dash];
         lea rbx, [rip + case10_argv];
@@ -558,7 +558,7 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case10_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case10_fail;
 
@@ -572,15 +572,15 @@ module ParseGrammarTests = structure {
         cmp rax, 1;
         jne case10_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case10_fail:
         mov rdi, 0x10000000A;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -600,7 +600,7 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
+        call full_reset;
 
         lea r11, [rip + case11_pdx_schema];
         lea rbx, [rip + case11_argv];
@@ -608,7 +608,7 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case11_argv];
         mov rsi, 1;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case11_fail;
 
@@ -622,15 +622,15 @@ module ParseGrammarTests = structure {
         cmp rax, 1;
         jne case11_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case11_fail:
         mov rdi, 0x10000000B;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -654,8 +654,8 @@ module ParseGrammarTests = structure {
       block: {
         push rbx;
 
-        call TestHarness::full_reset;
-        call StdVocab::register_all;
+        call full_reset;
+        call register_all;
 
         lea r11, [rip + case12_verbose];
         lea rbx, [rip + case12_argv];
@@ -669,7 +669,7 @@ module ParseGrammarTests = structure {
 
         lea rdi, [rip + case12_argv];
         mov rsi, 4;
-        call Parser::parse_argv;
+        call parse_argv;
         cmp rax, 0;
         jne case12_fail;
 
@@ -685,25 +685,25 @@ module ParseGrammarTests = structure {
 
         // find --verbose (id=6) present
         mov rdi, 6;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je case12_fail;
 
         // find --quiet (id=7) present
         mov rdi, 7;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         cmp rax, 32;
         je case12_fail;
 
-        call TestHarness::record_pass;
+        call record_pass;
         pop rbx;
-        ret
+        ret;
 
       case12_fail:
         mov rdi, 0x10000000C;
-        call TestHarness::record_fail;
+        call record_fail;
         pop rbx;
-        ret
+        ret;
       }
     }
 }
