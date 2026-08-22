@@ -1,8 +1,10 @@
-// src/parsed_args.pdx — libpdx-argv.M1-001 + M2-001 + M2-002 + M2-003
+// src/parsed_args.pdx — libpdx-argv.M1-001 + M2-001 + M2-002 + M2-003 + M3-001
 // ParsedArgs record: singleton .bss storage for one parse_argv() call.
 // See design/architecture.md §2–§3 (M1 record shape) and §9 (M2
-// additions: typed flags, standard vocabulary, positional-list).
-// Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os).
+// additions: typed flags, standard vocabulary, positional-list) and
+// §10 (M3 additions: schema-record invocation, doc back-end, --schema
+// emission). Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12
+// (paideia-os).
 
 module ParsedArgs = structure {
   // --- Error codes (0 = OK). Consumers pattern-match on these. ---------
@@ -15,6 +17,13 @@ module ParsedArgs = structure {
   pub let ERR_LONG_MISSING_NAME : u64 = 5   // "--" or "--=foo"
   // Added by M2-001 (typed flags):
   pub let ERR_MISSING_VALUE     : u64 = 6   // typed flag reached EOL without a value
+  // Added by M3-001 (schema-record invocation path). All three surface via
+  // SchemaInvoke::parse_from_schema_record. The alt path shares the same
+  // ERR_* space as parse_argv so a consumer's error-dispatch table can
+  // treat both invocation paths uniformly.
+  pub let ERR_SCHEMA_BAD_MAGIC          : u64 = 7  // wire-form magic mismatch
+  pub let ERR_SCHEMA_UNSUPPORTED_VERSION: u64 = 8  // version != 1
+  pub let ERR_SCHEMA_BAD_LAYOUT         : u64 = 9  // record too short or count > MAX
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

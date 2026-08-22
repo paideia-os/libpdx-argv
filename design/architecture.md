@@ -412,3 +412,100 @@ the flag_kinds write can consume it directly (see the two `cmp rax,
 - `--schema` printing the tool's declared output schemas — M3-003.
 - Semantic-pipe emission — M3-001.
 - Signed release + `.pdxdoc` — M5-001.
+
+---
+
+## 10. M3 additions (schema invocation, doc back-end, --schema emit)
+
+M3 lands three independent extensions on the M2 foundation. None of
+them changes the ParsedArgs read shape; each adds either a new module,
+a new set of error codes, or a new entry-point that fills the same
+ParsedArgs a M2 consumer already reads. A M2 consumer can pick up any
+subset of M3 without touching its existing dispatch code.
+
+### 10.1 Alternate invocation: typed schema record → ParsedArgs (M3-001)
+
+New file: `src/schema_invoke.pdx`. Module `SchemaInvoke` with one
+entry point:
+
+```
+SchemaInvoke::parse_from_schema_record(record_ptr, record_len) -> u64
+```
+
+**Wire form (v1).** The entire record body sits in caller-owned memory
+that libpdx-argv borrows exactly the way it borrows argv. Every
+pointer written into ParsedArgs is computed as `record_ptr + offset`
+and stays live as long as the caller keeps the record buffer alive.
+
+| offset | size | field |
+|--------|------|-------|
+| 0 | 8 | magic = `"PDXARGV\0"` ASCII (0x50 0x44 0x58 0x41 0x52 0x47 0x56 0x00) |
+| 8 | 8 | version (u64 LE; must equal `SCHEMA_VERSION_V1 = 1`) |
+| 16 | 8 | flag_count (u64; 0..MAX_FLAGS=32) |
+| 24 | 8 | pos_count (u64; 0..MAX_POS=32) |
+| 32 | 16 · flag_count | flag entries — each is `{u64 name_off, u64 value_off}` |
+| next | 8 · pos_count | positional entries — each is `u64 pos_off` |
+| rest | — | string table (NUL-terminated strings; opaque here) |
+
+**Semantics.**
+
+- `name_ptr = record_ptr + name_off` for every flag; the sender lays
+  out the string table such that each `name_off` points at a NUL-
+  terminated bytestring.
+- `value_off == 0` marks a boolean flag (no value stored); otherwise
+  `value_ptr = record_ptr + value_off` (same NUL-terminated shape).
+- For each flag, `SchemaInvoke` calls `FlagSpec::lookup(name_ptr)` and
+  writes `(kind, id)` into `ParsedArgs::flag_kinds[k]` /
+  `ParsedArgs::flag_ids[k]` — identical semantics to `Parser::parse_argv`
+  so a consumer's `find_flag_by_id` dispatch is invocation-path
+  agnostic.
+- On error `error_code` is set to one of the three new codes below,
+  and `error_arg_index` carries the flag/pos loop index at failure
+  (0 for header failures).
+
+**New error codes** (in `ParsedArgs`):
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `ERR_SCHEMA_BAD_MAGIC`           | 7 | Bytes 0..8 did not match `"PDXARGV\0"`. |
+| `ERR_SCHEMA_UNSUPPORTED_VERSION` | 8 | Version qword != 1. |
+| `ERR_SCHEMA_BAD_LAYOUT`          | 9 | Record < 32 B, or count > MAX, or body-fits check failed. |
+
+**Preconditions.** `ParsedArgs::reset()` and `FlagSpec` registration
+must have happened before the call. The consumer's `_start` sequence
+becomes:
+
+```
+FlagSpec::reset()
+StdVocab::register_all()
+FlagSpec::register(tool_specific ...)
+ParsedArgs::reset()
+
+if invoked_via_argv:
+    Parser::parse_argv(argv, argc)
+else:                                # invoked via semantic-pipe
+    SchemaInvoke::parse_from_schema_record(rec_ptr, rec_len)
+
+// downstream dispatch identical on both paths
+```
+
+**What the parser does NOT validate at M3-001.**
+
+- String terminators. Every `name_off` / `value_off` / `pos_off` is
+  trusted to point at a NUL-terminated bytestring inside the record.
+  Validation of "does this offset land on a byte the sender allocated,
+  and does a NUL appear before the record end?" is a M4 test-matrix
+  concern per `libpdx-argv.M4-001` line "typed-arg-parse-error
+  diagnostics".
+- `ddash_seen` and `emit_schema`. The schema-record shape has no
+  literal `--` sentinel and no `--pdx-schema` well-known-flag; a
+  sender that wants either concept expresses it via a registered
+  flag id and its consumer's dispatch table. `SchemaInvoke` leaves
+  both `ParsedArgs` slots at whatever value `ParsedArgs::reset` left
+  them (i.e. 0).
+
+**Non-leaf / SysV alignment.** `parse_from_schema_record` is non-leaf
+(one `call FlagSpec::lookup` per stored flag). The prologue mirrors
+`Parser::parse_argv` exactly: push rbx/rbp/r12/r13/r14/r15 + `sub
+rsp, 8` = 7 stack slots after the return address, so `rsp % 16 == 0`
+at every nested call site.

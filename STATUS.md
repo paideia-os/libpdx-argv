@@ -1,10 +1,8 @@
 # libpdx-argv — status
 
 **Wave:** R49 shared library
-**Current milestone:** M2 (core implementation) — CLOSED. Ready for M3
-(semantic-pipe / audit integration: alt invocation via typed schema
-record, `--help` back-end integration with `doc <tool>`, `--schema`
-prints tool's declared output schemas).
+**Current milestone:** M3 in progress (M3-001 LANDED — alternate
+invocation path via typed schema record; M3-002 and M3-003 next).
 
 ## Milestone rollup
 
@@ -15,14 +13,16 @@ prints tool's declared output schemas).
 | M2-001 (#3)     | typed flag arguments (--older-than 7d, --size > 1MB)               | LANDED |
 | M2-002 (#4)     | 9-flag standard vocabulary from I3                                 | LANDED |
 | M2-003 (#5)     | positional-argument list handling (`--` sentinel, `:` separator)   | LANDED |
+| M3-001 (#6)     | alternate invocation: typed schema record -> ParsedArgs            | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.12 in paideia-os for the full
-milestone breakdown (M1–M5) and cross-repo dependencies.
+milestone breakdown (M1-M5) and cross-repo dependencies.
 
 ## Local layout
 
 - `design/architecture.md` — internal spec (M1 record shape + state
-  machine + M2 additions: FlagSpec, StdVocab, Typed, positional list).
+  machine + M2 additions: FlagSpec, StdVocab, Typed, positional list
+  + M3.1: SchemaInvoke).
 - `src/parsed_args.pdx` — `ParsedArgs` module (error codes + slot
   storage + `find_flag_by_id` helper).
 - `src/parser.pdx` — `Parser` module (`parse_argv` entry point;
@@ -33,7 +33,10 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   `register_all` helper; M2-002).
 - `src/typed.pdx` — `Typed` module (`parse_int_u64`, `parse_size`,
   `parse_timespan`; M2-001).
-- `caps.decl` — libpdx-argv requires no caps of its own.
+- `src/schema_invoke.pdx` — `SchemaInvoke` module (alt invocation:
+  typed record -> ParsedArgs; M3-001).
+- `caps.decl` — libpdx-argv requires no caps of its own; declares the
+  `PdxArgvRecord@0.1` wire schema consumed by SchemaInvoke.
 - `tests/` — empty until `libpdx-argv.M4-001` lands the
   parse-correctness matrix.
 - `.plans/` — per-milestone implementation notes.

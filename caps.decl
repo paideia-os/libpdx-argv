@@ -17,8 +17,11 @@
 requires: (none)
 
 # Declared output schemas — the semantic-pipe schema record that the
-# parser emits when the caller asks for --pdx-schema. Landed as a
-# text-form stub in M1; migrates to libpdx-semantic-pipe wire format in
-# M3 (see r49-r50-plan.md §5.12 M3 line).
+# parser emits when the caller asks for --pdx-schema (M1 stub) and the
+# alternate-invocation wire schema read by SchemaInvoke::parse_from_
+# schema_record (M3-001; see design/architecture.md §10.1 for the wire
+# form). Both share the same schema fingerprint namespace and land at
+# libpdx-semantic-pipe M2 once envelope framing is wired end-to-end.
 declares_output_schemas:
   - PdxArgvParsed@0.1
+  - PdxArgvRecord@0.1
