@@ -549,3 +549,66 @@ argv[0] agrees byte-for-byte, so a shell-side audit-record consumer
 can recognise the "doc" tool without normalising per-caller
 whitespace or case. The symbol is 4 bytes; the cost of the shared
 copy is negligible.
+
+### 10.3 `--schema` prints declared output schemas (M3-003)
+
+New file: `src/schema_emit.pdx`. Module `SchemaEmit` with a four-call
+API that mirrors FlagSpec's storage-then-lookup shape:
+
+```
+SchemaEmit::reset()                       // clear the table
+SchemaEmit::register(schema_name_ptr)     // append; drops past SCHEMA_MAX=8
+SchemaEmit::get_count() -> u64            // for iteration
+SchemaEmit::get_name(idx) -> u64          // per-slot ptr (0 if idx OOR)
+```
+
+**Storage-only, not I/O.** libpdx-argv holds no capability (see
+`caps.decl`: "libpdx-argv requires no caps of its own"). SchemaEmit
+owns the *table* of declared schema names; the actual write to
+stdout is the consumer's responsibility (which holds the KIND_TTY /
+KIND_IPC_ENDPOINT cap for stdout). This split keeps the library
+untouched by the R42-blocked I/O substrate and cleanly testable at M4.
+
+**Consumer pattern.**
+
+```
+at _start:
+  SchemaEmit::reset()
+  SchemaEmit::register(&SCHEMA_NAME_A)   // e.g. "MyToolRecord@0.1\0"
+  SchemaEmit::register(&SCHEMA_NAME_B)
+
+at --schema dispatch:
+  let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_SCHEMA)
+  if k != 32 {
+    let n = SchemaEmit::get_count()
+    let mut i = 0
+    while i < n {
+      write_line(stdout_fd, SchemaEmit::get_name(i))
+      i = i + 1
+    }
+    exit(0)
+  }
+```
+
+**Cap on 8 schemas.** Every P0 tool's observed maximum is 3 (`pkg`
+declares PackageManifest[], InstallProgressRecord[], and
+KeyFingerprintRecord[]). SCHEMA_MAX = 8 leaves 5× headroom without
+inflating the .bss footprint (64 B for the array + 8 B for the count).
+Over-registrations silently drop; consumers wanting the diagnostic
+compare `schema_count` against their intended count after the batch.
+
+### 10.4 What M3 explicitly does not do
+
+- Runtime parse of `caps.decl` `declares_output_schemas:` — the
+  consumer bakes its schema list into `.rodata` and registers them
+  by pointer. Runtime `caps.decl` parsing is a post-M5 concern gated
+  on the `pdx-help` library.
+- Fork/exec of `doc` — the `HelpBackend::fill_doc_argv` output is the
+  argv the caller passes to whichever `doc_dispatch` entry it linked;
+  the actual process spawn is R51+ substrate.
+- Wire-form v2 for the semantic-pipe record — the M3 shape is v1;
+  a compound `flag_group` or per-flag `kind` override would land as
+  v2 alongside a coordinated libpdx-semantic-pipe schema fingerprint
+  bump.
+- Per-string-terminator validation on the schema record — M4-001
+  test-matrix line.

@@ -1,0 +1,179 @@
+// src/schema_emit.pdx — libpdx-argv.M3-003
+// SchemaEmit: --schema prints the tool's declared output schemas.
+//
+// Every P0 tool implements `--schema` (I3 STD_ID_SCHEMA). The tool
+// declares its output schemas in `caps.decl` (see the
+// `declares_output_schemas:` line in libpdx-argv's own caps.decl for
+// the canonical shape). When the user passes `--schema`, the tool
+// prints one schema name per line on stdout, then exits 0.
+//
+// libpdx-argv cannot itself write to stdout — it holds no capability
+// (see `caps.decl`: "libpdx-argv requires no caps of its own"). This
+// module therefore only owns the *table* of declared schema names;
+// the actual write is the consumer's job (which does hold the
+// KIND_TTY / KIND_IPC_ENDPOINT cap for stdout).
+//
+// The three-call shape mirrors FlagSpec:
+//
+//   SchemaEmit::reset()                    // clear
+//   SchemaEmit::register(schema_name_ptr)  // append
+//   ...
+//   SchemaEmit::get_count() -> u64         // read for iteration
+//   SchemaEmit::get_name(idx) -> u64       // per-slot ptr (0 if OOR)
+//
+// Consumer pattern:
+//
+//   at _start:
+//     SchemaEmit::reset()
+//     SchemaEmit::register(&SCHEMA_NAME_A)  // e.g. "MyToolRecord@0.1\0"
+//     SchemaEmit::register(&SCHEMA_NAME_B)
+//     ...
+//
+//   at --schema handling:
+//     let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_SCHEMA)
+//     if k != 32 {
+//       let n = SchemaEmit::get_count()
+//       let mut i = 0
+//       while i < n {
+//         let ptr = SchemaEmit::get_name(i)
+//         write_line(stdout_fd, ptr)      // consumer's own syscall
+//         i = i + 1
+//       }
+//       exit(0)
+//     }
+//
+// See design/architecture.md §10.3 for the M3 emission-vs-storage
+// split rationale.
+// Upstream: design/tooling/r49-r50-plan.md §5.12 M3-003 (paideia-os).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module SchemaEmit (PascalCase basename).
+//   - All entry points are leaf (no push/pop parity needed).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 8 = SCHEMA_MAX).
+//   - r11 is scratch (used only for cross-module .bss lea).
+//   - Byte loads unused (this module stores/reads only pointer qwords).
+
+module SchemaEmit = structure {
+
+  // Bootstrap-scope cap on declared schemas per tool. 8 is generous
+  // for every P0 tool (the observed max is `pkg`'s 3 output schemas:
+  // PackageManifest[], InstallProgressRecord[], KeyFingerprintRecord[]).
+  // Increases are wire-compatible — SchemaEmit::register drops past
+  // SCHEMA_MAX silently, which surfaces at the consumer via
+  // get_count() < the number of register() calls made.
+  pub let SCHEMA_MAX : u64 = 8
+
+  // Singleton .bss table — pointers to caller-owned NUL-terminated
+  // schema-name strings (typically per-tool .rodata symbols). The
+  // table entries are pure pointers; SchemaEmit never dereferences
+  // them so unaligned or invalid pointers don't crash this module.
+  pub let mut schema_names : [u64; 8] = uninit @align(8)
+  pub let mut schema_count : u64      = uninit @align(8)
+
+  // ============================================================
+  // reset() — clear the schema-name table.
+  // Signature: () -> () !{mem} @{}
+  // Leaf. Zeroes schema_count; the schema_names array is consumed by
+  // index so stale trailing entries are unreachable.
+  // ============================================================
+  pub let reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M3-003 SchemaEmit::reset — zero schema_count so the next SchemaEmit::register writes at slot 0. Leaf; r11 scratch; xor rax,rax produces the zero constant.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + schema_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================
+  // register(schema_name_ptr) -> ()
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = schema_name_ptr — NUL-terminated string; e.g. a
+  //         per-tool .rodata symbol like "MyToolRecord@0.1\0".
+  //
+  // Appends the pointer at slot schema_count and increments; silently
+  // drops past SCHEMA_MAX. Callers wanting overflow detection can
+  // read schema_count against SCHEMA_MAX after their batch.
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = schema_count / scratch
+  //   r11 = lea scratch for cross-module .bss bases
+  // ============================================================
+  pub let register : (u64) -> () !{mem} @{} =
+    fn (schema_name_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M3-003 SchemaEmit::register — appends a NUL-terminated schema-name pointer at slot schema_count. Silently no-ops past SCHEMA_MAX (=8) so a consumer that over-registers surfaces the miss via get_count() vs its call count rather than as a run-time fault. Leaf; r11 lea scratch; rax as spec_count/scratch. The MAX-check uses cmp rax, 8 (well ≤ 0x7FFFFFFF).",
+      block: {
+        lea r11, [rip + schema_count];
+        mov rax, [r11];
+        cmp rax, 8;                         // SCHEMA_MAX
+        jge schema_emit_register_full;
+
+        lea r11, [rip + schema_names];
+        mov [r11 + rax*8], rdi;
+
+        add rax, 1;
+        lea r11, [rip + schema_count];
+        mov [r11], rax;
+
+      schema_emit_register_full:
+        ret
+      }
+    }
+
+  // ============================================================
+  // get_count() -> u64
+  // Signature: () -> u64 !{mem} @{}
+  //   rax = schema_count (0..SCHEMA_MAX)
+  //
+  // Leaf. Register plan:
+  //   rax = return value
+  //   r11 = lea scratch
+  // ============================================================
+  pub let get_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M3-003 SchemaEmit::get_count — returns the number of registered schema names in rax. Leaf; r11 lea scratch. Consumer walks 0..count-1 via get_name(i).",
+      block: {
+        lea r11, [rip + schema_count];
+        mov rax, [r11];
+        ret
+      }
+    }
+
+  // ============================================================
+  // get_name(idx) -> u64
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   rdi = idx (0..schema_count-1)
+  //   rax = schema name pointer (NUL-terminated), or 0 if idx is
+  //         out of range (idx >= schema_count).
+  //
+  // Leaf. Register plan:
+  //   rax = schema_count / return value
+  //   r11 = lea scratch
+  // ============================================================
+  pub let get_name : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M3-003 SchemaEmit::get_name — returns schema_names[idx] in rax, or 0 if idx is out of range. Bounds check uses reg-reg cmp against schema_count. Leaf; r11 lea scratch. Callers use the returned NUL-terminated pointer to write the schema name to stdout via their own cap.",
+      block: {
+        lea r11, [rip + schema_count];
+        mov rax, [r11];
+        cmp rdi, rax;
+        jge schema_emit_get_name_oor;
+
+        lea r11, [rip + schema_names];
+        mov rax, [r11 + rdi*8];
+        ret
+
+      schema_emit_get_name_oor:
+        xor rax, rax;                       // 0 = out of range
+        ret
+      }
+    }
+}
