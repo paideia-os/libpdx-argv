@@ -29,12 +29,12 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | 3  | ParseTypedArgsTests         | 5     |
 | 4  | (reserved: parse_positional_ext) | — |
 | 5  | ParseStdVocabTests          | 2     |
-| 6  | ParseSchemaRecordTests      | 6     |
+| 6  | ParseSchemaRecordTests      | 8     |
 | 7  | HelpBackendTests            | 3     |
 | 8  | SchemaEmitTests             | 5     |
 | 9  | (reserved: parse_mixed_ext) | —     |
 
-**Total M4-001 cases:** 50.
+**Total M4-001 cases:** 52 (2 added by `libpdx-argv.ENH-002`).
 
 `last_fail_tag` encoding: `(module_id << 32) | case_number`.
 `case_number` is the last hex digit of the module's `run_caseN` name;
@@ -124,6 +124,8 @@ Per the M4 line in `design/tooling/r49-r50-plan.md` §5.12:
 | 4 | record_len=16 (< 32) | ERR_SCHEMA_BAD_LAYOUT (9) | header-size gate |
 | 5 | flag_count=33 (> 32) | ERR_SCHEMA_BAD_LAYOUT (9) | count-cap gate |
 | 6 | body-fits fail | ERR_SCHEMA_BAD_LAYOUT (9) | supplied len < required |
+| 7 | flag_count=0xFFFFFFFFFFFFFFFF | ERR_SCHEMA_BAD_LAYOUT (9) | ENH-002: unsigned count-cap gate |
+| 8 | record_len=0x8000000000000001, empty body | OK | ENH-002: unsigned header-size gate must not false-reject |
 
 ### `--help` round-trip (help_backend.pdx)
 

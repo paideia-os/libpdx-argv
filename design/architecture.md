@@ -471,6 +471,18 @@ and stays live as long as the caller keeps the record buffer alive.
 | `ERR_SCHEMA_UNSUPPORTED_VERSION` | 8 | Version qword != 1. |
 | `ERR_SCHEMA_BAD_LAYOUT`          | 9 | Record < 32 B, or count > MAX, or body-fits check failed. |
 
+**Wire-integer compares are unsigned (`libpdx-argv.ENH-002`).**
+`record_len`, `flag_count` and `pos_count` are u64 fields read straight
+off an untrusted frame; the header-size, count-cap and body-fits gates
+compare them with `jb`/`ja` (unsigned), not `jl`/`jg`. A signed compare
+let a wire value with bit 63 set (e.g. `flag_count = 0xFFFFFFFFFFFFFFFF`)
+pass the `> 32` cap as a "negative" number, wrap `flag_count * 16`, and
+land the positional-array base inside the 32-byte header — handing the
+consumer offsets read out of the magic/version qwords. It symmetrically
+let a huge `record_len` (bit 63 set) fail the `< 32` header-size gate
+even though the caller-supplied length was actually far larger than
+required. See `tests/parse_schema_record.pdx` cases 7–8.
+
 **Preconditions.** `ParsedArgs::reset()` and `FlagSpec` registration
 must have happened before the call. The consumer's `_start` sequence
 becomes:

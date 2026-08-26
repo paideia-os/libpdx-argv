@@ -130,8 +130,12 @@ module SchemaInvoke = structure {
         mov r12, rsi;                       // r12 = record_len
 
         // ---- Header size gate (need at least 32 bytes for header) -------
+        // record_len is a u64 read straight off the wire — compare
+        // unsigned (jb) so a value with bit 63 set (e.g. 0x8000...0001)
+        // is treated as the huge unsigned quantity it is, not as a
+        // negative number that would be falsely rejected here.
         cmp r12, 32;                        // SCHEMA_HEADER_SIZE
-        jl schema_bad_layout_header;
+        jb schema_bad_layout_header;
 
         // ---- Magic check: bytes[0..8] == "PDXARGV\0" (0x50 44 58 41 52 47 56 00) ---
         xor rax, rax; mov_b rax, [rbx + 0]; cmp rax, 0x50; jne schema_bad_magic;  // 'P'
@@ -149,12 +153,16 @@ module SchemaInvoke = structure {
         jne schema_unsupported_version;
 
         // ---- flag_count and pos_count (both must be ≤ 32 = MAX_FLAGS/MAX_POS)
+        // Both are u64 wire fields — compare unsigned (ja) so a
+        // negative-looking value (bit 63 set, e.g. 0xFFFF...FFFF or
+        // 0x8000...0000) is correctly treated as far greater than 32
+        // rather than passing a signed jg cap.
         mov r9, [rbx + 16];                 // r9 = flag_count
         cmp r9, 32;
-        jg schema_bad_layout_header;
+        ja schema_bad_layout_header;
         mov r10, [rbx + 24];                // r10 = pos_count
         cmp r10, 32;
-        jg schema_bad_layout_header;
+        ja schema_bad_layout_header;
 
         // ---- Body-fits gate: record_len must be at least
         //      SCHEMA_HEADER_SIZE + flag_count*SCHEMA_FLAG_STRIDE
@@ -171,8 +179,11 @@ module SchemaInvoke = structure {
         mov r8, 32;                         // r8 = SCHEMA_HEADER_SIZE
         add r8, rcx;
         add r8, rdx;
+        // record_len (r12) vs. computed minimum tail-inclusive size
+        // (r8) — both are u64 wire-derived quantities; compare
+        // unsigned (jb) for the same reason as the two gates above.
         cmp r12, r8;
-        jl schema_bad_layout_header;
+        jb schema_bad_layout_header;
 
         // ---- Flag loop ---------------------------------------------------
         // For each i in 0..flag_count:

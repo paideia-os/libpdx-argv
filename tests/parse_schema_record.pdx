@@ -9,6 +9,11 @@
 //   4. Short header → ERR_SCHEMA_BAD_LAYOUT (=9).
 //   5. flag_count > MAX_FLAGS → ERR_SCHEMA_BAD_LAYOUT (=9).
 //   6. Body-fits gate: record_len < header+arrays → ERR_SCHEMA_BAD_LAYOUT.
+//   7. flag_count = 0xFFFFFFFFFFFFFFFF (negative under a signed compare)
+//      → ERR_SCHEMA_BAD_LAYOUT. Regression fixture for libpdx-argv.ENH-002.
+//   8. record_len = 0x8000000000000001 with an otherwise-valid empty-
+//      body header → ERR_OK (must NOT be falsely rejected by a signed
+//      header-size compare). Regression fixture for libpdx-argv.ENH-002.
 //
 // The records are pre-baked in .rodata as fixed-size byte arrays; the
 // test declares them with the exact byte-for-byte content the parser
@@ -242,6 +247,82 @@ module ParseSchemaRecord = structure {
 
       sr6_fail:
         mov rdi, 0x600000006;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // Case 7 — flag_count with bit 63 set (0xFFFFFFFFFFFFFFFF).
+  //   Header: magic + version OK, flag_count = all-ones qword,
+  //   pos_count = 0. Under a SIGNED cmp/jg this value is negative and
+  //   is not greater than 32, so it would wrongly clear the MAX_FLAGS
+  //   cap; under the unsigned cmp/ja fix (ENH-002) it is far greater
+  //   than 32 and is correctly rejected.
+  //   Expected: ERR_SCHEMA_BAD_LAYOUT (=9).
+  // ============================================================
+  pub let case7_rec : [u8; 32] = "PDXARGV\0\x01\0\0\0\0\0\0\0\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\0\0\0\0\0\0\0\0"
+
+  pub let run_case7 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-002 regression schema-record case7 — flag_count = 0xFFFFFFFFFFFFFFFF (bit 63 set). Magic and version OK; pos_count=0. Verifies the unsigned `cmp r9, 32; ja schema_bad_layout_header` gate rejects this as far-greater-than-32 rather than a signed `jg` treating it as negative and passing. Verifies rax=ERR_SCHEMA_BAD_LAYOUT=9.",
+      block: {
+        push rbx;
+        call full_reset;
+
+        lea rdi, [rip + case7_rec];
+        mov rsi, 32;
+        call parse_from_schema_record;
+        cmp rax, 9; jne sr7_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sr7_fail:
+        mov rdi, 0x600000007;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // Case 8 — record_len with bit 63 set (0x8000000000000001), header
+  //   otherwise valid and empty (flag_count=0, pos_count=0). Under a
+  //   SIGNED cmp/jl this record_len reads as negative and is less than
+  //   32, so it would be falsely rejected at the header-size gate; under
+  //   the unsigned cmp/jb fix (ENH-002) it is far greater than 32 and
+  //   the (empty) record parses clean.
+  //   Expected: ERR_OK (=0), flag_count=0, pos_count=0.
+  // ============================================================
+  pub let case8_rec : [u8; 32] = "PDXARGV\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+
+  pub let run_case8 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-002 regression schema-record case8 — record_len = 0x8000000000000001 (bit 63 set) passed as the rsi parameter against an otherwise-valid empty-body 32-byte header. Verifies the unsigned `cmp r12, 32; jb`/`cmp r12, r8; jb` gates treat this huge value as far-greater-than-the-minimum rather than a signed `jl` falsely rejecting it. Only the 32-byte header is ever dereferenced (flag_count=pos_count=0), so the oversized rsi is never actually read past. Verifies rax=ERR_OK=0, flag_count=0, pos_count=0.",
+      block: {
+        push rbx;
+        call full_reset;
+
+        lea rdi, [rip + case8_rec];
+        mov rsi, 0x8000000000000001;
+        call parse_from_schema_record;
+        cmp rax, 0; jne sr8_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0; jne sr8_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 0; jne sr8_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sr8_fail:
+        mov rdi, 0x600000008;
         call record_fail;
         pop rbx; ret;
       }
