@@ -10,6 +10,9 @@
 //   - libpdx-argv.ENH-004 opt-in strict mode (cases 13-15): permissive
 //     default unchanged, FlagSpec::set_strict(1) rejects an
 //     unregistered flag on both the long- and short-flag paths.
+//   - libpdx-argv.ENH-008 duplicate-flag policy (case 16):
+//     find_flag_by_id stays first-wins; find_last_flag_by_id (new)
+//     is last-wins; count_flag_by_id (new) tallies occurrences.
 //
 // Module id in TestHarness::last_fail_tag: 1
 //
@@ -867,6 +870,90 @@ module ParseGrammar = structure {
 
       case15_fail:
         mov rdi, 0x10000000F;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 16 — libpdx-argv.ENH-008 duplicate-flag policy:
+  //   `--color=auto --color=never` (STD_ID_COLOR = 8).
+  //   Expected: err=0, flag_count=2 (both occurrences stored),
+  //     find_last_flag_by_id(8) -> a slot whose value is "never"
+  //     (first byte 'n' = 0x6E), count_flag_by_id(8) == 2. Also
+  //     verifies find_flag_by_id(8) (first-wins, unchanged) still
+  //     points at "auto" (first byte 'a' = 0x61).
+  // ============================================================
+  pub let case16_auto  : [u8; 13] = "--color=auto\0"
+  pub let case16_never : [u8; 14] = "--color=never\0"
+  pub let mut case16_argv : [u64; 2] = uninit @align(8)
+
+  pub let run_case16 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-008 case16 — duplicate-flag policy fixture. Both --color occurrences are stored (flag_count=2); find_flag_by_id (unchanged, first-wins) still resolves to 'auto', find_last_flag_by_id (new, last-wins) resolves to 'never', and count_flag_by_id reports 2 occurrences.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case16_auto];
+        lea rbx, [rip + case16_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case16_never];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case16_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0;
+        jne case16_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case16_fail;
+
+        // find_flag_by_id (first-wins, unchanged) -> "auto"
+        mov rdi, 8;                          // STD_ID_COLOR
+        call find_flag_by_id;
+        cmp rax, 32;
+        je case16_fail;
+        mov rcx, rax;
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rcx*8];
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0x61;                       // 'a' (auto)
+        jne case16_fail;
+
+        // find_last_flag_by_id (last-wins, new) -> "never"
+        mov rdi, 8;
+        call find_last_flag_by_id;
+        cmp rax, 32;
+        je case16_fail;
+        mov rcx, rax;
+        lea r11, [rip + flag_values];
+        mov rdx, [r11 + rcx*8];
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0x6E;                       // 'n' (never)
+        jne case16_fail;
+
+        // count_flag_by_id -> 2
+        mov rdi, 8;
+        call count_flag_by_id;
+        cmp rax, 2;
+        jne case16_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case16_fail:
+        mov rdi, 0x100000010;
         call record_fail;
         pop rbx;
         ret;

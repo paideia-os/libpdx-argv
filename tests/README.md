@@ -24,7 +24,7 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 
 | ID | Module                      | Cases |
 |----|-----------------------------|-------|
-| 1  | ParseGrammarTests           | 15    |
+| 1  | ParseGrammarTests           | 16    |
 | 2  | ParseTypedValuesTests       | 17    |
 | 3  | ParseTypedArgsTests         | 5     |
 | 4  | (reserved: parse_positional_ext) | — |
@@ -34,8 +34,9 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | 8  | SchemaEmitTests             | 5     |
 | 9  | (reserved: parse_mixed_ext) | —     |
 
-**Total M4-001 cases:** 57 (2 added by `libpdx-argv.ENH-002`, 2 more by
-`libpdx-argv.ENH-001`, 3 more by `libpdx-argv.ENH-004`).
+**Total M4-001 cases:** 58 (2 added by `libpdx-argv.ENH-002`, 2 more by
+`libpdx-argv.ENH-001`, 3 more by `libpdx-argv.ENH-004`, 1 more by
+`libpdx-argv.ENH-008`).
 
 `last_fail_tag` encoding: `(module_id << 32) | case_number`.
 `case_number` is the last hex digit of the module's `run_caseN` name;
@@ -83,6 +84,12 @@ Per the M4 line in `design/tooling/r49-r50-plan.md` §5.12:
 | 13 | `--nosuchflag foo` (strict unset) | OK, flags=1, pos=1 | permissive default unchanged |
 | 14 | `--nosuchflag foo` (strict=1) | ERR_UNKNOWN_FLAG (12), arg_index=0 | long-flag path |
 | 15 | `-z` (strict=1) | ERR_UNKNOWN_FLAG (12), arg_index=0 | short-flag path |
+
+### Duplicate-flag policy (parse_grammar.pdx, `libpdx-argv.ENH-008`)
+
+| Case | Fixture argv | Expected | Notes |
+|-----:|--------------|:--------:|-------|
+| 16 | `--color=auto --color=never` | flags=2; `find_flag_by_id`→auto (first-wins, unchanged); `find_last_flag_by_id`→never; `count_flag_by_id`=2 | new duplicate-flag accessors |
 
 ### Typed value parsers (parse_typed_values.pdx)
 

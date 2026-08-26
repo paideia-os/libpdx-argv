@@ -66,6 +66,28 @@ the tool's choice per `FlagSpec::register` kind. The `:` separator
 is reserved for `--no-cap:<name>` (I3-vocabulary) and for future
 namespaced-flag forms; consumer tools may not repurpose it.
 
+.section DUPLICATE FLAGS
+Repeating a flag is never an error: every occurrence gets its own
+storage slot and `flag_count` grows with each one. Three accessors
+read the result (`libpdx-argv.ENH-008`):
+
+  find_flag_by_id(id)       FIRST occurrence (default; unchanged
+                             since M2)
+  find_last_flag_by_id(id)  LAST occurrence — a later flag
+                             overrides an earlier one, e.g.
+                             `--color=auto --color=never` resolves
+                             to `never`. This is the mainstream-CLI
+                             convention and what makes shell
+                             aliases composable (an alias that
+                             appends `--color=never` wins over
+                             whatever the user typed earlier).
+  count_flag_by_id(id)      occurrence count, for flags where
+                             repetition itself is the signal
+                             (`-v -v -v` raising verbosity by 3).
+
+A tool picks whichever accessor matches its own flag's semantics;
+libpdx-argv does not force one policy on every flag.
+
 .section STANDARD FLAGS (I3 vocabulary)
 `StdVocab::register_all` binds these nine ids into `FlagSpec`
 for every tool that calls it. IDs 1..9 are RESERVED for these

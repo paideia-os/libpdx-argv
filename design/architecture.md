@@ -366,6 +366,27 @@ let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_HELP)
 if k != 32 { /* --help was seen — dispatch help + exit */ }
 ```
 
+**Duplicate-flag policy (`libpdx-argv.ENH-008`, post-1.0).** Neither
+`Parser::parse_argv` nor `SchemaInvoke::parse_from_schema_record`
+de-duplicates — every occurrence of a repeated flag gets its own slot
+in `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`. Prior to
+ENH-008 the only accessor, `find_flag_by_id`, was first-wins by
+construction (it scans upward and returns on the first match) with no
+policy stated anywhere. ENH-008 keeps `find_flag_by_id`'s behaviour
+and documents it explicitly as first-wins, and adds two companions:
+
+- `ParsedArgs::find_last_flag_by_id(id) -> k` — scans downward from
+  `flag_count-1`, so a later occurrence shadows an earlier one (the
+  mainstream-CLI / shell-alias-composability convention: `--color=auto
+  --color=never` resolves to `never`).
+- `ParsedArgs::count_flag_by_id(id) -> u64` — full scan tallying every
+  occurrence, for the repeat-count idiom (`-v -v -v` for a verbosity
+  level, where the count itself is the signal, not any one slot).
+
+No existing consumer's behaviour changes — `find_flag_by_id` is
+untouched — this is purely additive. See `tests/parse_grammar.pdx`
+case 16.
+
 ### 9.5 `--` sentinel (M2-003)
 
 The parser tracks a single-bit sentinel: once `--` is seen at
@@ -688,7 +709,7 @@ reshuffle case numbers.
 
 | ID | Module (file)                            | Cases (M4-001) |
 |----|------------------------------------------|:--:|
-| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 15 |
+| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 16 |
 | 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 17 |
 | 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
 | 4  | *reserved* (parse_positional_ext)         | —  |

@@ -102,6 +102,17 @@ module ParsedArgs = structure {
   // rax (out) = k (0..flag_count-1) if a flag with that id was stored;
   //             else 32 (== MAX_FLAGS).
   //
+  // Duplicate-flag policy (libpdx-argv.ENH-008): every occurrence of a
+  // repeated flag gets its own slot (Parser::parse_argv never
+  // de-duplicates), and this function is FIRST-WINS — it returns the
+  // lowest-indexed match. A consumer that wants mainstream CLI /
+  // shell-alias-composability semantics (a later `--color=never`
+  // overriding an earlier `--color=auto`) wants
+  // `find_last_flag_by_id` instead. `count_flag_by_id` is for the
+  // repeat-count idiom (`-v -v -v` for a verbosity level). This
+  // function's own behaviour is unchanged by ENH-008 — existing
+  // consumers that already call `find_flag_by_id` see no difference.
+  //
   // Leaf. Iterates flag_count entries once. O(MAX_FLAGS) worst case.
   //
   // Register plan (all caller-save; leaf):
@@ -138,6 +149,96 @@ module ParsedArgs = structure {
 
       ffbi_not_found:
         mov rax, 32;                             // MAX_FLAGS
+        ret;
+      }
+    }
+
+  // find_last_flag_by_id(id) -> k   [libpdx-argv.ENH-008]
+  //   rdi (in)  = target id
+  //   rax (out) = k of the HIGHEST-indexed (last-parsed) flag with
+  //               that id, or MAX_FLAGS (=32) if none.
+  //
+  // Last-wins companion to find_flag_by_id: scans downward from
+  // flag_count-1 so a later occurrence of a repeated flag always
+  // shadows an earlier one — e.g. after `--color=auto --color=never`,
+  // this returns the slot whose flag_values[k] is "never".
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rcx = loop cursor, counts down from flag_count to 0 (also the
+  //         return value on a match)
+  //   r8  = flag_ids table base (hoisted once)
+  //   rdx = per-iteration flag_ids[k]
+  //   r11 = scratch (only used briefly to load flag_count)
+  pub let find_last_flag_by_id : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-008 find_last_flag_by_id — downward linear scan over flag_ids returning the highest-indexed match (last-wins), or MAX_FLAGS (=32) if the id was never stored. Leaf; only caller-save regs used. Mirrors find_flag_by_id's O(MAX_FLAGS) shape and MAX_FLAGS sentinel exactly, differing only in scan direction — the two functions are deliberately symmetric so a reader who understands one understands the other.",
+      block: {
+        lea r11, [rip + flag_count];
+        mov rcx, [r11];                          // rcx = flag_count
+        lea r8, [rip + flag_ids];                // r8  = &flag_ids[0]
+
+      flfbi_loop:
+        cmp rcx, 0;
+        je flfbi_not_found;
+
+        sub rcx, 1;                              // rcx = k (highest unvisited index)
+        mov rdx, [r8 + rcx*8];                    // rdx = flag_ids[k]
+        cmp rdx, rdi;
+        je flfbi_found;
+
+        jmp flfbi_loop;
+
+      flfbi_found:
+        mov rax, rcx;
+        ret;
+
+      flfbi_not_found:
+        mov rax, 32;                              // MAX_FLAGS
+        ret;
+      }
+    }
+
+  // count_flag_by_id(id) -> u64   [libpdx-argv.ENH-008]
+  //   rdi (in)  = target id
+  //   rax (out) = number of stored flags whose flag_ids[k] == id
+  //               (0 if never seen)
+  //
+  // For the repeat-count idiom (`-v -v -v` raising verbosity by 3
+  // steps) where a consumer needs "how many times", not "which slot".
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = running count / return value
+  //   rcx = loop index i
+  //   r8  = flag_ids table base (hoisted once)
+  //   r9  = flag_count upper bound (hoisted once)
+  //   rdx = per-iteration flag_ids[i]
+  //   r11 = scratch (only used briefly to load flag_count)
+  pub let count_flag_by_id : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-008 count_flag_by_id — full linear scan over flag_ids tallying every match. Leaf; only caller-save regs used. Unlike find_flag_by_id/find_last_flag_by_id this never early-exits (every slot must be inspected to count them all), so it is always O(flag_count) rather than best-case O(1).",
+      block: {
+        xor rax, rax;                            // rax = count = 0
+        xor rcx, rcx;                            // rcx = i = 0
+        lea r11, [rip + flag_count];
+        mov r9, [r11];                            // r9 = flag_count
+        lea r8, [rip + flag_ids];                 // r8 = &flag_ids[0]
+
+      cfbi_loop:
+        cmp rcx, r9;
+        jge cfbi_done;
+
+        mov rdx, [r8 + rcx*8];                    // rdx = flag_ids[i]
+        cmp rdx, rdi;
+        jne cfbi_advance;
+        add rax, 1;
+
+      cfbi_advance:
+        add rcx, 1;
+        jmp cfbi_loop;
+
+      cfbi_done:
         ret;
       }
     }

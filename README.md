@@ -50,7 +50,9 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 | Function | Purpose |
 | --- | --- |
 | `reset() -> () !{mem} @{}` | Zero the bookkeeping slots so the next parse starts clean. Arrays are consumed by index, so only counters are cleared. |
-| `find_flag_by_id(id: u64) -> u64 !{mem} @{}` | Linear scan of `flag_ids`; returns the storage index `k`, or `32` (`MAX_FLAGS`) if that id was never seen. |
+| `find_flag_by_id(id: u64) -> u64 !{mem} @{}` | Linear scan of `flag_ids`; returns the storage index `k`, or `32` (`MAX_FLAGS`) if that id was never seen. **First-wins** on a repeated flag (`libpdx-argv.ENH-008`). |
+| `find_last_flag_by_id(id: u64) -> u64 !{mem} @{}` | **(ENH-008)** Same as above but **last-wins** — scans downward, so a later occurrence of a repeated flag shadows an earlier one (e.g. `--color=auto --color=never` → `never`). |
+| `count_flag_by_id(id: u64) -> u64 !{mem} @{}` | **(ENH-008)** Number of stored flags with the given id (0 if never seen) — for the repeat-count idiom (`-v -v -v`). |
 
 ### flag_spec.pdx — `FlagSpec`
 
