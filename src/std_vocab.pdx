@@ -85,14 +85,21 @@ module StdVocab = structure {
   //   FKIND_ENUM : color   (auto|always|never)
   //   FKIND_STR  : no-cap  (a KIND name; opaque to libpdx-argv)
   //
+  // libpdx-argv.ENH-010: color and no-cap are registered via
+  // FlagSpec::register_sep rather than FlagSpec::register — their I3
+  // spellings (`--color=<mode>`, `--no-cap:<name>`) require the
+  // inline separator and never had a lookahead form, so Parser::
+  // parse_argv must not accept `--color auto` (which previously let
+  // `--color --json` swallow `--json` as the colour mode).
+  //
   // Non-leaf. 1-push prologue (rbx) aligns rsp%16 to 0 for the nested
-  // FlagSpec::register calls. rbx is not otherwise used — pushed
-  // purely for alignment.
+  // FlagSpec::register/register_sep calls. rbx is not otherwise used
+  // — pushed purely for alignment.
   // ============================================================
   pub let register_all : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-002 StdVocab::register_all — registers the I3 9-flag standard vocabulary with FlagSpec via nine calls to FlagSpec::register. Non-leaf; 1-push prologue (rbx, unused, for rsp alignment) → rsp%16: 8 → 0 for the nested calls. rdi/rsi/rdx are set per call to (name_ptr, kind, id). Six/seven of the flags are FKIND_BOOL; color is FKIND_ENUM; no-cap is FKIND_STR. Consumers that only need a subset (e.g. a tool with no --color) can pay the ~1µs cost of the extra registrations or register selected flags individually.",
+      justification: "libpdx-argv.M2-002 + ENH-010 StdVocab::register_all — registers the I3 9-flag standard vocabulary with FlagSpec via nine calls to FlagSpec::register/register_sep. Non-leaf; 1-push prologue (rbx, unused, for rsp alignment) → rsp%16: 8 → 0 for the nested calls. rdi/rsi/rdx are set per call to (name_ptr, kind, id). Six/seven of the flags are FKIND_BOOL; color is FKIND_ENUM; no-cap is FKIND_STR. ENH-010: color and no-cap use register_sep (not register) so Parser::parse_argv never accepts a lookahead value for them, matching their I3-mandated `=`/`:` spellings. Consumers that only need a subset (e.g. a tool with no --color) can pay the ~1µs cost of the extra registrations or register selected flags individually.",
       block: {
         push rbx;                                // align rsp
 
@@ -117,11 +124,15 @@ module StdVocab = structure {
         lea rdi, [rip + STD_NAME_QUIET];   mov rsi, 0;    mov rdx, 7;
         call register;
 
+        // libpdx-argv.ENH-010: --color and --no-cap are registered
+        // separator-required — their I3 spellings (--color=<mode>,
+        // --no-cap:<name>) never had a lookahead form, and accepting
+        // one let `--color --json` swallow --json as the colour mode.
         lea rdi, [rip + STD_NAME_COLOR];   mov rsi, 5;    mov rdx, 8;
-        call register;
+        call register_sep;
 
         lea rdi, [rip + STD_NAME_NO_CAP];  mov rsi, 1;    mov rdx, 9;
-        call register;
+        call register_sep;
 
         pop rbx;
         ret;

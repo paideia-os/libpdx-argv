@@ -50,6 +50,30 @@ module FlagSpec = structure {
   pub let mut spec_ids   : [u64; 32] = uninit @align(8)  // caller-chosen id
   pub let mut spec_count : u64       = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-010: per-registration arity policy. 0
+  // (default; set by every plain register() call) = the flag may
+  // take its value either inline (`=`/`:`) or via lookahead
+  // (`argv[i+1]`), unchanged from pre-ENH-010 behaviour. 1 (set by
+  // register_sep()) = the flag's value MUST arrive inline; the
+  // lookahead form is never accepted, even if argv[i+1] looks like a
+  // plausible value — the parser fails ERR_MISSING_VALUE instead of
+  // consuming it. See StdVocab::register_all's use for `--color` /
+  // `--no-cap`, whose I3-mandated spellings (`--color=<mode>`,
+  // `--no-cap:<name>`) never had a lookahead form to begin with.
+  pub let mut spec_sep_required : [u64; 32] = uninit @align(8)
+
+  // Companion "out parameter" for lookup() (libpdx-argv.ENH-010):
+  // lookup's own return convention is fixed at (kind in rax, id in
+  // rdx) — the full width of SysV's multi-return rax:rdx pair — so a
+  // third return value (whether the matched registration is
+  // separator-required) is published here as a side effect of the
+  // same linear scan, instead of forcing a second call. Parser reads
+  // this slot immediately after `call lookup` returns, the same
+  // "companion .bss slot" pattern ParsedArgs::error_code already
+  // uses after Parser::parse_argv. Valid only immediately after a
+  // lookup() call; a miss (FKIND_UNKNOWN) always leaves this at 0.
+  pub let mut last_lookup_sep_required : u64 = uninit @align(8)
+
   // Added by libpdx-argv.ENH-004: opt-in strict mode. 0 (default, and
   // the value FlagSpec::reset() restores) = permissive — an
   // unregistered flag name is treated as boolean, unchanged from
@@ -119,9 +143,10 @@ module FlagSpec = structure {
   //   rdx = id (caller-chosen; 0 reserved for "unregistered")
   //
   // Appends (name, kind, id) at slot spec_count and increments
-  // spec_count. Silently no-ops past SPEC_MAX; callers that need
-  // overflow detection can compare spec_count against SPEC_MAX
-  // before the call.
+  // spec_count, with spec_sep_required[slot] = 0 (lookahead allowed —
+  // see register_sep() for the separator-required variant). Silently
+  // no-ops past SPEC_MAX; callers that need overflow detection can
+  // compare spec_count against SPEC_MAX before the call.
   //
   // Leaf. Register plan (all caller-save):
   //   rax = spec_count / scratch
@@ -130,7 +155,7 @@ module FlagSpec = structure {
   pub let register : (u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 FlagSpec::register — appends (name, kind, id) at spec_count and increments. Leaf; r11 for lea; rax as spec_count/scratch. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF).",
+      justification: "libpdx-argv.M2-001 + ENH-010 FlagSpec::register — appends (name, kind, id) at spec_count and increments, explicitly zeroing spec_sep_required[slot] so a slot index reused after a reset never inherits a stale separator-required flag from an earlier registration batch. Leaf; r11 for lea; rax as spec_count/scratch. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF).",
       block: {
         lea r11, [rip + spec_count];
         mov rax, [r11];
@@ -143,12 +168,57 @@ module FlagSpec = structure {
         mov [r11 + rax*8], rsi;
         lea r11, [rip + spec_ids];
         mov [r11 + rax*8], rdx;
+        lea r11, [rip + spec_sep_required];
+        mov r8, 0;
+        mov [r11 + rax*8], r8;
 
         add rax, 1;
         lea r11, [rip + spec_count];
         mov [r11], rax;
 
       register_full:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // register_sep(name_ptr, kind, id) — libpdx-argv.ENH-010
+  // Signature: (u64, u64, u64) -> () !{mem} @{}
+  //
+  // Identical to register() except spec_sep_required[slot] is set to
+  // 1: the parser will never accept a lookahead (`argv[i+1]`) value
+  // for this flag, only an inline `=`/`:` one. Use for a flag whose
+  // spelling is defined with a mandatory separator (I3's `--color=`,
+  // `--no-cap:`) so `--color --json` cannot swallow `--json` as the
+  // colour mode.
+  //
+  // Leaf. Register plan mirrors register().
+  // ============================================================
+  pub let register_sep : (u64, u64, u64) -> () !{mem} @{} =
+    fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-010 FlagSpec::register_sep — same as register() but writes spec_sep_required[slot] = 1 instead of 0, marking the registration separator-required. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the literal 1.",
+      block: {
+        lea r11, [rip + spec_count];
+        mov rax, [r11];
+        cmp rax, 32;                       // SPEC_MAX
+        jge register_sep_full;
+
+        lea r11, [rip + spec_names];
+        mov [r11 + rax*8], rdi;
+        lea r11, [rip + spec_kinds];
+        mov [r11 + rax*8], rsi;
+        lea r11, [rip + spec_ids];
+        mov [r11 + rax*8], rdx;
+        lea r11, [rip + spec_sep_required];
+        mov r8, 1;
+        mov [r11 + rax*8], r8;
+
+        add rax, 1;
+        lea r11, [rip + spec_count];
+        mov [r11], rax;
+
+      register_sep_full:
         ret;
       }
     }
@@ -172,16 +242,17 @@ module FlagSpec = structure {
   //   rcx = outer loop index i
   //   r10 = spec_count upper bound (hoisted once)
   //   rsi = spec_names table base (hoisted once)
-  //   r8  = inner walk cursor: candidate name
+  //   r8  = inner walk cursor: candidate name; reused post-match
+  //         (libpdx-argv.ENH-010) to stage last_lookup_sep_required
   //   r9  = inner walk cursor: input name (copy of rdi)
   //   rax = byte-load / return (kind)
   //   rdx = byte-load / return (id)
-  //   r11 = lea scratch (for the match-path kinds/ids loads)
+  //   r11 = lea scratch (for the match-path kinds/ids/sep_required loads)
   // ============================================================
   pub let lookup : (u64) -> u64 !{mem} @{} =
     fn (name_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 FlagSpec::lookup — linear scan of the registration table returning (kind in rax, id in rdx). O(SPEC_MAX) worst case, at most 32 strcmp probes per parsed flag. Leaf; only caller-save regs. Byte loads use xor+mov_b per #1248. Miss returns FKIND_UNKNOWN=0xFF and id=0 so parser can treat unregistered flags as boolean (the fix for the cat M1 blocker: `cat -n foo.txt` no longer binds `foo.txt` to `-n`). rax/rdx as multi-return exploits SysV's rax:rdx pair; callers save/restore rdx across this call if needed.",
+      justification: "libpdx-argv.M2-001 + ENH-010 FlagSpec::lookup — linear scan of the registration table returning (kind in rax, id in rdx). O(SPEC_MAX) worst case, at most 32 strcmp probes per parsed flag. Leaf; only caller-save regs. Byte loads use xor+mov_b per #1248. Miss returns FKIND_UNKNOWN=0xFF and id=0 so parser can treat unregistered flags as boolean (the fix for the cat M1 blocker: `cat -n foo.txt` no longer binds `foo.txt` to `-n`). rax/rdx as multi-return exploits SysV's rax:rdx pair; callers save/restore rdx across this call if needed. ENH-010: on a match, also publishes spec_sep_required[i] into last_lookup_sep_required (a companion .bss slot, since lookup's own return pair is already fully used by kind/id) — reusing r8 as scratch since the strcmp walk cursor it held is no longer needed once a match is found. A miss always sets it to 0 (unregistered flags were never separator-required to begin with).",
       block: {
         xor rcx, rcx;                     // rcx = i = 0
         lea r11, [rip + spec_count];
@@ -216,11 +287,19 @@ module FlagSpec = structure {
         mov rax, [r11 + rcx*8];           // rax = kind
         lea r11, [rip + spec_ids];
         mov rdx, [r11 + rcx*8];           // rdx = id
+
+        lea r11, [rip + spec_sep_required];
+        mov r8, [r11 + rcx*8];            // r8 = this match's sep_required
+        lea r11, [rip + last_lookup_sep_required];
+        mov [r11], r8;
         ret;
 
       lookup_not_found:
         mov rax, 0xFF;                    // FKIND_UNKNOWN
         xor rdx, rdx;                     // id = 0
+        lea r11, [rip + last_lookup_sep_required];
+        xor r8, r8;
+        mov [r11], r8;
         ret;
       }
     }

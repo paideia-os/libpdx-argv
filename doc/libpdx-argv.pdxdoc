@@ -103,6 +103,14 @@ flags; a tool's own flags start at id 100.
   id 8  --color=<mode>   `auto`, `always`, `never`
   id 9  --no-cap:<name>  strip the named cap before exec (I7)
 
+`--color` and `--no-cap` are registered separator-required
+(`libpdx-argv.ENH-010`, `FlagSpec::register_sep`): the parser never
+accepts `--color auto` or `--no-cap KIND_TTY` as a lookahead form —
+only the inline spellings shown above. `--color file.txt` fails
+`ERR_MISSING_VALUE` rather than swallowing `file.txt` as the colour
+mode. A tool's own lookahead-permitted typed flags (registered via
+the plain `FlagSpec::register`) are unaffected.
+
 .section TYPED FLAG ARGUMENTS
 `Typed::parse_int_u64` / `parse_size` / `parse_timespan` decode
 the string half of a typed flag into a `(ok: u64, value: u64)`
@@ -199,7 +207,12 @@ whole-buffer header failure.
   ERR_CLUSTERED_SHORT (4)           `-la` etc. (D3 rejects clustering)
   ERR_LONG_MISSING_NAME (5)         `--=foo`, `--:foo`
   ERR_MISSING_VALUE (6)             typed flag reached end of argv with
-                                     no value to consume
+                                     no value to consume, OR (ENH-010)
+                                     a separator-required flag
+                                     (--color, --no-cap) had no inline
+                                     =/: value — its lookahead form is
+                                     never accepted regardless of
+                                     what follows in argv
   ERR_SCHEMA_BAD_MAGIC (7)          schema-record: bad wire magic
                                      (semantic-pipe path only)
   ERR_SCHEMA_UNSUPPORTED_VERSION (8) schema-record: version != 1

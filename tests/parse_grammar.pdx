@@ -13,6 +13,12 @@
 //   - libpdx-argv.ENH-008 duplicate-flag policy (case 16):
 //     find_flag_by_id stays first-wins; find_last_flag_by_id (new)
 //     is last-wins; count_flag_by_id (new) tallies occurrences.
+//   - libpdx-argv.ENH-010 per-registration arity policy (cases
+//     17-20): --color/--no-cap (registered via FlagSpec::register_sep)
+//     reject the lookahead form with ERR_MISSING_VALUE while their
+//     inline =/: forms are unaffected; a plain register()-ed typed
+//     flag (older-than, in tests/parse_typed_args.pdx case1) still
+//     accepts lookahead, proving the policy is per-registration.
 //
 // Module id in TestHarness::last_fail_tag: 1
 //
@@ -954,6 +960,206 @@ module ParseGrammar = structure {
 
       case16_fail:
         mov rdi, 0x100000010;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 17 — libpdx-argv.ENH-010 separator-required rejection:
+  //   `--color file.txt` (lookahead form; STD_ID_COLOR is now
+  //   registered via register_sep, so this must NOT swallow
+  //   file.txt as the colour mode).
+  //   Expected: ERR_MISSING_VALUE (6), error_arg_index=0.
+  // ============================================================
+  pub let case17_color   : [u8; 8] = "--color\0"
+  pub let case17_file    : [u8; 9] = "file.txt\0"
+  pub let mut case17_argv : [u64; 2] = uninit @align(8)
+
+  pub let run_case17 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-010 case17 — `--color file.txt`: --color is separator-required (StdVocab registers it via register_sep), so the lookahead form must fail ERR_MISSING_VALUE=6 with error_arg_index=0 rather than binding file.txt as the colour mode and leaving pos_count=0.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case17_color];
+        lea rbx, [rip + case17_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case17_file];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case17_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 6; jne case17_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0; jne case17_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case17_fail:
+        mov rdi, 0x100000011;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 18 — libpdx-argv.ENH-010 separator-required, inline form
+  //   still works: `--color=auto file.txt`.
+  //   Expected: ERR_OK, flag_count=1, pos_count=1.
+  // ============================================================
+  pub let case18_color_eq : [u8; 13] = "--color=auto\0"
+  pub let case18_file     : [u8; 9]  = "file.txt\0"
+  pub let mut case18_argv  : [u64; 2] = uninit @align(8)
+
+  pub let run_case18 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-010 case18 — `--color=auto file.txt`: the inline '=' form is unaffected by register_sep (last_lookup_sep_required is only ever consulted on the no-inline-value lookahead branch). Verifies ERR_OK, flag_count=1, pos_count=1 (file.txt correctly lands as a positional, not swallowed).",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case18_color_eq];
+        lea rbx, [rip + case18_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case18_file];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case18_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0; jne case18_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case18_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case18_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case18_fail:
+        mov rdi, 0x100000012;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 19 — libpdx-argv.ENH-010 separator-required rejection,
+  //   second flag: `--no-cap --dry-run /tmp/x`.
+  //   Expected: ERR_MISSING_VALUE (6), error_arg_index=0.
+  // ============================================================
+  pub let case19_no_cap   : [u8; 9]  = "--no-cap\0"
+  pub let case19_dry_run  : [u8; 10] = "--dry-run\0"
+  pub let case19_path     : [u8; 7]  = "/tmp/x\0"
+  pub let mut case19_argv  : [u64; 3] = uninit @align(8)
+
+  pub let run_case19 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-010 case19 — `--no-cap --dry-run /tmp/x`: --no-cap is separator-required (FKIND_STR, registered via register_sep), so it must fail ERR_MISSING_VALUE=6 at its own argv index (0) rather than swallowing --dry-run as the cap name.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case19_no_cap];
+        lea rbx, [rip + case19_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case19_dry_run];
+        mov [rbx + 8], r11;
+        lea r11, [rip + case19_path];
+        mov [rbx + 16], r11;
+
+        lea rdi, [rip + case19_argv];
+        mov rsi, 3;
+        call parse_argv;
+        cmp rax, 6; jne case19_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0; jne case19_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case19_fail:
+        mov rdi, 0x100000013;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 20 — libpdx-argv.ENH-010 separator-required, inline colon
+  //   form still works: `--no-cap:KIND_TTY --dry-run /tmp/x`.
+  //   Expected: ERR_OK, flag_count=2, pos_count=1.
+  // ============================================================
+  pub let case20_no_cap_colon : [u8; 18] = "--no-cap:KIND_TTY\0"
+  pub let case20_dry_run      : [u8; 10] = "--dry-run\0"
+  pub let case20_path         : [u8; 7]  = "/tmp/x\0"
+  pub let mut case20_argv      : [u64; 3] = uninit @align(8)
+
+  pub let run_case20 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-010 case20 — `--no-cap:KIND_TTY --dry-run /tmp/x`: the inline ':' form is unaffected by register_sep. Verifies ERR_OK, flag_count=2 (--no-cap + --dry-run both stored), pos_count=1 (/tmp/x correctly a positional).",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case20_no_cap_colon];
+        lea rbx, [rip + case20_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case20_dry_run];
+        mov [rbx + 8], r11;
+        lea r11, [rip + case20_path];
+        mov [rbx + 16], r11;
+
+        lea rdi, [rip + case20_argv];
+        mov rsi, 3;
+        call parse_argv;
+        cmp rax, 0; jne case20_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 2; jne case20_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case20_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case20_fail:
+        mov rdi, 0x100000014;
         call record_fail;
         pop rbx;
         ret;

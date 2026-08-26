@@ -218,6 +218,16 @@ module Parser = structure {
         cmp rax, 0xFF;                      // FKIND_UNKNOWN
         je parse_argv_long_do_store;
 
+        // -- ENH-010: separator-required flags never accept lookahead ----
+        // last_lookup_sep_required was published by the `call lookup`
+        // above; a nonzero value means this flag's spelling has no
+        // lookahead form at all (e.g. --color=<mode>) — fail here
+        // rather than swallowing argv[i+1] as its value.
+        lea r11, [rip + last_lookup_sep_required];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne parse_argv_missing_value;
+
         // Typed flag, no inline value → consume argv[i+1] as value.
         mov r10, r13;
         add r10, 1;
@@ -305,6 +315,19 @@ module Parser = structure {
         je parse_argv_short_do_store;
         cmp rax, 0xFF;                      // FKIND_UNKNOWN
         je parse_argv_short_do_store;
+
+        // -- ENH-010: separator-required flags never accept lookahead ----
+        // Note: the short-flag grammar has no `=`/`:` inline-value form
+        // at all, so a separator-required flag registered under a
+        // single-letter name can never be satisfied via this path —
+        // it always fails here. That is a corollary of the policy,
+        // not a special case: I3's two separator-required flags
+        // (--color, --no-cap) are long-only and StdVocab never
+        // registers short aliases for them (see std_vocab.pdx).
+        lea r11, [rip + last_lookup_sep_required];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne parse_argv_missing_value;
 
         // Typed short flag → consume argv[i+1] as value.
         mov r10, r13;

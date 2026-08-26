@@ -24,7 +24,7 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 
 | ID | Module                      | Cases |
 |----|-----------------------------|-------|
-| 1  | ParseGrammarTests           | 16    |
+| 1  | ParseGrammarTests           | 20    |
 | 2  | ParseTypedValuesTests       | 24    |
 | 3  | ParseTypedArgsTests         | 5     |
 | 4  | (reserved: parse_positional_ext) | — |
@@ -34,9 +34,10 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | 8  | SchemaEmitTests             | 5     |
 | 9  | (reserved: parse_mixed_ext) | —     |
 
-**Total M4-001 cases:** 65 (2 added by `libpdx-argv.ENH-002`, 2 more by
+**Total M4-001 cases:** 69 (2 added by `libpdx-argv.ENH-002`, 2 more by
 `libpdx-argv.ENH-001`, 3 more by `libpdx-argv.ENH-004`, 1 more by
-`libpdx-argv.ENH-008`, 7 more by `libpdx-argv.ENH-009`).
+`libpdx-argv.ENH-008`, 7 more by `libpdx-argv.ENH-009`, 4 more by
+`libpdx-argv.ENH-010`).
 
 `last_fail_tag` encoding: `(module_id << 32) | case_number`.
 `case_number` is the last hex digit of the module's `run_caseN` name;
@@ -90,6 +91,15 @@ Per the M4 line in `design/tooling/r49-r50-plan.md` §5.12:
 | Case | Fixture argv | Expected | Notes |
 |-----:|--------------|:--------:|-------|
 | 16 | `--color=auto --color=never` | flags=2; `find_flag_by_id`→auto (first-wins, unchanged); `find_last_flag_by_id`→never; `count_flag_by_id`=2 | new duplicate-flag accessors |
+
+### Per-registration arity policy (parse_grammar.pdx, `libpdx-argv.ENH-010`)
+
+| Case | Fixture argv | Expected | Notes |
+|-----:|--------------|:--------:|-------|
+| 17 | `--color file.txt` | ERR_MISSING_VALUE (6), arg_index=0 | lookahead rejected (register_sep) |
+| 18 | `--color=auto file.txt` | OK, flags=1, pos=1 | inline `=` unaffected |
+| 19 | `--no-cap --dry-run /tmp/x` | ERR_MISSING_VALUE (6), arg_index=0 | lookahead rejected |
+| 20 | `--no-cap:KIND_TTY --dry-run /tmp/x` | OK, flags=2, pos=1 | inline `:` unaffected |
 
 ### Typed value parsers (parse_typed_values.pdx)
 

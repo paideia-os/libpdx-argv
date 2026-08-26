@@ -264,6 +264,50 @@ path). The long-flag check runs before the inline-value (`=`/`:`)
 short-circuit, so `--nosuchflag=foo` is rejected identically to
 `--nosuchflag`. See `tests/parse_grammar.pdx` cases 13-15.
 
+**Per-registration arity policy (`libpdx-argv.ENH-010`, post-1.0).**
+M1's state machine required `argv[i+1][0] != '-'` before a lookahead
+consumption; M2 dropped that guard entirely when arity moved to
+`FlagSpec`, so *every* typed flag with no inline value swallows
+`argv[i+1]` unconditionally. That is correct for a tool-specific flag
+meant to take a lookahead (`--output foo.log`), but wrong for `--color`
+and `--no-cap`: I3 spells both with a mandatory separator
+(`--color=<mode>`, `--no-cap:<name>`) and neither ever had a lookahead
+form, so `ls --color file.txt` was silently swallowing `file.txt` as
+the colour mode (`pos_count` staying 0) and `rm --no-cap --dry-run
+/tmp/x` was swallowing `--dry-run` as the cap name.
+
+Rather than a global rule change (which would break `--output
+foo.log`-style tool-specific flags), ENH-010 adds a **per-registration**
+arity policy:
+
+```
+FlagSpec::register(name_ptr, kind, id)     // unchanged: lookahead OR inline
+FlagSpec::register_sep(name_ptr, kind, id) // NEW: inline only, ever
+```
+
+Internally, a new parallel array `spec_sep_required : [u64; 32]`
+records the policy per slot (`register` writes 0; `register_sep`
+writes 1). `lookup`'s own return convention stays fixed at `(kind in
+rax, id in rdx)` — SysV's full multi-return pair — so the policy for
+a match is published as a side effect into a companion `.bss` slot,
+`last_lookup_sep_required`, the same "read a related slot right after
+the call" pattern `ParsedArgs::error_code` already uses after
+`Parser::parse_argv`. `Parser::parse_argv` (both long- and short-flag
+paths) checks that slot immediately after every `call lookup`: if
+nonzero and the flag has no inline value, it fails `ERR_MISSING_VALUE`
+instead of reaching the lookahead-consumption code at all. The
+short-flag path checks it too for symmetry, even though no I3 flag is
+both separator-required and short-only — a short-form registration
+under this policy is simply always unsatisfiable, since the
+short-flag grammar has no `=`/`:` inline form to begin with.
+
+`StdVocab::register_all` registers `--color` and `--no-cap` via
+`register_sep`; the other seven standard flags are unaffected. See
+`tests/parse_grammar.pdx` cases 17-20 for the fingerprint (lookahead
+rejected, inline `=`/`:` unaffected) and case1 in
+`tests/parse_typed_args.pdx` for the regression proof that a plain
+`register()`-ed typed flag still accepts lookahead.
+
 ### 9.2 Standard vocabulary (M2-002)
 
 New file: `src/std_vocab.pdx`. The I3 9-flag vocabulary from
@@ -747,7 +791,7 @@ reshuffle case numbers.
 
 | ID | Module (file)                            | Cases (M4-001) |
 |----|------------------------------------------|:--:|
-| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 16 |
+| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 20 |
 | 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 24 |
 | 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
 | 4  | *reserved* (parse_positional_ext)         | —  |

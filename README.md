@@ -63,7 +63,8 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | Function | Purpose |
 | --- | --- |
 | `reset() -> () !{mem} @{}` | Clear the registration table (zeroes `spec_count`). |
-| `register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. |
+| `register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. The flag may take its value inline (`=`/`:`) or via lookahead (`argv[i+1]`). |
+| `register_sep(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-010`)** Same as `register`, but the flag's value MUST arrive inline — the parser never accepts a lookahead value for it, even if `argv[i+1]` looks like a plausible one. Use for a flag whose I3 spelling mandates a separator (`--color=`, `--no-cap:`). |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
 | `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `Parser::parse_argv` and `SchemaInvoke::parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `reset()` restores 0. |
 
@@ -78,8 +79,14 @@ flags one letter per hyphen (`-f`; clustered `-la` is rejected with
 `ERR_CLUSTERED_SHORT`); a bare `-` is positional; `--` is a sentinel after
 which every remaining argument is positional regardless of leading byte.
 Arity comes from `FlagSpec::lookup`: `FKIND_BOOL` and `FKIND_UNKNOWN` never
-consume a lookahead, every other kind always does (`ERR_MISSING_VALUE` if
-none remains). The well-known `--pdx-schema` sets `ParsedArgs::emit_schema`.
+consume a lookahead; a typed flag registered via `register()` consumes one
+if it has no inline value (`ERR_MISSING_VALUE` if none remains); a typed
+flag registered via **`register_sep()`** (`libpdx-argv.ENH-010`) never
+consumes a lookahead at all — only an inline `=`/`:` value satisfies it,
+and no inline value is `ERR_MISSING_VALUE` regardless of what follows in
+argv (`StdVocab` uses this for `--color`/`--no-cap`, whose I3 spellings
+never had a lookahead form). The well-known `--pdx-schema` sets
+`ParsedArgs::emit_schema`.
 
 ### typed.pdx — `Typed`
 
