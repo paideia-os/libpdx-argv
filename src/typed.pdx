@@ -20,11 +20,28 @@
 // ---------------------
 //   - Module Typed (PascalCase basename).
 //   - No test mnemonic; every zero-check via cmp reg, 0.
-//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 0x39 = ASCII '9').
-//   - r11 is scratch (not used here — parsers don't touch .bss/.rodata).
+//   - Every `cmp reg, imm` ≤ 0x7FFFFFFF (max: 0x39 = ASCII '9'). The
+//     libpdx-argv.ENH-009 overflow thresholds (up to
+//     1844674407370955161) are u64 constants well past that cap, so
+//     every threshold compare is staged as `mov r11, <imm64>; cmp
+//     reg, r11` (register-register, no immediate-size limit) rather
+//     than a direct `cmp reg, imm64` — the same staging idiom
+//     libpdx-cap's M4-002 test matrix uses for its 0xFFFFFFxx error
+//     sentinels.
+//   - r11 is scratch: ENH-009 overflow-threshold staging (was unused
+//     before ENH-009 — these leaf functions still touch no .bss/
+//     .rodata of their own).
 //   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
 //   - No mul/imul; *10 uses shl + add; *60/*3600/*86400 use fixed
 //     shl+add sequences (see multiply-by-N justifications).
+//   - ENH-009 pre-shift overflow checks use `shr reg, imm` (the same
+//     encoder path as `shl reg, imm`, which was already proven at M2;
+//     shr is its direct logical-shift counterpart) rather than
+//     inspecting the shift's own carry/overflow flag — no instruction
+//     in this file relies on flags surviving past the next
+//     instruction, matching the rest of this codebase's explicit-
+//     compare style (e.g. libpdx-argv.ENH-002's unsigned wire
+//     compares) over flag-reuse tricks.
 //   - Leaf functions (no calls); parsers can be invoked from any
 //     stack alignment.
 
@@ -42,20 +59,31 @@ module Typed = structure {
   // Grammar: [0-9]+ terminated by NUL. No sign, no whitespace, no
   // suffix. Any non-digit byte (including empty string) → ok=0.
   //
-  // Overflow: bytes past a u64's range wrap silently (multiply
-  // saturation is a M3+ concern). Real-world tool flags are small
-  // enough that this is a non-issue at M2.
+  // Overflow (libpdx-argv.ENH-009): detected, not wrapped. Before
+  // every `acc = acc*10 + digit` step, the accumulator is checked
+  // against `floor(u64::MAX / 10) = 1844674407370955161` (call it Q)
+  // with remainder `u64::MAX mod 10 = 5` (call it R): if `acc > Q`,
+  // `acc*10` alone already exceeds `u64::MAX`; if `acc == Q` and
+  // `digit > R`, `acc*10 + digit` exceeds it. Either case fails with
+  // `ok = 0` — the pre-existing failure contract, so callers that
+  // already check `ok` need no change. `parse_int_u64("18446744073709551615")`
+  // (u64::MAX exactly) still returns `(1, 0xFFFFFFFFFFFFFFFF)`;
+  // `parse_int_u64("18446744073709551616")` (one past MAX) returns
+  // `(0, 0)`.
   //
   // Leaf. Register plan (all caller-save):
   //   rcx = accumulator (final val in rdx after ret)
   //   rax = byte load / return (ok flag)
   //   r8  = digit value (byte - 0x30)
   //   r9  = *10 scratch (accumulator << 3 for the mul-by-10)
+  //   r11 = overflow-threshold staging (imm64 Q, loaded fresh each
+  //         iteration via mov — cmp reg,imm is capped at 0x7FFFFFFF
+  //         so a 64-bit threshold must be staged through a register)
   // ============================================================
   pub let parse_int_u64 : (u64) -> u64 !{mem} @{} =
     fn (str_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 Typed::parse_int_u64 — decimal-digit accumulator. Loop: load byte, if < '0' or > '9' terminate (NUL is the success-terminator; anything else is a parse error). Multiply-by-10 uses `mov r9, rcx; shl r9, 3; add r9, rcx; add r9, rcx` = *8 + *1 + *1 = *10 (three ops after the mov, well inside the R49 subset). Success requires at least one digit AND terminating NUL — an empty string or a partial digit run returns ok=0. Leaf; no callee-save regs touched.",
+      justification: "libpdx-argv.M2-001 + ENH-009 Typed::parse_int_u64 — decimal-digit accumulator. Loop: load byte, if < '0' or > '9' terminate (NUL is the success-terminator; anything else is a parse error). Multiply-by-10 uses `mov r9, rcx; shl r9, 3; add r9, rcx; add r9, rcx` = *8 + *1 + *1 = *10 (three ops after the mov, well inside the R49 subset). ENH-009: before every multiply-add, stages the imm64 threshold Q=floor(u64::MAX/10)=1844674407370955161 into r11 (cmp reg,imm is capped at 0x7FFFFFFF, so a 64-bit threshold must go through a register-register compare instead) and fails with ok=0 if acc > Q, or acc == Q and digit > R=5 (u64::MAX mod 10) — either condition means acc*10+digit would exceed u64::MAX. Success requires at least one digit AND terminating NUL — an empty string or a partial digit run returns ok=0. Leaf; no callee-save regs touched.",
       block: {
         xor rcx, rcx;                     // rcx = accumulator = 0
         xor r10, r10;                     // r10 = digits_seen = 0
@@ -76,6 +104,16 @@ module Typed = structure {
         // digit = byte - '0'
         mov r8, rax;
         sub r8, 0x30;
+
+        // Overflow check (ENH-009): acc*10 + digit must not exceed
+        // u64::MAX. Q = 1844674407370955161, R = 5.
+        mov r11, 1844674407370955161;
+        cmp rcx, r11;
+        ja pi_fail;                       // acc > Q → acc*10 alone overflows
+        jne pi_digit_ok;                  // acc < Q → always safe
+        cmp r8, 5;
+        jg pi_fail;                       // acc == Q, digit > R → overflow
+      pi_digit_ok:
 
         // accumulator = accumulator * 10 + digit
         mov r9, rcx;
@@ -122,20 +160,32 @@ module Typed = structure {
   // both spellings normalise to the binary form. The multi-char
   // spellings "KiB" / "MB" / "GB" are M3 additions.
   //
-  // Overflow: shifts past bit 63 wrap silently (M3 adds saturation).
+  // Overflow (libpdx-argv.ENH-009): detected, not wrapped, at two
+  // sites — the mantissa's own decimal accumulation (identical
+  // Q=1844674407370955161 / R=5 check as parse_int_u64) and the
+  // suffix shift. A `shl rcx, N` loses data iff any of the top N
+  // bits of the pre-shift mantissa are set (those bits would land at
+  // or past bit 63): checked via `shr` into a scratch register and
+  // comparing against 0, rather than inspecting the shift's own
+  // carry/flag state (no instruction in this file relies on flags
+  // surviving past the next instruction). `parse_size("15g")` still
+  // returns `(1, 16106127360)`; a mantissa whose top N bits are
+  // nonzero for its suffix (e.g. one large enough that `mantissa g`
+  // would exceed u64::MAX) returns `(0, 0)`.
   //
   // Leaf. Register plan (all caller-save):
   //   rcx = accumulator (mantissa)
   //   rsi = walk cursor
   //   rax = byte load / return (ok flag)
   //   r8  = digit value
-  //   r9  = *10 scratch
+  //   r9  = *10 scratch / shr-check scratch
   //   r10 = digits_seen
+  //   r11 = overflow-threshold staging (imm64 Q, mantissa-loop only)
   // ============================================================
   pub let parse_size : (u64) -> u64 !{mem} @{} =
     fn (str_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 Typed::parse_size — parses [0-9]+ mantissa then one of k/K/m/M/g/G suffix (or NUL for literal bytes), converts via shl. Multiply-by-10 uses the same shl+add trick as parse_int_u64. Suffix dispatch is a linear cmp/jne chain (6 letters; O(1) constant). shl imm is bounded by 30 (< 63) so no encoder complaints. Leaf; no callee-save touched. Success requires at least one digit AND (NUL or valid suffix followed by NUL).",
+      justification: "libpdx-argv.M2-001 + ENH-009 Typed::parse_size — parses [0-9]+ mantissa then one of k/K/m/M/g/G suffix (or NUL for literal bytes), converts via shl. Multiply-by-10 uses the same shl+add trick as parse_int_u64, with the same ENH-009 overflow gate (Q=1844674407370955161, R=5) staged through r11 before each digit. Suffix dispatch is a linear cmp/jne chain (6 letters; O(1) constant). ENH-009 adds a pre-shift check per suffix arm: `shr r9, (64-N); cmp r9, 0; jne fail` catches any mantissa whose top N bits are nonzero (would be lost by `shl rcx, N`) before the shift executes, rather than trusting CF/OF after the fact. shl/shr imm is bounded by 54 (< 63) so no encoder complaints. Leaf; no callee-save touched. Success requires at least one digit AND (NUL or valid suffix followed by NUL) AND no overflow at either site.",
       block: {
         xor rcx, rcx;
         xor r10, r10;
@@ -153,6 +203,16 @@ module Typed = structure {
 
         mov r8, rax;
         sub r8, 0x30;
+
+        // Overflow check (ENH-009): same Q/R gate as parse_int_u64.
+        mov r11, 1844674407370955161;
+        cmp rcx, r11;
+        ja ps_fail;
+        jne ps_digit_ok;
+        cmp r8, 5;
+        jg ps_fail;
+      ps_digit_ok:
+
         mov r9, rcx;
         shl r9, 3;
         add r9, rcx;
@@ -193,14 +253,30 @@ module Typed = structure {
         jmp ps_fail;
 
       ps_shl_10:
+        // Overflow (ENH-009): shl rcx, 10 loses data iff the top 10
+        // bits of rcx (bits 54..63) are nonzero.
+        mov r9, rcx;
+        shr r9, 54;
+        cmp r9, 0;
+        jne ps_fail;
         shl rcx, 10;
         jmp ps_check_terminator;
 
       ps_shl_20:
+        // Overflow (ENH-009): top 20 bits (bits 44..63).
+        mov r9, rcx;
+        shr r9, 44;
+        cmp r9, 0;
+        jne ps_fail;
         shl rcx, 20;
         jmp ps_check_terminator;
 
       ps_shl_30:
+        // Overflow (ENH-009): top 30 bits (bits 34..63).
+        mov r9, rcx;
+        shr r9, 34;
+        cmp r9, 0;
+        jne ps_fail;
         shl rcx, 30;
         // fallthrough
 
@@ -248,12 +324,27 @@ module Typed = structure {
   // inside the R49 subset (no mul/imul). See the per-arm justification
   // for each factor.
   //
-  // Leaf. Register plan mirrors parse_size.
+  // Overflow (libpdx-argv.ENH-009): detected, not wrapped, at two
+  // sites — the mantissa's own decimal accumulation (identical
+  // Q=1844674407370955161 / R=5 check as parse_int_u64) and each
+  // suffix multiplier. Since a multiplier arm computes `mantissa *
+  // CONST` with no further addend afterward, overflow is exactly
+  // `mantissa > floor(u64::MAX / CONST)` — no remainder case to
+  // special-case (unlike the per-digit accumulation, there is
+  // nothing added on top of the product here). The three thresholds
+  // (`*60` → 307445734561825860, `*3600` → 5124095576030431, `*86400`
+  // → 213503982334601) are Python-verified `u64::MAX // CONST`
+  // values, staged through r11 the same way as the digit-loop
+  // threshold. `*1` (bare seconds) can never overflow — the mantissa
+  // itself already passed the accumulation-loop gate.
+  //
+  // Leaf. Register plan mirrors parse_size, plus r11 for threshold
+  // staging (mantissa loop and each multiplier arm).
   // ============================================================
   pub let parse_timespan : (u64) -> u64 !{mem} @{} =
     fn (str_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 Typed::parse_timespan — parses [0-9]+ mantissa then one of s/m/h/d suffix (or NUL for literal seconds). Suffix multipliers are 1/60/3600/86400. Multiplication uses shl+add without mul/imul: *60 = *64 - *4 not usable (no sub without corrupting flags in a tight loop — actually sub IS allowed per dispatch.pdx precedent, but the shl+lea route is cleaner). *60 = *(2^6 - 2^2) OR (*2 * *30) OR the composed lea sequence. The chosen sequence is documented per arm. Leaf; no callee-save touched.",
+      justification: "libpdx-argv.M2-001 + ENH-009 Typed::parse_timespan — parses [0-9]+ mantissa then one of s/m/h/d suffix (or NUL for literal seconds). Suffix multipliers are 1/60/3600/86400. Multiplication uses shl+add without mul/imul. ENH-009: the digit loop gates each *10+digit step with the same Q=1844674407370955161/R=5 check as parse_int_u64/parse_size; each multiplier arm (60/3600/86400) gates with `cmp rcx, r11; ja fail` against its own Python-verified floor(u64::MAX/CONST) threshold before running its shl+add decomposition, since a pure `mantissa*CONST` overflow needs no remainder special-case (nothing is added to the product afterward). Leaf; no callee-save touched.",
       block: {
         xor rcx, rcx;
         xor r10, r10;
@@ -271,6 +362,16 @@ module Typed = structure {
 
         mov r8, rax;
         sub r8, 0x30;
+
+        // Overflow check (ENH-009): same Q/R gate as parse_int_u64.
+        mov r11, 1844674407370955161;
+        cmp rcx, r11;
+        ja pt_fail;
+        jne pt_digit_ok;
+        cmp r8, 5;
+        jg pt_fail;
+      pt_digit_ok:
+
         mov r9, rcx;
         shl r9, 3;
         add r9, rcx;
@@ -308,6 +409,12 @@ module Typed = structure {
         jmp pt_check_terminator;
 
       pt_mul_60:
+        // Overflow (ENH-009): mantissa * 60 must not exceed u64::MAX.
+        // Threshold = floor(u64::MAX / 60) = 307445734561825860.
+        mov r11, 307445734561825860;
+        cmp rcx, r11;
+        ja pt_fail;
+
         // *60 = (*8 + *2) * 6 ... simpler: *64 - *4 requires sub with
         // carry care. Cleanest with shl+add: *60 = *4 * *15 = *4 *
         // (*16 - *1). Also complex. Use the direct sum decomposition:
@@ -335,6 +442,12 @@ module Typed = structure {
         jmp pt_check_terminator;
 
       pt_mul_3600:
+        // Overflow (ENH-009): threshold = floor(u64::MAX / 3600)
+        // = 5124095576030431.
+        mov r11, 5124095576030431;
+        cmp rcx, r11;
+        ja pt_fail;
+
         // 3600 = 2048 + 1024 + 512 + 16
         //      = 2^11 + 2^10 + 2^9 + 2^4
         //      = shl 11 + shl 10 + shl 9 + shl 4
@@ -357,6 +470,12 @@ module Typed = structure {
         jmp pt_check_terminator;
 
       pt_mul_86400:
+        // Overflow (ENH-009): threshold = floor(u64::MAX / 86400)
+        // = 213503982334601.
+        mov r11, 213503982334601;
+        cmp rcx, r11;
+        ja pt_fail;
+
         // 86400 = 65536 + 16384 + 4096 + 256 + 128
         //       = 2^16 + 2^14 + 2^12 + 2^8 + 2^7
         //       = shl 16 + shl 14 + shl 12 + shl 8 + shl 7

@@ -84,7 +84,11 @@ none remains). The well-known `--pdx-schema` sets `ParsedArgs::emit_schema`.
 ### typed.pdx — `Typed`
 
 Value decoders for the string a typed flag captured. Each returns **ok in
-`rax` (1/0), decoded value in `rdx`**; all are leaf functions.
+`rax` (1/0), decoded value in `rdx`**; all are leaf functions. **All three
+detect (rather than silently wrap on) a value that would exceed `u64::MAX`
+and return `ok = 0` (`libpdx-argv.ENH-009`)** — a wrapped `--older-than`
+or `--size` threshold is a correctness hazard this library no longer
+produces.
 
 | Function | Purpose |
 | --- | --- |

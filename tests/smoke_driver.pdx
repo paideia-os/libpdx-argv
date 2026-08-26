@@ -91,6 +91,13 @@ module SmokeDriver = structure {
         call run_case15;
         call run_case16;
         call run_case17;
+        call run_case18;
+        call run_case19;
+        call run_case20;
+        call run_case21;
+        call run_case22;
+        call run_case23;
+        call run_case24;
 
         // --- ParseTypedArgsTests (module id 3) ----------------------
         call run_case1;

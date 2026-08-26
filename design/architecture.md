@@ -344,6 +344,44 @@ The multipliers are implemented as fixed `shl+add` sequences (see the
 per-arm justifications in `typed.pdx`). This keeps the encoded
 instruction set inside the R49 subset — no `mul`, no `imul`, no `neg`.
 
+**Overflow detection (`libpdx-argv.ENH-009`, post-1.0).** All three
+decoders now detect rather than silently wrap on overflow, returning
+`ok = 0` — the pre-existing failure contract, so no consumer changes.
+Two distinct checks are involved:
+
+- **Per-digit accumulation** (`acc = acc*10 + digit`, shared by all
+  three decoders). Let `Q = floor(u64::MAX / 10) = 1844674407370955161`
+  and `R = u64::MAX mod 10 = 5`. Before each step: `acc > Q` fails
+  (`acc*10` alone overflows); `acc == Q && digit > R` fails
+  (`acc*10 + digit` overflows); otherwise the step is safe. `Q`/`R`
+  are the standard bignum "checked multiply-then-add by a small
+  constant" boundary values, verified independently in Python
+  (`(2**64-1)//10, (2**64-1)%10`) rather than hand-derived.
+- **`parse_size`'s suffix shift** (`shl rcx, N` for `N ∈ {10,20,30}`).
+  A left shift loses data iff any of the top `N` bits of the pre-shift
+  mantissa are set — checked as `(mantissa >> (64-N)) != 0` via `shr`
+  into a scratch register compared against 0, not by inspecting the
+  shift instruction's own flags (no code in this file relies on a
+  flag surviving past the next instruction).
+- **`parse_timespan`'s suffix multiplier** (`mantissa * CONST` for
+  `CONST ∈ {60, 3600, 86400}`; `*1` for bare seconds can never
+  overflow, since the mantissa itself already passed the
+  accumulation-loop gate). Unlike the per-digit case there is no
+  addend after the product, so the check has no remainder
+  special-case: overflow is exactly `mantissa > floor(u64::MAX /
+  CONST)`. The three thresholds — `307445734561825860` (÷60),
+  `5124095576030431` (÷3600), `213503982334601` (÷86400) — are
+  likewise Python-verified.
+
+All of these thresholds exceed the paideia-as `cmp reg, imm ≤
+0x7FFFFFFF` cap, so every compare stages the constant through a
+register first (`mov r11, <imm64>; cmp reg, r11`) rather than
+comparing against the immediate directly — the same staging idiom
+`libpdx-cap`'s M4-002 test matrix uses for its `0xFFFFFFxx` sentinels.
+See `tests/parse_typed_values.pdx` cases 18-24, which pair each
+boundary's exact-threshold success with its one-past-threshold
+failure so the gate's own off-by-one risk is covered directly.
+
 ### 9.4 ParsedArgs record extensions
 
 Four new slots + one new error code:
@@ -710,7 +748,7 @@ reshuffle case numbers.
 | ID | Module (file)                            | Cases (M4-001) |
 |----|------------------------------------------|:--:|
 | 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 16 |
-| 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 17 |
+| 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 24 |
 | 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
 | 4  | *reserved* (parse_positional_ext)         | —  |
 | 5  | `ParseStdVocabTests` (parse_std_vocab.pdx) | 2  |

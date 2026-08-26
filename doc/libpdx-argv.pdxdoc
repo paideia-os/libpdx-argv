@@ -124,6 +124,13 @@ out to decode to), so the tool renders its own diagnostic from
 The `w` (week) suffix on `parse_timespan` is deferred to M6 (a
 per-tool concern once anything ships a `--older-than 1w` need).
 
+Overflow (`libpdx-argv.ENH-009`): all
+three decoders detect a value that would exceed `u64::MAX` and
+return `ok = 0` rather than silently wrapping (`--size 100g` no
+longer turns into a small, wrong threshold; it fails). This applies
+to the decimal-digit accumulation in all three, and to `parse_size`'s
+suffix shift and `parse_timespan`'s suffix multiplier individually.
+
 .section ALTERNATE INVOCATION (SEMANTIC PIPE)
 When a tool is invoked through a `KIND_IPC_ENDPOINT` semantic
 pipe with a `PdxArgvRecord@0.1` payload rather than through the

@@ -7,6 +7,13 @@
 // returns rax=ok (1/0), rdx=value; the test caller pulls rdx into r14
 // (callee-preserved) so a comparison after the call still holds.
 //
+// Cases 18-24 (libpdx-argv.ENH-009): overflow detection. Each
+// decoder's per-digit accumulation and (for parse_size/parse_timespan)
+// its suffix multiply/shift is gated against a Python-verified
+// threshold; cases pair an exact-boundary success with an
+// one-past-boundary failure so the gate's own off-by-one risk is
+// covered, not just "overflow is rejected somewhere".
+//
 // Module id in TestHarness::last_fail_tag: 2
 //
 // paideia-as compliance
@@ -39,6 +46,15 @@ module ParseTypedValues = structure {
   pub let f_ts_3h       : [u8; 3]  = "3h\0"
   pub let f_ts_7d       : [u8; 3]  = "7d\0"
   pub let f_ts_bad_w    : [u8; 3]  = "1w\0"    // 'w' unsupported at M2
+
+  // -- libpdx-argv.ENH-009 overflow-detection fixtures --
+  pub let f_int_u64_max      : [u8; 21] = "18446744073709551615\0" // u64::MAX exactly
+  pub let f_int_u64_max_plus : [u8; 21] = "18446744073709551616\0" // u64::MAX + 1
+  pub let f_size_mantissa_over : [u8; 21] = "18446744073709551616\0" // no suffix; mantissa itself > u64::MAX
+  pub let f_size_g_over      : [u8; 13] = "17179869184g\0"  // 2^34; shl 30 overflows
+  pub let f_size_g_boundary  : [u8; 13] = "17179869183g\0"  // 2^34 - 1; shl 30 fits exactly
+  pub let f_ts_d_over        : [u8; 17] = "213503982334602d\0" // floor(u64::MAX/86400) + 1
+  pub let f_ts_d_boundary    : [u8; 17] = "213503982334601d\0" // floor(u64::MAX/86400) exactly
 
   // ============================================================
   // case 1  parse_int_u64("0") → (1, 0)
@@ -432,6 +448,213 @@ module ParseTypedValues = structure {
         mov rdi, 0x200000011;
         call record_fail;
         pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 18  parse_int_u64("18446744073709551615") → (1, u64::MAX)
+  //   libpdx-argv.ENH-009: the boundary value itself must still
+  //   succeed — the overflow gate must not be off-by-one.
+  // ============================================================
+  pub let run_case18 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case18 — parse_int_u64 at exactly u64::MAX must still succeed (the overflow gate's acc==Q/digit<=R boundary case). u64::MAX doesn't fit a cmp reg,imm (>0x7FFFFFFF), so it's staged via mov r15, imm64 and compared reg-reg, matching case9's precedent for the same reason.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        lea rdi, [rip + f_int_u64_max];
+        call parse_int_u64;
+        mov r14, rdx;
+        cmp rax, 1; jne case18_fail;
+        mov r15, 0xFFFFFFFFFFFFFFFF;
+        cmp r14, r15; jne case18_fail;
+
+        call record_pass;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret;
+
+      case18_fail:
+        mov rdi, 0x200000012;
+        call record_fail;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // case 19  parse_int_u64("18446744073709551616") → (0, —)
+  //   libpdx-argv.ENH-009: u64::MAX + 1 must now be rejected instead
+  //   of wrapping to 0.
+  // ============================================================
+  pub let run_case19 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case19 — one past u64::MAX must fail with ok=0 rather than silently wrapping to 0 (the pre-ENH-009 behaviour). This is the regression fixture for the bug ENH-009 fixes.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_int_u64_max_plus];
+        call parse_int_u64;
+        cmp rax, 0; jne case19_fail;
+        call record_pass;
+        pop rbx; ret;
+      case19_fail:
+        mov rdi, 0x200000013;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 20  parse_size("18446744073709551616") → (0, —)
+  //   libpdx-argv.ENH-009: mantissa-accumulation overflow (no
+  //   suffix) — same gate as parse_int_u64, exercised through
+  //   parse_size's own copy of the digit loop.
+  // ============================================================
+  pub let run_case20 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case20 — parse_size's mantissa-only path (no suffix) must reject a mantissa one past u64::MAX, proving the digit-loop overflow gate applies here too, not just in parse_int_u64.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_mantissa_over];
+        call parse_size;
+        cmp rax, 0; jne case20_fail;
+        call record_pass;
+        pop rbx; ret;
+      case20_fail:
+        mov rdi, 0x200000014;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 21  parse_size("17179869184g") → (0, —)
+  //   libpdx-argv.ENH-009: suffix-shift overflow. Mantissa = 2^34;
+  //   shl 30 would need bit 64 — the top-30-bits-nonzero gate must
+  //   catch this before the shift executes.
+  // ============================================================
+  pub let run_case21 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case21 — mantissa 2^34 with the 'g' (shl 30) suffix: shr r9,34 on 2^34 yields 1 (nonzero), so ps_shl_30's pre-shift gate must reject this before shl rcx,30 ever executes and silently wraps.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_size_g_over];
+        call parse_size;
+        cmp rax, 0; jne case21_fail;
+        call record_pass;
+        pop rbx; ret;
+      case21_fail:
+        mov rdi, 0x200000015;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 22  parse_size("17179869183g") → (1, (2^34-1) << 30)
+  //   libpdx-argv.ENH-009: one less than case21's mantissa (2^34-1)
+  //   must still succeed — the shift-overflow gate's boundary must
+  //   not be off-by-one either.
+  // ============================================================
+  pub let run_case22 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case22 — mantissa 2^34-1 with 'g' suffix: shr r9,34 yields 0 (all top-30 bits clear), so the shift proceeds and must return ok=1 with the exact product 18446744072635809792 (Python-verified). Staged via r15/mov imm64 + cmp reg,reg, same as case9/case18.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        lea rdi, [rip + f_size_g_boundary];
+        call parse_size;
+        mov r14, rdx;
+        cmp rax, 1; jne case22_fail;
+        mov r15, 18446744072635809792;
+        cmp r14, r15; jne case22_fail;
+
+        call record_pass;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret;
+
+      case22_fail:
+        mov rdi, 0x200000016;
+        call record_fail;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // case 23  parse_timespan("213503982334602d") → (0, —)
+  //   libpdx-argv.ENH-009: suffix-multiplier overflow. Mantissa is
+  //   floor(u64::MAX/86400) + 1; mantissa*86400 exceeds u64::MAX by
+  //   construction (Python-verified in the fixture's own derivation).
+  // ============================================================
+  pub let run_case23 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case23 — mantissa one past the 'd' (*86400) overflow threshold must fail ok=0 rather than silently wrapping, proving pt_mul_86400's pre-multiply gate.",
+      block: {
+        push rbx;
+        lea rdi, [rip + f_ts_d_over];
+        call parse_timespan;
+        cmp rax, 0; jne case23_fail;
+        call record_pass;
+        pop rbx; ret;
+      case23_fail:
+        mov rdi, 0x200000017;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 24  parse_timespan("213503982334601d") → (1, 18446744073709526400)
+  //   libpdx-argv.ENH-009: the exact threshold mantissa must still
+  //   succeed — the *86400 gate's boundary must not be off-by-one.
+  // ============================================================
+  pub let run_case24 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-009 case24 — mantissa exactly floor(u64::MAX/86400) with 'd' suffix must succeed with the exact product 18446744073709526400 (Python-verified). Staged via r15, same as case9/case18/case22.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        lea rdi, [rip + f_ts_d_boundary];
+        call parse_timespan;
+        mov r14, rdx;
+        cmp rax, 1; jne case24_fail;
+        mov r15, 18446744073709526400;
+        cmp r14, r15; jne case24_fail;
+
+        call record_pass;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret;
+
+      case24_fail:
+        mov rdi, 0x200000018;
+        call record_fail;
+        add rsp, 8;
+        pop r15;
+        pop rbx;
+        ret;
       }
     }
 }

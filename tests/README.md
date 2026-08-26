@@ -25,7 +25,7 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | ID | Module                      | Cases |
 |----|-----------------------------|-------|
 | 1  | ParseGrammarTests           | 16    |
-| 2  | ParseTypedValuesTests       | 17    |
+| 2  | ParseTypedValuesTests       | 24    |
 | 3  | ParseTypedArgsTests         | 5     |
 | 4  | (reserved: parse_positional_ext) | — |
 | 5  | ParseStdVocabTests          | 2     |
@@ -34,9 +34,9 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | 8  | SchemaEmitTests             | 5     |
 | 9  | (reserved: parse_mixed_ext) | —     |
 
-**Total M4-001 cases:** 58 (2 added by `libpdx-argv.ENH-002`, 2 more by
+**Total M4-001 cases:** 65 (2 added by `libpdx-argv.ENH-002`, 2 more by
 `libpdx-argv.ENH-001`, 3 more by `libpdx-argv.ENH-004`, 1 more by
-`libpdx-argv.ENH-008`).
+`libpdx-argv.ENH-008`, 7 more by `libpdx-argv.ENH-009`).
 
 `last_fail_tag` encoding: `(module_id << 32) | case_number`.
 `case_number` is the last hex digit of the module's `run_caseN` name;
@@ -112,6 +112,13 @@ Per the M4 line in `design/tooling/r49-r50-plan.md` §5.12:
 | 15 | `parse_timespan("3h")` | (1, 10800) |
 | 16 | `parse_timespan("7d")` | (1, 604800) |
 | 17 | `parse_timespan("1w")` | (0, —) — 'w' unsupported at M2 |
+| 18 | `parse_int_u64("18446744073709551615")` | (1, u64::MAX) — `libpdx-argv.ENH-009` exact boundary |
+| 19 | `parse_int_u64("18446744073709551616")` | (0, —) — ENH-009 one past MAX |
+| 20 | `parse_size("18446744073709551616")` | (0, —) — ENH-009 mantissa-only overflow |
+| 21 | `parse_size("17179869184g")` | (0, —) — ENH-009 shift-overflow (mantissa=2^34) |
+| 22 | `parse_size("17179869183g")` | (1, (2^34-1)<<30) — ENH-009 shift boundary |
+| 23 | `parse_timespan("213503982334602d")` | (0, —) — ENH-009 multiplier overflow |
+| 24 | `parse_timespan("213503982334601d")` | (1, 18446744073709526400) — ENH-009 multiplier boundary |
 
 ### Typed arg consumption + diagnostics (parse_typed_args.pdx)
 
