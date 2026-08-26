@@ -147,14 +147,20 @@ stdout (no caps), so the actual printing is the consumer's job.
 | `get_count() -> u64 !{mem} @{}` | Number of registered names. |
 | `get_name(idx: u64) -> u64 !{mem} @{}` | Pointer to `schema_names[idx]`, or `0` if out of range. |
 
-## Schemas exposed
+## Wire schema (input only)
 
-Two, both declared in `caps.decl` under `declares_output_schemas:` and
-sharing the `libpdx-semantic-pipe` fingerprint namespace:
+`caps.decl` declares no output schema (`declares_output_schemas: (none)`).
+**`libpdx-argv.ENH-003` (2026-08-25):** the 1.0 release declared a second
+schema, `PdxArgvParsed@0.1` (a structured mirror of `ParsedArgs`,
+supposedly emitted when a consumer opts into `--pdx-schema`), that never
+had a producer anywhere in `src/` — `--pdx-schema` only ever set the
+`emit_schema` bit. Withdrawn rather than implemented; no known consumer
+depended on it. See `CHANGELOG.md`'s dated correction on the 1.0 entry.
 
-- **`PdxArgvParsed@0.1`** — structured mirror of `ParsedArgs`, emitted when
-  the consumer opts into `--pdx-schema`. Lets a downstream tool introspect a
-  peer's parsed invocation without re-running the parser.
+The one wire schema this library actually touches is an **input**, not
+an output — read by `SchemaInvoke::parse_from_schema_record`, never
+produced by anything here:
+
 - **`PdxArgvRecord@0.1`** — the alternate-invocation wire form read by
   `SchemaInvoke::parse_from_schema_record`. v1 layout:
 
@@ -168,8 +174,8 @@ sharing the `libpdx-semantic-pipe` fingerprint namespace:
   | … | 8 × `pos_count` | `u64 pos_off` |
   | … | rest | NUL-terminated string table |
 
-Envelope framing for both binds at `libpdx-semantic-pipe` M2/M3-001 — see
-that repo for pipe schema definitions. The decoder here is self-contained:
+Envelope framing binds at `libpdx-semantic-pipe` M2/M3-001 — see that
+repo for pipe schema definitions. The decoder here is self-contained:
 `deps.list` records **no library dependencies**, and the wire shape is
 *coordinated with* rather than linked against `libpdx-semantic-pipe`.
 

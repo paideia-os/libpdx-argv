@@ -41,10 +41,21 @@ milestone issue (#1–#10 in `paideia-os/libpdx-argv`) is closed.
   `--pdx-schema` (structured mirror of `ParsedArgs`; used by
   downstream tools that want to introspect a peer tool's parsed
   invocation without re-running the parser).
+  **Correction (2026-08-25, `libpdx-argv.ENH-003`):** this schema was
+  never implemented — `--pdx-schema` only ever set the `emit_schema`
+  bit; no function in this repo has ever serialized `ParsedArgs` into
+  this shape. Withdrawn from `caps.decl`/`pkgs/mirror.entry` rather
+  than built, since no consumer depended on it. Left in place here
+  rather than edited, per this repo's policy of not rewriting a
+  signed release's history silently.
 - `PdxArgvRecord@0.1` — the alternate-invocation wire form
   consumed by `SchemaInvoke::parse_from_schema_record`
   (schema-driven arg binding when libpdx-argv is called through
-  a semantic pipe rather than through argv).
+  a semantic pipe rather than through argv). **Note (ENH-003):** this
+  is this library's *input* schema (`SchemaInvoke` decodes it; nothing
+  here encodes it) — `declares_output_schemas:` was the wrong
+  direction for it from the start; see `caps.decl`'s
+  `consumes_input_schemas:` for the corrected framing.
 
 Both schemas live in the same fingerprint namespace and bind to
 `libpdx-semantic-pipe` M2 envelope framing (schema-registry-aware

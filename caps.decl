@@ -16,12 +16,26 @@
 # tooling can consult a uniform declaration for every library.
 requires: (none)
 
-# Declared output schemas — the semantic-pipe schema record that the
-# parser emits when the caller asks for --pdx-schema (M1 stub) and the
-# alternate-invocation wire schema read by SchemaInvoke::parse_from_
-# schema_record (M3-001; see design/architecture.md §10.1 for the wire
-# form). Both share the same schema fingerprint namespace and land at
-# libpdx-semantic-pipe M2 once envelope framing is wired end-to-end.
+# libpdx-argv.ENH-003 (2026-08-25): PdxArgvParsed@0.1 was declared here
+# at 1.0 but never had a producer anywhere in src/ — --pdx-schema only
+# ever set the emit_schema bit, and no function serializes ParsedArgs
+# into that wire shape. Withdrawn rather than implemented; no known
+# consumer depended on it (see CHANGELOG.md's dated correction on the
+# 1.0 entry).
+#
+# PdxArgvRecord@0.1 was also misfiled under declares_output_schemas:
+# at 1.0 — it is this library's only *input* wire schema
+# (SchemaInvoke::parse_from_schema_record decodes it; nothing here
+# encodes/emits it — see design/architecture.md §10.1 for the wire
+# form). The caps.decl grammar this file's own sibling libpdx-cap
+# parses (src/caps_decl.pdx there) recognises only `requires:` and
+# `declares_output_schemas:` as top-level keys — there is no
+# `consumes_input_schemas:` (or equivalent) key in that grammar to
+# declare it correctly, so it is recorded here as prose only rather
+# than invented as new parseable syntax that libpdx-cap's own parser
+# would reject as CAPS_DECL_MALFORMED_HEADER. declares_output_schemas:
+# is therefore correctly empty below — this library declares no
+# output schema of its own onto a semantic pipe.
 #
 # PdxArgvRecord@0.1 is this library's only untrusted-input surface (a
 # peer process hands it a frame across a KIND_IPC_ENDPOINT). Every
@@ -30,6 +44,4 @@ requires: (none)
 # before the record's end before SchemaInvoke::parse_from_schema_record
 # dereferences it — see ERR_SCHEMA_BAD_OFFSET / ERR_SCHEMA_UNTERMINATED
 # in src/parsed_args.pdx (libpdx-argv.ENH-001).
-declares_output_schemas:
-  - PdxArgvParsed@0.1
-  - PdxArgvRecord@0.1
+declares_output_schemas: (none)
