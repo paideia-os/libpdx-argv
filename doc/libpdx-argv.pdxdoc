@@ -84,9 +84,14 @@ flags; a tool's own flags start at id 100.
 .section TYPED FLAG ARGUMENTS
 `Typed::parse_int_u64` / `parse_size` / `parse_timespan` decode
 the string half of a typed flag into a `(ok: u64, value: u64)`
-pair. Failing decodes set `ParsedArgs::error_code =
-ERR_TYPED_PARSE` and leave `flag_values[k]` pointing at the
-offending text so the tool can render a diagnostic.
+pair, returned directly in `rax:rdx`. These are leaf functions —
+they never touch `ParsedArgs::error_code` at all; no
+`ParsedArgs` constant exists for a typed-decode failure. A failing
+decode (`ok == 0`) still leaves `flag_values[k]` pointing at the
+offending text (the
+parser stored that pointer regardless of what the value turns
+out to decode to), so the tool renders its own diagnostic from
+`ok` plus that pointer — this library does not do it for you.
 
   --older-than 7d       parse_timespan -> 604800 (seconds)
   --older-than 3h       parse_timespan -> 10800
@@ -129,9 +134,16 @@ permitted.
 .section --SCHEMA
 `SchemaEmit::register(schema_name_ptr)` at init lets a tool
 publish which schemas it emits on stdout under normal operation.
-`Parser::parse_argv` intercepts `--schema` at parse time and the
-consumer's dispatch loop walks `SchemaEmit::get_count` /
-`SchemaEmit::get_name` to print them one per line, then exits 0.
+`--schema` is ordinary `StdVocab` id 5 (see STANDARD FLAGS above)
+— `Parser::parse_argv` stores it like any other registered flag;
+it does not intercept it specially. The consumer's dispatch loop
+checks `ParsedArgs::find_flag_by_id(StdVocab::STD_ID_SCHEMA)`,
+and on a hit walks `SchemaEmit::get_count` / `SchemaEmit::get_name`
+to print the declared schemas one per line, then exits 0. (This is
+a different flag from the well-known `--pdx-schema` inline compare
+described under ALTERNATE INVOCATION's `emit_schema` bit — `--schema`
+lists declared output schemas; `--pdx-schema` is an M1 debug toggle
+unrelated to SchemaEmit.)
 
 Consumers that emit no schema-bearing output register nothing
 (the flag is still accepted; the tool exits 0 with empty stdout).
@@ -144,27 +156,54 @@ synchronously inside the caller's process and issues no
 syscalls.
 
 .section DIAGNOSTICS
-Non-zero return from `Parser::parse_argv` or
-`SchemaInvoke::parse_from_schema_record` sets
-`ParsedArgs::error_code`. Consumers render the diagnostic on
-stderr and exit per I4:
+`Parser::parse_argv` and `SchemaInvoke::parse_from_schema_record`
+both set `ParsedArgs::error_code`; `ERR_OK` (0) is success, and every
+non-zero value is one of the constants below (all defined in
+`src/parsed_args.pdx`; this list and that file's `pub let ERR_*` set
+match exactly — libpdx-argv.ENH-005). Every non-zero code also sets
+`ParsedArgs::error_arg_index` to the offending argv slot (argv path)
+or flag/positional loop index (schema-record path); `0` for a
+whole-buffer header failure.
 
-  exit 2   ERR_UNKNOWN_FLAG          unrecognised long/short name
+  ERR_FLAG_OVERFLOW (1)             more than 32 flags in one parse
+  ERR_POS_OVERFLOW (2)              more than 32 positionals in one parse
+  ERR_CLUSTERED_SHORT (4)           `-la` etc. (D3 rejects clustering)
+  ERR_LONG_MISSING_NAME (5)         `--=foo`, `--:foo`
+  ERR_MISSING_VALUE (6)             typed flag reached end of argv with
+                                     no value to consume
+  ERR_SCHEMA_BAD_MAGIC (7)          schema-record: bad wire magic
+                                     (semantic-pipe path only)
+  ERR_SCHEMA_UNSUPPORTED_VERSION (8) schema-record: version != 1
+                                     (semantic-pipe path only)
+  ERR_SCHEMA_BAD_LAYOUT (9)         schema-record: header too short, a
+                                     count exceeds MAX_FLAGS/MAX_POS, or
+                                     the body-fits check failed
+                                     (semantic-pipe path only)
+  ERR_SCHEMA_BAD_OFFSET (10)        schema-record: name/value/pos
+                                     offset out of range
+                                     (semantic-pipe path only)
+  ERR_SCHEMA_UNTERMINATED (11)      schema-record: string ran to record
+                                     end with no NUL
+                                     (semantic-pipe path only)
+  ERR_UNKNOWN_FLAG (12)             unrecognised long/short name
                                      (opt-in: FlagSpec::set_strict(1);
                                      libpdx-argv.ENH-004. Permissive by
                                      default — an unregistered flag is
                                      silently accepted as boolean
                                      unless strict mode is enabled.)
-  exit 2   ERR_CLUSTERED_SHORT       `-la` etc.
-  exit 2   ERR_LONG_MISSING_NAME     `--=foo`, `--:foo`
-  exit 2   ERR_MISSING_VALUE         typed flag without value
-  exit 2   ERR_TYPED_PARSE           `--size xyz`, `--older-than 3q`
-  exit 3   ERR_SCHEMA_RECORD_MALFORMED  semantic-pipe path only
-  exit 3   ERR_SCHEMA_BAD_OFFSET     name/value/pos offset out of range
-  exit 3   ERR_SCHEMA_UNTERMINATED   string ran to record end with no NUL
 
-exit 3 is a system error (audit-journal broker refused, or
-peer sent a malformed schema record); exit 2 is a user error.
+`ERR_UNKNOWN_ARG_FORM` (3) is reserved in `parsed_args.pdx` but no
+code path returns it yet. Typed-decode failures (`Typed::parse_*`
+returning `ok == 0`) do not set `error_code` at all — see TYPED FLAG
+ARGUMENTS above — and the schema-record path's only failure codes
+are the four listed above; no other constant exists for it.
+
+This library does not itself call `exit` or prescribe a process exit
+status for any code above — mapping `ParsedArgs::error_code` to a
+concrete exit number (and rendering the human-readable diagnostic on
+stderr) is entirely the consumer's own I4 exit-code-discipline
+obligation (`design/tooling/plan.md` T-INV-I4). Do not treat any
+exit-status split by "code group" as a contract this library defines.
 
 .section CROSS-REFERENCES
   doc doc                        the .pdxdoc reader (renders this file)
