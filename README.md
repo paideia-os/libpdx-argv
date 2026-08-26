@@ -171,30 +171,51 @@ that repo for pipe schema definitions. The decoder here is self-contained:
 
 ## Callers
 
-Verified by reading the consumer's own source:
+Verified (`libpdx-argv.ENH-011`, 2026-08-25) by grepping each tool's own
+`src/` for a call into this library's symbols (`parse_argv`,
+`parsed_args_reset`, `register_all`, `parse_from_schema_record`,
+`fill_doc_argv`) — 6 of the 9 R49+R50 P0 tools genuinely link and call
+this library:
 
-- [pkg](https://github.com/paideia-os/pkg) — `src/main.pdx` resets
-  `ParsedArgs`, `call parse_argv`, then dispatches on `ParsedArgs::pos_ptrs[0]`.
-- [ls](https://github.com/paideia-os/ls) — `src/argv_surface.pdx` is an
-  explicit "argv-facing wrapper around libpdx-argv::Parser", calling
+- [pkg](https://github.com/paideia-os/pkg) — `src/main.pdx:103`
+  `call parse_argv`, dispatches on `ParsedArgs::pos_ptrs[0]`.
+- [ls](https://github.com/paideia-os/ls) — `src/argv_surface.pdx:223,228`,
+  an explicit "argv-facing wrapper around libpdx-argv::Parser", calling
   `parsed_args_reset` and `parse_argv` and branching on
   `ParsedArgs::emit_schema`.
+- [cp](https://github.com/paideia-os/cp) — `src/main.pdx:125`
+  `call register_all`, `:141` `call parse_argv`.
+- [mkdir](https://github.com/paideia-os/mkdir) — `src/mkdir.pdx:1210`
+  `call parse_argv`.
+- [mv](https://github.com/paideia-os/mv) — `src/argv.pdx:194`
+  `call parse_argv`.
+- [rm](https://github.com/paideia-os/rm) — `src/main.pdx:130`
+  `call parse_argv`.
 
-Checked and **not yet** a caller:
+Checked and **not** a caller, with the real reason each isn't:
 
 - [cat](https://github.com/paideia-os/cat) — carries its own
   `ArgvDispatch::cat_parse_argv`; its source notes that migrating cat's argv
   surface to libpdx-argv is scheduled at cat.M3, kept off M2 to preserve
-  byte-compat with the M1 golden fixtures.
+  byte-compat with the M1 golden fixtures. Tool-side, by plan.
+- [doc](https://github.com/paideia-os/doc) — its own
+  `src/argv_dispatch.pdx:206` inline positional scan carries the comment
+  "M1: inline positional; M2: libpdx-argv" — migration is scheduled, not
+  blocked. Tool-side, by plan.
+- [shell](https://github.com/paideia-os/shell) — reimplements the parse
+  discipline as its own `Pds` ("mirrors its `ParsedArgs` singleton
+  discipline", per shell's README) rather than linking this library.
+  This is the one library-side cause: `ParsedArgs`/`FlagSpec`/`SchemaEmit`
+  are `.bss` singletons with one live parse context per process
+  (`design/architecture.md` §3), which a multi-command-line shell can't
+  adopt as shipped. See `libpdx-argv.ENH-006` (#17) for the caller-owned
+  context that would unblock it.
 
-Likely callers (by design — all P0 CLI tools parse flags and implement the
-I3 vocabulary — but not verified here):
-[cp](https://github.com/paideia-os/cp),
-[doc](https://github.com/paideia-os/doc),
-[mkdir](https://github.com/paideia-os/mkdir),
-[mv](https://github.com/paideia-os/mv),
-[rm](https://github.com/paideia-os/rm),
-[shell](https://github.com/paideia-os/shell).
+Four P0 tools that link this library (`cp`, `ls`, `pkg`, `rm`) currently
+ship an empty `deps.list`, so `pkg install --strict` would verify them
+against a manifest that omits a library they actually link — a defect in
+those four tool repos (and possibly a `deps.list`-lint gap in `pkg`), not
+tracked in this repo.
 
 ## Version
 

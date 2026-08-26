@@ -60,6 +60,12 @@ declare their own caps.
 
 - Consumers (direct): `pkg`, `shell`, `doc`, `ls`, `cat`, `cp`,
   `mv`, `rm`, `mkdir` (all nine R49+R50 P0 tools).
+  **Correction (2026-08-25, `libpdx-argv.ENH-011`):** this overclaimed.
+  A source-grep audit found only 6 of these 9 (`pkg`, `ls`, `cp`,
+  `mkdir`, `mv`, `rm`) actually call into this library; `cat`, `doc`
+  and `shell` do not, each for the reason recorded in README.md
+  §Callers. Left in place rather than edited, per this repo's policy
+  of not rewriting a signed release's history silently.
 - Coordinated wire schema (shape only, no link):
   `libpdx-semantic-pipe` at M2 envelope framing.
 - Runtime target: `doc` at ≥ M2 (`HelpBackend::fill_doc_argv`
