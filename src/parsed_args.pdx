@@ -32,6 +32,12 @@ module ParsedArgs = structure {
   // apart from "sender pointed us at attacker-chosen bytes".
   pub let ERR_SCHEMA_BAD_OFFSET         : u64 = 10 // name/value/pos offset out of range
   pub let ERR_SCHEMA_UNTERMINATED       : u64 = 11 // string ran to record end with no NUL
+  // Added by libpdx-argv.ENH-004 (opt-in strict mode). Fires on both
+  // invocation paths when FlagSpec::set_strict(1) is in effect and a
+  // flag name is not registered with FlagSpec (FKIND_UNKNOWN). Default
+  // (FlagSpec::strict_mode == 0) is unchanged permissive behaviour —
+  // an unregistered flag stores as boolean, same as before ENH-004.
+  pub let ERR_UNKNOWN_FLAG              : u64 = 12 // strict mode: unregistered flag name
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

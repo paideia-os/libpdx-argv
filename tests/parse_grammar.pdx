@@ -7,6 +7,9 @@
 //   - Bare `-` treated as positional
 //   - `--=foo` and `--:foo` → ERR_LONG_MISSING_NAME
 //   - Well-known `--pdx-schema` toggles emit_schema=1
+//   - libpdx-argv.ENH-004 opt-in strict mode (cases 13-15): permissive
+//     default unchanged, FlagSpec::set_strict(1) rejects an
+//     unregistered flag on both the long- and short-flag paths.
 //
 // Module id in TestHarness::last_fail_tag: 1
 //
@@ -701,6 +704,169 @@ module ParseGrammar = structure {
 
       case12_fail:
         mov rdi, 0x10000000C;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 13 — libpdx-argv.ENH-004 permissive baseline (default,
+  //   strict mode never set): an unregistered long flag still parses
+  //   clean, unchanged from pre-ENH-004 behaviour.
+  //   argv: "--nosuchflag", "foo"
+  //   Expected: err=0, flag_count=1 (stored as boolean/unknown),
+  //             pos_count=1.
+  // ============================================================
+  pub let case13_nosuchflag : [u8; 13] = "--nosuchflag\0"
+  pub let case13_foo        : [u8; 4]  = "foo\0"
+  pub let mut case13_argv   : [u64; 2] = uninit @align(8)
+
+  pub let run_case13 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-004 case13 — strict mode is never set in this case (FlagSpec::reset leaves it at 0, the permissive default), so `--nosuchflag foo` must parse exactly as it did before ENH-004: ERR_OK, the flag stored (boolean, unregistered), foo landing as a positional. Regression fixture proving ENH-004 is additive, not a behaviour change for existing consumers.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case13_nosuchflag];
+        lea rbx, [rip + case13_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case13_foo];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case13_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0;
+        jne case13_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case13_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne case13_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case13_fail:
+        mov rdi, 0x10000000D;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 14 — libpdx-argv.ENH-004 strict mode, long flag.
+  //   FlagSpec::set_strict(1) after register_all; argv: same as
+  //   case13 ("--nosuchflag", "foo").
+  //   Expected: err=ERR_UNKNOWN_FLAG (12), error_arg_index=0,
+  //             flag_count=0 (rejected before any store).
+  // ============================================================
+  pub let case14_nosuchflag : [u8; 13] = "--nosuchflag\0"
+  pub let case14_foo        : [u8; 4]  = "foo\0"
+  pub let mut case14_argv   : [u64; 2] = uninit @align(8)
+
+  pub let run_case14 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-004 case14 — FlagSpec::set_strict(1) after register_all; `--nosuchflag foo` must now fail with ERR_UNKNOWN_FLAG=12, error_arg_index=0 (the flag's own argv index), and flag_count must stay 0 — the rejection fires before the flag_count/flag_names store, per the fingerprint in the issue.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+        mov rdi, 1;
+        call set_strict;
+
+        lea r11, [rip + case14_nosuchflag];
+        lea rbx, [rip + case14_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case14_foo];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case14_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 12;
+        jne case14_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case14_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case14_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case14_fail:
+        mov rdi, 0x10000000E;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 15 — libpdx-argv.ENH-004 strict mode, short flag.
+  //   FlagSpec::set_strict(1) after register_all; argv: "-z" (an
+  //   unregistered single-letter short flag; register_all only
+  //   registers long-name aliases per StdVocab's own doc, so "-z"
+  //   is guaranteed unregistered).
+  //   Expected: err=ERR_UNKNOWN_FLAG (12), error_arg_index=0.
+  // ============================================================
+  pub let case15_z       : [u8; 3] = "-z\0"
+  pub let mut case15_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case15 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-004 case15 — same strict-mode policy exercised via the short-flag path: FlagSpec::set_strict(1), then `-z` (unregistered) must fail ERR_UNKNOWN_FLAG=12 with error_arg_index=0, proving both invocation-path branches (long and short) apply the identical policy.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+        mov rdi, 1;
+        call set_strict;
+
+        lea r11, [rip + case15_z];
+        lea rbx, [rip + case15_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case15_argv];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 12;
+        jne case15_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case15_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case15_fail:
+        mov rdi, 0x10000000F;
         call record_fail;
         pop rbx;
         ret;

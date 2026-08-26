@@ -44,7 +44,8 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 (reserved), `ERR_CLUSTERED_SHORT` 4, `ERR_LONG_MISSING_NAME` 5,
 `ERR_MISSING_VALUE` 6, `ERR_SCHEMA_BAD_MAGIC` 7,
 `ERR_SCHEMA_UNSUPPORTED_VERSION` 8, `ERR_SCHEMA_BAD_LAYOUT` 9,
-`ERR_SCHEMA_BAD_OFFSET` 10, `ERR_SCHEMA_UNTERMINATED` 11.
+`ERR_SCHEMA_BAD_OFFSET` 10, `ERR_SCHEMA_UNTERMINATED` 11,
+`ERR_UNKNOWN_FLAG` 12 (opt-in strict mode only — see `FlagSpec::set_strict`).
 
 | Function | Purpose |
 | --- | --- |
@@ -62,6 +63,7 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `reset() -> () !{mem} @{}` | Clear the registration table (zeroes `spec_count`). |
 | `register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
+| `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `Parser::parse_argv` and `SchemaInvoke::parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `reset()` restores 0. |
 
 ### parser.pdx — `Parser`
 

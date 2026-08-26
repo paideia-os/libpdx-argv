@@ -145,7 +145,7 @@ module SchemaInvoke = structure {
   pub let parse_from_schema_record : (u64, u64) -> u64 !{mem} @{} =
     fn (record_ptr: u64) (record_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M3-001 + ENH-001 SchemaInvoke::parse_from_schema_record — alternate invocation path that reads a v1 typed record (magic + version + counts + flag/positional offsets + string table) and populates the same ParsedArgs singleton the argv path fills. Non-leaf: calls FlagSpec::lookup(name) per stored flag and scan_terminated per validated offset, so flag_ids/flag_kinds are populated identically to Parser::parse_argv only for offsets that passed range + terminator validation. Prologue mirrors Parser::parse_argv exactly (push rbx/rbp/r12/r13/r14/r15 + sub rsp, 8 = 7 slots → rsp%16 = 0 at every call site). Magic check is 8 byte-compares (M1 --pdx-schema-compare pattern; avoids imm64). Bounds check clamps flag_count/pos_count against MAX_FLAGS/MAX_POS (=32, well ≤ 0x7FFFFFFF) and against a computed minimum-record-size (also reg-reg compare after loading counts). ENH-001: every name_off/value_off(if nonzero)/pos_off is range-gated (off != 0 && off < record_len, unsigned) before it is dereferenced, and the resulting pointer is scanned for a NUL before record_ptr+record_len; either failure returns before FlagSpec::lookup is ever called on the pointer. ENH-001 also fixes a register-clobber bug: the pre-ENH-001 entry_base calc reused r10 (which holds pos_count for the whole function) as scratch for i*16, corrupting the pos-loop bound whenever flag_count > 0 — it now uses r8, which is dead at that point in the iteration. Every store into ParsedArgs mirrors the M2 parser's flag store (name/value/id/kind quartet at [rcx*8]). error_arg_index carries the loop index at failure (0 for header failures).",
+      justification: "libpdx-argv.M3-001 + ENH-001 + ENH-004 SchemaInvoke::parse_from_schema_record — alternate invocation path that reads a v1 typed record (magic + version + counts + flag/positional offsets + string table) and populates the same ParsedArgs singleton the argv path fills. Non-leaf: calls FlagSpec::lookup(name) per stored flag and scan_terminated per validated offset, so flag_ids/flag_kinds are populated identically to Parser::parse_argv only for offsets that passed range + terminator validation. Prologue mirrors Parser::parse_argv exactly (push rbx/rbp/r12/r13/r14/r15 + sub rsp, 8 = 7 slots → rsp%16 = 0 at every call site). Magic check is 8 byte-compares (M1 --pdx-schema-compare pattern; avoids imm64). Bounds check clamps flag_count/pos_count against MAX_FLAGS/MAX_POS (=32, well ≤ 0x7FFFFFFF) and against a computed minimum-record-size (also reg-reg compare after loading counts). ENH-001: every name_off/value_off(if nonzero)/pos_off is range-gated (off != 0 && off < record_len, unsigned) before it is dereferenced, and the resulting pointer is scanned for a NUL before record_ptr+record_len; either failure returns before FlagSpec::lookup is ever called on the pointer. ENH-001 also fixes a register-clobber bug: the pre-ENH-001 entry_base calc reused r10 (which holds pos_count for the whole function) as scratch for i*16, corrupting the pos-loop bound whenever flag_count > 0 — it now uses r8, which is dead at that point in the iteration. ENH-004: immediately after FlagSpec::lookup returns, if kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before any store, using rcx (not r10, for the same pos_count-preservation reason ENH-001 fixed) to hold the strict_mode value. Every store into ParsedArgs mirrors the M2 parser's flag store (name/value/id/kind quartet at [rcx*8]). error_arg_index carries the loop index at failure (0 for header failures).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -308,6 +308,20 @@ module SchemaInvoke = structure {
         // rax = kind (preserved for the store below — no arm here
         // clobbers rax before the flag_kinds write).
 
+        // -- libpdx-argv.ENH-004 strict mode: reject unregistered flags --
+        // Uses rcx (not r10 — r10 holds pos_count for the whole
+        // function, see the ENH-001 register-clobber note above; rcx
+        // is dead here and gets a fresh load in the flag_count bounds
+        // check right below regardless).
+        cmp rax, 0xFF;                      // FKIND_UNKNOWN
+        jne schema_flag_not_unknown;
+        lea r11, [rip + strict_mode];
+        mov rcx, [r11];
+        cmp rcx, 0;
+        je schema_flag_not_unknown;
+        jmp schema_unknown_flag;
+      schema_flag_not_unknown:
+
         // Bounds check the flag_count slot (paranoia — flag_count was
         // already gated ≤ MAX_FLAGS at the header, but ParsedArgs's
         // reset() left flag_count at 0 and every store increments it,
@@ -431,6 +445,10 @@ module SchemaInvoke = structure {
       schema_unterminated:
         mov rax, 11;                        // ERR_SCHEMA_UNTERMINATED
         jmp schema_fail;                    // r13 = current loop index (i or j)
+
+      schema_unknown_flag:
+        mov rax, 12;                        // ERR_UNKNOWN_FLAG (ENH-004)
+        jmp schema_fail;                    // r13 = current flag loop index i
 
       schema_fail:
         // rax = error code. r13 = loop index (or 0 for header failures).

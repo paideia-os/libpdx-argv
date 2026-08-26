@@ -150,6 +150,11 @@ Non-zero return from `Parser::parse_argv` or
 stderr and exit per I4:
 
   exit 2   ERR_UNKNOWN_FLAG          unrecognised long/short name
+                                     (opt-in: FlagSpec::set_strict(1);
+                                     libpdx-argv.ENH-004. Permissive by
+                                     default — an unregistered flag is
+                                     silently accepted as boolean
+                                     unless strict mode is enabled.)
   exit 2   ERR_CLUSTERED_SHORT       `-la` etc.
   exit 2   ERR_LONG_MISSING_NAME     `--=foo`, `--:foo`
   exit 2   ERR_MISSING_VALUE         typed flag without value

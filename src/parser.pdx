@@ -22,6 +22,15 @@
 //     accepts `:` as a value separator (in addition to `=`) so
 //     `--no-cap:KIND_TTY` parses as name="no-cap", value="KIND_TTY".
 //
+// libpdx-argv.ENH-004 (opt-in strict mode, post-1.0):
+//   FlagSpec::strict_mode defaults to 0 (permissive; unchanged
+//   behaviour). When a consumer calls FlagSpec::set_strict(1), any
+//   flag (long or short) whose name FlagSpec::lookup can't find fails
+//   the parse with ParsedArgs::ERR_UNKNOWN_FLAG (12) and
+//   error_arg_index = the offending argv index, instead of silently
+//   storing it as a boolean. SchemaInvoke::parse_from_schema_record
+//   applies the identical policy on its own invocation path.
+//
 // See design/architecture.md §4 (M1 state machine) and §9 (M2
 // extensions). Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12
 // (paideia-os).
@@ -79,7 +88,7 @@ module Parser = structure {
   pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration).",
+      justification: "libpdx-argv.M2 + ENH-004 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -188,6 +197,19 @@ module Parser = structure {
         // rax = kind (preserved through the arity checks below since
         // those touch r14/r10/r12/r13/r14 not rax)
 
+        // -- ENH-004 strict mode: reject unregistered flags --------------
+        // Checked before the inline-value short-circuit below so
+        // `--nosuchflag=foo` is rejected under strict mode exactly
+        // like `--nosuchflag` is.
+        cmp rax, 0xFF;                      // FKIND_UNKNOWN
+        jne parse_argv_long_not_unknown;
+        lea r11, [rip + strict_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        je parse_argv_long_not_unknown;
+        jmp parse_argv_unknown_flag;
+      parse_argv_long_not_unknown:
+
         cmp r14, 0;
         jne parse_argv_long_do_store;       // value already set
 
@@ -269,6 +291,16 @@ module Parser = structure {
         call lookup;              // rax=kind, rdx=id
         mov r15, rdx;
 
+        // -- ENH-004 strict mode: reject unregistered flags --------------
+        cmp rax, 0xFF;                      // FKIND_UNKNOWN
+        jne parse_argv_short_not_unknown;
+        lea r11, [rip + strict_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        je parse_argv_short_not_unknown;
+        jmp parse_argv_unknown_flag;
+      parse_argv_short_not_unknown:
+
         cmp rax, 0;                         // FKIND_BOOL
         je parse_argv_short_do_store;
         cmp rax, 0xFF;                      // FKIND_UNKNOWN
@@ -339,6 +371,10 @@ module Parser = structure {
 
       parse_argv_missing_value:
         mov rax, 6;                         // ERR_MISSING_VALUE
+        jmp parse_argv_fail;
+
+      parse_argv_unknown_flag:
+        mov rax, 12;                        // ERR_UNKNOWN_FLAG (ENH-004)
         jmp parse_argv_fail;
 
       parse_argv_fail:

@@ -248,6 +248,22 @@ names (including short flags a tool has not registered) return
 (no lookahead). Tools that need typed short flags register them
 explicitly with `FKIND_INT` / `FKIND_STR` / etc.
 
+**Opt-in strict mode (`libpdx-argv.ENH-004`, post-1.0).** Permissive
+handling of `FKIND_UNKNOWN` is correct by default — it is the cat-M1
+fix above — but it means no path exists for a tool to report a
+mistyped flag, which is worse in a capability OS than in POSIX because
+the flag a user reaches for is frequently a restricting one
+(`--dry-run`, `--no-cap:`). `FlagSpec::strict_mode` (a `.bss` u64,
+zeroed by `FlagSpec::reset()`) defaults to 0; `FlagSpec::set_strict(1)`
+opts in. With strict mode on, both `Parser::parse_argv` (long- and
+short-flag paths) and `SchemaInvoke::parse_from_schema_record` fail
+with `ParsedArgs::ERR_UNKNOWN_FLAG` (12) the moment `FlagSpec::lookup`
+returns `FKIND_UNKNOWN`, before any store — `error_arg_index` carries
+the offending argv index (or flag-loop index, on the schema-record
+path). The long-flag check runs before the inline-value (`=`/`:`)
+short-circuit, so `--nosuchflag=foo` is rejected identically to
+`--nosuchflag`. See `tests/parse_grammar.pdx` cases 13-15.
+
 ### 9.2 Standard vocabulary (M2-002)
 
 New file: `src/std_vocab.pdx`. The I3 9-flag vocabulary from
@@ -672,7 +688,7 @@ reshuffle case numbers.
 
 | ID | Module (file)                            | Cases (M4-001) |
 |----|------------------------------------------|:--:|
-| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 12 |
+| 1  | `ParseGrammarTests` (parse_grammar.pdx)  | 15 |
 | 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 17 |
 | 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
 | 4  | *reserved* (parse_positional_ext)         | —  |

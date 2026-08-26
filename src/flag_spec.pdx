@@ -50,6 +50,15 @@ module FlagSpec = structure {
   pub let mut spec_ids   : [u64; 32] = uninit @align(8)  // caller-chosen id
   pub let mut spec_count : u64       = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-004: opt-in strict mode. 0 (default, and
+  // the value FlagSpec::reset() restores) = permissive — an
+  // unregistered flag name is treated as boolean, unchanged from
+  // pre-ENH-004 behaviour. 1 = both Parser::parse_argv and
+  // SchemaInvoke::parse_from_schema_record fail with
+  // ParsedArgs::ERR_UNKNOWN_FLAG on a FlagSpec::lookup miss instead of
+  // storing the flag.
+  pub let mut strict_mode : u64 = uninit @align(8)
+
   // ============================================================
   // reset() — clear the registration table.
   // Signature: () -> () !{mem} @{}
@@ -65,11 +74,39 @@ module FlagSpec = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 FlagSpec::reset — zero spec_count so the next FlagSpec::register writes at slot 0. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant.",
+      justification: "libpdx-argv.M2-001 + ENH-004 FlagSpec::reset — zero spec_count so the next FlagSpec::register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant.",
       block: {
         xor rax, rax;
         lea r11, [rip + spec_count];
         mov [r11], rax;
+        lea r11, [rip + strict_mode];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // set_strict(on) — libpdx-argv.ENH-004
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = on (0 = permissive, nonzero = strict; stored as-is, but
+  //         every consumer of strict_mode compares it with `cmp ..,
+  //         0` so any nonzero value behaves as "on")
+  //
+  // Leaf. Consumer usage (after FlagSpec::reset()):
+  //   FlagSpec::reset()
+  //   StdVocab::register_all()
+  //   FlagSpec::register(...)
+  //   FlagSpec::set_strict(1)          // opt in; default is 0
+  //   ParsedArgs::reset()
+  //   Parser::parse_argv(argv, argc)   // or SchemaInvoke equivalent
+  // ============================================================
+  pub let set_strict : (u64) -> () !{mem} @{} =
+    fn (on: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-004 FlagSpec::set_strict — stores the caller's strict-mode policy into the strict_mode .bss slot. Leaf; r11 lea scratch; rdi passed straight through to the store.",
+      block: {
+        lea r11, [rip + strict_mode];
+        mov [r11], rdi;
         ret;
       }
     }
