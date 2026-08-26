@@ -108,6 +108,8 @@ module SmokeDriver = structure {
         call run_case6;
         call run_case7;
         call run_case8;
+        call run_case9;
+        call run_case10;
 
         // --- HelpBackendTests (module id 7) -------------------------
         call run_case1;

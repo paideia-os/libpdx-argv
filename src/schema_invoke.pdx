@@ -27,9 +27,21 @@
 //                 (16 bytes per flag; value_off == 0 → boolean)
 //   next    —     pos_count × u64 pos_off
 //   rest    —     string table: NUL-terminated strings the offsets
-//                 above point at. Opaque to SchemaInvoke — validation
-//                 that a string is well-terminated is a M4 test
-//                 concern; senders are trusted at M3-001.
+//                 above point at.
+//
+// Offset + terminator validation (libpdx-argv.ENH-001). Every
+// name_off / value_off / pos_off is now range-gated before it is
+// dereferenced: a nonzero offset must satisfy `off < record_len`
+// (unsigned compare — this is an untrusted wire field, see ENH-002)
+// or the call fails with ERR_SCHEMA_BAD_OFFSET (10) and
+// error_arg_index = the flag/pos loop index. value_off == 0 keeps its
+// boolean-sentinel meaning and is never range-checked. Once an offset
+// passes the range gate, the resulting pointer is scanned for a NUL
+// byte before `record_ptr + record_len`; a string that runs to the
+// end of the frame with no terminator fails with
+// ERR_SCHEMA_UNTERMINATED (11), same error_arg_index convention.
+// FlagSpec::lookup is never called on a name pointer that failed
+// either check — see ParseSchemaRecord case9/case10 for the fixtures.
 //
 // The parser consults FlagSpec::lookup(name) for every stored flag so
 // flag_ids[k] and flag_kinds[k] are populated identically to the argv
@@ -94,28 +106,46 @@ module SchemaInvoke = structure {
   //   rsi = record_len (bytes of caller-owned record buffer)
   //   rax = ERR_OK (0) on success, else one of the ERR_* codes.
   //
-  // Non-leaf (calls FlagSpec::lookup once per flag stored).
+  // Non-leaf (calls FlagSpec::lookup once per flag stored, and
+  // scan_terminated once per validated offset).
   //
   // Register plan (mirrors Parser::parse_argv):
-  //   rbx = record_ptr (base for offset dereferences)
-  //   rbp = name pointer preserved across FlagSpec::lookup
-  //   r12 = record_len (bounds ceiling)
-  //   r13 = loop index i / working slot number
-  //   r14 = value pointer preserved across the call (0 = boolean)
-  //   r15 = id returned by lookup, preserved for the store sequence
+  //   rbx = record_ptr (base for offset dereferences) — never reused
+  //   r12 = record_len (bounds ceiling) — never reused; end_ptr for a
+  //         bounds check is recomputed on demand as rbx + r12 rather
+  //         than cached, so no seventh callee-saved slot is needed
+  //   r9  = flag_count, loaded once from the header and read every
+  //         flag-loop iteration — never reused as scratch
+  //   r10 = pos_count, loaded once from the header and read at the
+  //         pos-loop head — never reused as scratch (libpdx-argv.ENH-001
+  //         fix: the pre-ENH-001 code clobbered r10 inside the flag
+  //         loop via `mov r10, r13; shl r10, 4` for the entry_base
+  //         calc, corrupting pos_count for every record with
+  //         flag_count > 0; the entry_base calc now uses r8, which is
+  //         free at that point in the iteration)
+  //   r13 = loop index i (flag loop) / j (pos loop)
+  //   rbp = flag loop: name pointer, preserved across FlagSpec::lookup
+  //         and scan_terminated. pos loop: pos_ptr, preserved across
+  //         scan_terminated (r15 and rbp are both free once the flag
+  //         loop is done, so pos_ptr reuses rbp for the same
+  //         "must-survive-a-call" role rather than a caller-saved reg)
+  //   r14 = flag loop: value pointer preserved across both calls (0 =
+  //         boolean, never validated/scanned). pos loop: positional-
+  //         array base, preserved across scan_terminated
+  //   r15 = flag loop only: id returned by lookup, preserved for the
+  //         store sequence
   //
-  //   rax = byte/qword load / lookup return kind / return code
-  //   rcx = slot cursor / walk cursor
+  //   rax = byte/qword load / lookup or scan_terminated return / rc
+  //   rcx = slot cursor / walk cursor / value_off holding reg
   //   rdx = per-iteration flag entry base / scratch
-  //   r8  = per-iteration name_off / value_off / bounds temp
-  //   r9  = per-iteration flag_count / pos_count / entries base
-  //   r10 = per-iteration ephemeral
+  //   r8  = per-iteration name_off / value_off / pos_off / entry_base
+  //         scratch (i*16) — never needs to survive a call
   //   r11 = lea scratch for cross-module .bss bases
   // ============================================================
   pub let parse_from_schema_record : (u64, u64) -> u64 !{mem} @{} =
     fn (record_ptr: u64) (record_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M3-001 SchemaInvoke::parse_from_schema_record — alternate invocation path that reads a v1 typed record (magic + version + counts + flag/positional offsets + string table) and populates the same ParsedArgs singleton the argv path fills. Non-leaf: calls FlagSpec::lookup(name) per stored flag so flag_ids/flag_kinds are populated identically to Parser::parse_argv. Prologue mirrors Parser::parse_argv exactly (push rbx/rbp/r12/r13/r14/r15 + sub rsp, 8 = 7 slots → rsp%16 = 0 at every call site). Magic check is 8 byte-compares (M1 --pdx-schema-compare pattern; avoids imm64). Bounds check clamps flag_count/pos_count against MAX_FLAGS/MAX_POS (=32, well ≤ 0x7FFFFFFF) and against a computed minimum-record-size (also reg-reg compare after loading counts). Offsets themselves are trusted at M3-001 — string-terminator validation is a M4 test concern. Every store into ParsedArgs mirrors the M2 parser's flag store (name/value/id/kind quartet at [rcx*8]). error_arg_index carries the loop index at failure (0 for header failures).",
+      justification: "libpdx-argv.M3-001 + ENH-001 SchemaInvoke::parse_from_schema_record — alternate invocation path that reads a v1 typed record (magic + version + counts + flag/positional offsets + string table) and populates the same ParsedArgs singleton the argv path fills. Non-leaf: calls FlagSpec::lookup(name) per stored flag and scan_terminated per validated offset, so flag_ids/flag_kinds are populated identically to Parser::parse_argv only for offsets that passed range + terminator validation. Prologue mirrors Parser::parse_argv exactly (push rbx/rbp/r12/r13/r14/r15 + sub rsp, 8 = 7 slots → rsp%16 = 0 at every call site). Magic check is 8 byte-compares (M1 --pdx-schema-compare pattern; avoids imm64). Bounds check clamps flag_count/pos_count against MAX_FLAGS/MAX_POS (=32, well ≤ 0x7FFFFFFF) and against a computed minimum-record-size (also reg-reg compare after loading counts). ENH-001: every name_off/value_off(if nonzero)/pos_off is range-gated (off != 0 && off < record_len, unsigned) before it is dereferenced, and the resulting pointer is scanned for a NUL before record_ptr+record_len; either failure returns before FlagSpec::lookup is ever called on the pointer. ENH-001 also fixes a register-clobber bug: the pre-ENH-001 entry_base calc reused r10 (which holds pos_count for the whole function) as scratch for i*16, corrupting the pos-loop bound whenever flag_count > 0 — it now uses r8, which is dead at that point in the iteration. Every store into ParsedArgs mirrors the M2 parser's flag store (name/value/id/kind quartet at [rcx*8]). error_arg_index carries the loop index at failure (0 for header failures).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -190,13 +220,20 @@ module SchemaInvoke = structure {
         //   entry_base = record_ptr + 32 + i*16
         //   name_off   = [entry_base + 0]
         //   value_off  = [entry_base + 8]
+        //   validate name_off  (!= 0 && < record_len) or ERR_SCHEMA_BAD_OFFSET
         //   name_ptr   = record_ptr + name_off
+        //   scan name_ptr..record_ptr+record_len for a NUL, else
+        //     ERR_SCHEMA_UNTERMINATED
         //   value_ptr  = value_off == 0 ? 0 : record_ptr + value_off
-        //   lookup(name_ptr) → (kind, id)
+        //     (value_off == 0 keeps its boolean-sentinel meaning and is
+        //     never range-checked or scanned; nonzero value_off gets
+        //     the same two gates as name_off)
+        //   lookup(name_ptr) → (kind, id)   — only reached once both
+        //     offsets that were present have cleared validation
         //   store (name_ptr, value_ptr, id, kind) at flag_names[i], etc.
         //
-        // r14 = value_ptr (preserved across FlagSpec::lookup)
-        // rbp = name_ptr  (preserved across FlagSpec::lookup)
+        // r14 = value_ptr (preserved across scan_terminated + lookup)
+        // rbp = name_ptr  (preserved across scan_terminated + lookup)
         // r15 = id        (preserved from lookup return through store)
         // rax = kind      (preserved from lookup return through store —
         //                  the arms below deliberately avoid rax)
@@ -209,31 +246,61 @@ module SchemaInvoke = structure {
         jge schema_flag_loop_done;
 
         // entry_base = record_ptr + 32 + i*16
-        //   r10 = i * 16
-        //   rdx = record_ptr + 32 + r10
-        mov r10, r13;
-        shl r10, 4;
+        //   r8  = i * 16 (scratch — reloaded with name_off below; never
+        //         needs to survive past this point, unlike the
+        //         pre-ENH-001 code which used r10 here and corrupted
+        //         pos_count for any record with flag_count > 0)
+        //   rdx = record_ptr + 32 + r8
+        mov r8, r13;
+        shl r8, 4;
         mov rdx, rbx;
         add rdx, 32;
-        add rdx, r10;
+        add rdx, r8;
 
         // name_off  = [entry_base + 0]
         // value_off = [entry_base + 8]
         mov r8, [rdx + 0];                  // r8 = name_off
         mov rcx, [rdx + 8];                 // rcx = value_off
 
+        // ---- Validate name_off: off != 0 && off < record_len ----------
+        cmp r8, 0;
+        je schema_bad_offset;
+        cmp r8, r12;                        // unsigned: record_len is a
+        jae schema_bad_offset;              // wire field (ENH-002 rationale)
+
         // name_ptr = record_ptr + name_off (rbp)
         mov rbp, rbx;
         add rbp, r8;
 
+        // ---- Bounded NUL scan on name_ptr ------------------------------
+        mov rdi, rbp;
+        mov rsi, rbx;
+        add rsi, r12;                       // rsi = record_ptr + record_len
+        call scan_terminated;
+        cmp rax, 0;
+        je schema_unterminated;
+
         // value_ptr = (value_off == 0) ? 0 : record_ptr + value_off  (r14)
         xor r14, r14;
         cmp rcx, 0;
-        je schema_flag_no_value;
+        je schema_flag_lookup;
+
+        // ---- Validate value_off: off < record_len (nonzero already true) --
+        cmp rcx, r12;
+        jae schema_bad_offset;
+
         mov r14, rbx;
         add r14, rcx;
 
-      schema_flag_no_value:
+        // ---- Bounded NUL scan on value_ptr ------------------------------
+        mov rdi, r14;
+        mov rsi, rbx;
+        add rsi, r12;
+        call scan_terminated;
+        cmp rax, 0;
+        je schema_unterminated;
+
+      schema_flag_lookup:
         // Call FlagSpec::lookup(name_ptr).
         mov rdi, rbp;
         call lookup;              // rax=kind, rdx=id
@@ -287,13 +354,31 @@ module SchemaInvoke = structure {
         xor r13, r13;                       // r13 = j = 0
 
       schema_pos_loop_head:
-        cmp r13, r10;                       // r10 = pos_count
-        jge schema_ok;
+        cmp r13, r10;                       // r10 = pos_count (ENH-001:
+        jge schema_ok;                      // no longer clobbered by the flag loop)
 
         // pos_off = [r14 + j*8]
         mov r8, [r14 + r13*8];              // r8 = pos_off
-        mov rdx, rbx;
-        add rdx, r8;                        // rdx = record_ptr + pos_off
+
+        // ---- Validate pos_off: off != 0 && off < record_len ------------
+        cmp r8, 0;
+        je schema_bad_offset;
+        cmp r8, r12;                        // unsigned (ENH-002 rationale)
+        jae schema_bad_offset;
+
+        // pos_ptr = record_ptr + pos_off. Held in rbp (free here — the
+        // flag loop's name_ptr use of rbp is done) so it survives the
+        // scan_terminated call without a caller-saved spill.
+        mov rbp, rbx;
+        add rbp, r8;
+
+        // ---- Bounded NUL scan on pos_ptr --------------------------------
+        mov rdi, rbp;
+        mov rsi, rbx;
+        add rsi, r12;                       // rsi = record_ptr + record_len
+        call scan_terminated;
+        cmp rax, 0;
+        je schema_unterminated;
 
         lea r11, [rip + pos_count];
         mov rcx, [r11];
@@ -301,7 +386,7 @@ module SchemaInvoke = structure {
         jge schema_pos_overflow;
 
         lea r11, [rip + pos_ptrs];
-        mov [r11 + rcx*8], rdx;
+        mov [r11 + rcx*8], rbp;
 
         add rcx, 1;
         lea r11, [rip + pos_count];
@@ -339,6 +424,14 @@ module SchemaInvoke = structure {
         mov rax, 2;                         // ERR_POS_OVERFLOW
         jmp schema_fail;
 
+      schema_bad_offset:
+        mov rax, 10;                        // ERR_SCHEMA_BAD_OFFSET
+        jmp schema_fail;                    // r13 = current loop index (i or j)
+
+      schema_unterminated:
+        mov rax, 11;                        // ERR_SCHEMA_UNTERMINATED
+        jmp schema_fail;                    // r13 = current loop index (i or j)
+
       schema_fail:
         // rax = error code. r13 = loop index (or 0 for header failures).
         lea r11, [rip + error_code];
@@ -355,6 +448,59 @@ module SchemaInvoke = structure {
         pop r12;
         pop rbp;
         pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // scan_terminated(ptr, end_ptr) -> u64          (libpdx-argv.ENH-001)
+  //
+  // Internal helper: scans forward from `ptr` (inclusive) up to
+  // `end_ptr` (exclusive) looking for a NUL byte. Used by
+  // parse_from_schema_record to bound-check every string offset it
+  // has already range-validated (name/value/pos) before treating the
+  // pointer as NUL-terminated (e.g. before handing it to
+  // FlagSpec::lookup, which walks it byte-by-byte with no bound of
+  // its own).
+  //
+  //   rdi (in)  = ptr      (start of the candidate string; already
+  //               known to satisfy ptr < end_ptr — the caller range-
+  //               checked the offset before computing this pointer)
+  //   rsi (in)  = end_ptr  (record_ptr + record_len; exclusive bound)
+  //   rax (out) = 1 if a NUL byte was found before end_ptr, else 0
+  //
+  // Leaf. No nested calls, no callee-saved registers touched — safe
+  // to call with any live value in rbx/rbp/r12..r15.
+  //
+  // Register plan (all caller-save; leaf):
+  //   rdi = cursor (mutated in place; caller does not rely on rdi
+  //         surviving the call, same convention as every other call
+  //         site in this file)
+  //   rsi = end_ptr (read-only)
+  //   rax = current byte / return value
+  // ============================================================
+  pub let scan_terminated : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (end_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-001 SchemaInvoke::scan_terminated — bounded NUL scan used to validate every string offset (name/value/pos) that parse_from_schema_record range-checks before dereferencing. Leaf; only rdi/rsi/rax touched, so it is safe to call with the flag/pos loop's live callee-saved state (rbx=record_ptr, rbp=candidate ptr saved by the caller if needed post-call, r9/r10/r12/r13/r14/r15) untouched. Loop compares the cursor against end_ptr with cmp+jae (pointer compare, not a wire-integer sign concern) and every byte zero-check uses cmp rax, 0 per the no-test-mnemonic convention. Byte load is xor rax,rax; mov_b rax,[rdi] per #1248.",
+      block: {
+      scan_terminated_loop:
+        cmp rdi, rsi;
+        jae scan_terminated_not_found;
+
+        xor rax, rax; mov_b rax, [rdi];
+        cmp rax, 0;
+        je scan_terminated_found;
+
+        add rdi, 1;
+        jmp scan_terminated_loop;
+
+      scan_terminated_found:
+        mov rax, 1;
+        ret;
+
+      scan_terminated_not_found:
+        xor rax, rax;
         ret;
       }
     }

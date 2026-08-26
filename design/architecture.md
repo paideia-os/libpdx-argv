@@ -470,6 +470,8 @@ and stays live as long as the caller keeps the record buffer alive.
 | `ERR_SCHEMA_BAD_MAGIC`           | 7 | Bytes 0..8 did not match `"PDXARGV\0"`. |
 | `ERR_SCHEMA_UNSUPPORTED_VERSION` | 8 | Version qword != 1. |
 | `ERR_SCHEMA_BAD_LAYOUT`          | 9 | Record < 32 B, or count > MAX, or body-fits check failed. |
+| `ERR_SCHEMA_BAD_OFFSET`          | 10 | A `name_off`/`value_off`/`pos_off` was 0 (name/pos) or `>= record_len` (`libpdx-argv.ENH-001`). |
+| `ERR_SCHEMA_UNTERMINATED`        | 11 | A validated offset's string ran to `record_ptr + record_len` with no NUL byte (`libpdx-argv.ENH-001`). |
 
 **Wire-integer compares are unsigned (`libpdx-argv.ENH-002`).**
 `record_len`, `flag_count` and `pos_count` are u64 fields read straight
@@ -501,14 +503,23 @@ else:                                # invoked via semantic-pipe
 // downstream dispatch identical on both paths
 ```
 
-**What the parser does NOT validate at M3-001.**
+**Offset + terminator validation (`libpdx-argv.ENH-001`, post-1.0).**
+At M3-001 every `name_off` / `value_off` / `pos_off` was trusted to
+point at a NUL-terminated bytestring inside the record with no range
+check at all — an unbounded read on this library's only untrusted-input
+surface (a peer process across a `KIND_IPC_ENDPOINT`). This was closed
+by `libpdx-argv.ENH-001`: every nonzero name/value/pos offset must
+satisfy `off < record_len` (unsigned — see the ENH-002 rationale above;
+`off == 0` is additionally rejected for name/pos offsets, since only
+`value_off` has a zero-sentinel meaning), and the resulting pointer is
+scanned for a NUL byte before `record_ptr + record_len` — an
+unterminated string fails with `ERR_SCHEMA_UNTERMINATED` rather than
+letting `FlagSpec::lookup`'s byte-by-byte strcmp walk off the end of
+the frame. `FlagSpec::lookup` is never called on a pointer that failed
+either gate. See `tests/parse_schema_record.pdx` cases 9–10.
 
-- String terminators. Every `name_off` / `value_off` / `pos_off` is
-  trusted to point at a NUL-terminated bytestring inside the record.
-  Validation of "does this offset land on a byte the sender allocated,
-  and does a NUL appear before the record end?" is a M4 test-matrix
-  concern per `libpdx-argv.M4-001` line "typed-arg-parse-error
-  diagnostics".
+**What M3-001 does NOT validate (unchanged from launch).**
+
 - `ddash_seen` and `emit_schema`. The schema-record shape has no
   literal `--` sentinel and no `--pdx-schema` well-known-flag; a
   sender that wants either concept expresses it via a registered
@@ -622,8 +633,8 @@ compare `schema_count` against their intended count after the batch.
   a compound `flag_group` or per-flag `kind` override would land as
   v2 alongside a coordinated libpdx-semantic-pipe schema fingerprint
   bump.
-- Per-string-terminator validation on the schema record — M4-001
-  test-matrix line.
+- Per-string-terminator validation on the schema record — deferred at
+  M3/M4, landed post-1.0 as `libpdx-argv.ENH-001` (see §10.1).
 
 ---
 
@@ -666,7 +677,7 @@ reshuffle case numbers.
 | 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
 | 4  | *reserved* (parse_positional_ext)         | —  |
 | 5  | `ParseStdVocabTests` (parse_std_vocab.pdx) | 2  |
-| 6  | `ParseSchemaRecordTests` (parse_schema_record.pdx) | 6  |
+| 6  | `ParseSchemaRecordTests` (parse_schema_record.pdx) | 10 |
 | 7  | `HelpBackendTests` (help_backend.pdx)     | 3  |
 | 8  | `SchemaEmitTests` (schema_emit.pdx)       | 5  |
 | 9  | *reserved* (parse_mixed_ext)              | —  |

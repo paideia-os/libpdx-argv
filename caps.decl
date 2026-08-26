@@ -22,6 +22,14 @@ requires: (none)
 # schema_record (M3-001; see design/architecture.md §10.1 for the wire
 # form). Both share the same schema fingerprint namespace and land at
 # libpdx-semantic-pipe M2 once envelope framing is wired end-to-end.
+#
+# PdxArgvRecord@0.1 is this library's only untrusted-input surface (a
+# peer process hands it a frame across a KIND_IPC_ENDPOINT). Every
+# name_off/value_off/pos_off is range-validated against the record
+# length and every resulting string is scanned for a NUL terminator
+# before the record's end before SchemaInvoke::parse_from_schema_record
+# dereferences it — see ERR_SCHEMA_BAD_OFFSET / ERR_SCHEMA_UNTERMINATED
+# in src/parsed_args.pdx (libpdx-argv.ENH-001).
 declares_output_schemas:
   - PdxArgvParsed@0.1
   - PdxArgvRecord@0.1

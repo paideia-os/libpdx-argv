@@ -24,6 +24,14 @@ module ParsedArgs = structure {
   pub let ERR_SCHEMA_BAD_MAGIC          : u64 = 7  // wire-form magic mismatch
   pub let ERR_SCHEMA_UNSUPPORTED_VERSION: u64 = 8  // version != 1
   pub let ERR_SCHEMA_BAD_LAYOUT         : u64 = 9  // record too short or count > MAX
+  // Added by libpdx-argv.ENH-001 (offset + terminator validation on the
+  // schema-record path). Distinguished from ERR_SCHEMA_BAD_LAYOUT (a
+  // malformed header) because these two fire on a per-flag/per-pos
+  // basis and set error_arg_index to the offending loop index — a
+  // consumer's audit record can tell "sender built the header wrong"
+  // apart from "sender pointed us at attacker-chosen bytes".
+  pub let ERR_SCHEMA_BAD_OFFSET         : u64 = 10 // name/value/pos offset out of range
+  pub let ERR_SCHEMA_UNTERMINATED       : u64 = 11 // string ran to record end with no NUL
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

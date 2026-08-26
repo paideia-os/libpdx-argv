@@ -14,6 +14,12 @@
 //   8. record_len = 0x8000000000000001 with an otherwise-valid empty-
 //      body header → ERR_OK (must NOT be falsely rejected by a signed
 //      header-size compare). Regression fixture for libpdx-argv.ENH-002.
+//   9. name_off == record_len (out of range, not < record_len) →
+//      ERR_SCHEMA_BAD_OFFSET (=10), error_arg_index=0. Regression
+//      fixture for libpdx-argv.ENH-001.
+//  10. Valid name_off, but the name string has no NUL before the
+//      record ends → ERR_SCHEMA_UNTERMINATED (=11), error_arg_index=0.
+//      Regression fixture for libpdx-argv.ENH-001.
 //
 // The records are pre-baked in .rodata as fixed-size byte arrays; the
 // test declares them with the exact byte-for-byte content the parser
@@ -323,6 +329,83 @@ module ParseSchemaRecord = structure {
 
       sr8_fail:
         mov rdi, 0x600000008;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // Case 9 — name_off == record_len (libpdx-argv.ENH-001).
+  //   Same layout as case1 (1 flag + 1 positional, 65 bytes total)
+  //   but the flag entry's name_off is set to 65 (0x41) instead of
+  //   56 (0x38) — exactly record_len, i.e. one byte past the last
+  //   valid index. The `off < record_len` gate must reject it before
+  //   any dereference or FlagSpec::lookup call.
+  //   Expected: ERR_SCHEMA_BAD_OFFSET (=10), error_arg_index=0.
+  // ============================================================
+  pub let case9_rec : [u8; 65] = "PDXARGV\0\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\x41\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x3D\0\0\0\0\0\0\0help\0foo\0"
+
+  pub let run_case9 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-001 regression schema-record case9 — name_off = 65 = record_len (out of range: the gate requires off < record_len, not off <= record_len). Header and pos entry are otherwise identical to case1's happy path. Verifies rax=ERR_SCHEMA_BAD_OFFSET=10 and error_arg_index=0 (first and only flag), and that the failure fires before FlagSpec::lookup would ever see the out-of-range pointer.",
+      block: {
+        push rbx;
+        call full_reset;
+
+        lea rdi, [rip + case9_rec];
+        mov rsi, 65;
+        call parse_from_schema_record;
+        cmp rax, 10; jne sr9_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0; jne sr9_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sr9_fail:
+        mov rdi, 0x600000009;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // Case 10 — unterminated name string (libpdx-argv.ENH-001).
+  //   Record: 1 flag (name_off=48, value_off=0), 0 positionals.
+  //   Header (32) + 1 flag entry (16) = 48 bytes, followed by the
+  //   4 bytes "help" with NO trailing NUL — the record ends exactly
+  //   at the last name byte. The bounded NUL scan must walk from
+  //   byte 48 to byte 52 (record_len), find no zero, and fail
+  //   without ever handing the pointer to FlagSpec::lookup.
+  //   Expected: ERR_SCHEMA_UNTERMINATED (=11), error_arg_index=0.
+  // ============================================================
+  pub let case10_rec : [u8; 52] = "PDXARGV\0\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x30\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0help"
+
+  pub let run_case10 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-001 regression schema-record case10 — 52-byte record, pos_count=0, 1 flag with name_off=48 (0x30) pointing at a 4-byte 'help' string with no trailing NUL before record_len=52. The name_off range gate passes (48 < 52) so scan_terminated runs and must return not-found. Verifies rax=ERR_SCHEMA_UNTERMINATED=11 and error_arg_index=0.",
+      block: {
+        push rbx;
+        call full_reset;
+
+        lea rdi, [rip + case10_rec];
+        mov rsi, 52;
+        call parse_from_schema_record;
+        cmp rax, 11; jne sr10_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0; jne sr10_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sr10_fail:
+        mov rdi, 0x60000000A;
         call record_fail;
         pop rbx; ret;
       }

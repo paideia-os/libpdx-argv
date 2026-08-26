@@ -110,6 +110,14 @@ The wire form is documented in `design/architecture.md` §10.1
 and its schema fingerprint is registered with
 `libpdx-semantic-pipe` M2 envelope framing.
 
+Every offset the record carries (`name_off`, `value_off` when
+present, `pos_off`) is bounds-checked against the record length
+before it is dereferenced, and the resulting string is scanned
+for a NUL terminator before the record ends — see DIAGNOSTICS
+below. This is the library's only untrusted-input surface (a
+peer process across the pipe), and no lookup is performed on a
+pointer that fails either check.
+
 .section --HELP BACK-END
 `HelpBackend::fill_doc_argv` synthesises a two-slot argv of the
 shape `["doc", tool_name]` in caller-provided storage and hands
@@ -147,6 +155,8 @@ stderr and exit per I4:
   exit 2   ERR_MISSING_VALUE         typed flag without value
   exit 2   ERR_TYPED_PARSE           `--size xyz`, `--older-than 3q`
   exit 3   ERR_SCHEMA_RECORD_MALFORMED  semantic-pipe path only
+  exit 3   ERR_SCHEMA_BAD_OFFSET     name/value/pos offset out of range
+  exit 3   ERR_SCHEMA_UNTERMINATED   string ran to record end with no NUL
 
 exit 3 is a system error (audit-journal broker refused, or
 peer sent a malformed schema record); exit 2 is a user error.

@@ -43,7 +43,8 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 `ERR_FLAG_OVERFLOW` 1, `ERR_POS_OVERFLOW` 2, `ERR_UNKNOWN_ARG_FORM` 3
 (reserved), `ERR_CLUSTERED_SHORT` 4, `ERR_LONG_MISSING_NAME` 5,
 `ERR_MISSING_VALUE` 6, `ERR_SCHEMA_BAD_MAGIC` 7,
-`ERR_SCHEMA_UNSUPPORTED_VERSION` 8, `ERR_SCHEMA_BAD_LAYOUT` 9.
+`ERR_SCHEMA_UNSUPPORTED_VERSION` 8, `ERR_SCHEMA_BAD_LAYOUT` 9,
+`ERR_SCHEMA_BAD_OFFSET` 10, `ERR_SCHEMA_UNTERMINATED` 11.
 
 | Function | Purpose |
 | --- | --- |
@@ -108,6 +109,17 @@ Wire constants: `SCHEMA_HEADER_SIZE` 32, `SCHEMA_FLAG_STRIDE` 16,
 Preconditions mirror `parse_argv`: `ParsedArgs::reset()` first, `FlagSpec`
 already populated. Stored pointers are interior pointers into the caller's
 record buffer and stay valid only while it is live.
+
+**Offsets are validated (`libpdx-argv.ENH-001`).** Every `name_off` /
+`value_off` (when nonzero) / `pos_off` must satisfy `off != 0 && off <
+record_len` (unsigned) or the call fails with `ERR_SCHEMA_BAD_OFFSET`
+(10); the resulting pointer is then scanned for a NUL byte before
+`record_ptr + record_len`, or the call fails with
+`ERR_SCHEMA_UNTERMINATED` (11). `error_arg_index` carries the failing
+flag/positional loop index in both cases. `FlagSpec::lookup` is never
+called on a pointer that failed either check — this is this library's
+only untrusted-input surface (a peer process over a `KIND_IPC_ENDPOINT`)
+and it is now bounds-checked end to end.
 
 ### help_backend.pdx — `HelpBackend`
 
