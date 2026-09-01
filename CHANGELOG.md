@@ -4,6 +4,21 @@ All notable changes to `libpdx-argv` are recorded here. The format is
 loosely modelled on Keep-a-Changelog, adapted to the PaideiaOS milestone
 rubric in `design/tooling/r49-r50-plan.md` §5.
 
+## Unreleased — ENH-012..ENH-021 tranche (post-1.1)
+
+### ENH-012 — `--foo=bar` / `--foo bar` equals-form witness (Closes #22)
+
+Documentation-only. The long-flag grammar has accepted both
+`--foo bar` (space) and `--foo=bar` (equals) since M1-001; the
+`:` separator was added at M2-003 as an equivalent universal.
+Case2 (`--color=auto`) and case3 (`--no-cap:KIND_TTY`) in
+`tests/parse_grammar.pdx` have covered both forms since M4-001.
+This entry closes ENH-012 as an already-implemented witness — no
+behavior change. The README §parser.pdx paragraph explicitly
+lists all four accepted forms (`--foo`, `--foo=bar`, `--foo:bar`,
+`--foo bar`); no code change was needed. The Q1-locked decision
+(accept both forms) matches shipped behavior.
+
 ## 1.0.0 — 2026-08-22
 
 First signed release. Closes the R49 shared-library slot for CLI
