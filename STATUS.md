@@ -2,12 +2,17 @@
 
 **Wave:** R49 shared library
 **Current milestone:** M5 (dual-signed release + `.pdxdoc` + mirror
-push) — CLOSED. Repo is at v1.0.0. Every milestone issue (#1..#10)
-is closed. See `CHANGELOG.md` for the 1.0 entry and
-`design/tooling/r49-r50-plan.md` §5.12 for the wave-level rubric.
+push) — CLOSED. Repo is at v1.1.0 (post-1.0 tranche closed
+2026-09-02; see `CHANGELOG.md`). Every milestone issue (#1..#10) is
+closed and the tracked post-1.0 issues (#32, #33, #39, #40 — plus
+the fixed #34 and #36) have all landed. See `CHANGELOG.md` for the
+per-version entries and `design/tooling/r49-r50-plan.md` §5.12 for
+the wave-level rubric.
 
-Signature state at 1.0: `manifest.pdxsig` is payload-frozen; both
-signature slots carry `PENDING:` sentinels. Populated in place by
+Signature state at 1.1.0: `manifest.pdxsig` is payload-frozen; both
+signature slots carry `PENDING:` sentinels and every per-source
+sha256 line is `DEFERRED-COMPUTED-AT-RELEASE-RUNNER` (ENH-030
+touched every source file in `src/`). Populated in place by
 `paideia-as release --sign` (author slot) once v0.33-crypto-kdf is
 reachable on the release-runner host, and by the pkgs.paideia-os
 mirror runner (paideia_root slot) at admission time — see
@@ -58,8 +63,8 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
   (harness + 8 fixture modules + smoke_driver + README). See
   `tests/README.md` for the coverage matrix.
 - `.plans/` — per-milestone implementation notes.
-- `VERSION` — semver (`1.0.0`).
-- `CHANGELOG.md` — release history with the 1.0.0 rollup.
+- `VERSION` — semver (`1.1.0`).
+- `CHANGELOG.md` — release history with the 1.0.0 and 1.1.0 rollups.
 - `deps.list` — library dependencies (none; toolchain floor only).
 - `manifest.pdxsig` — dual-signed release manifest per §6.3
   (both signature slots PENDING until runner passes complete).
@@ -75,22 +80,22 @@ shape; downstream dispatch is identical.
 
 ```
 _start:
-  FlagSpec::reset()
-  StdVocab::register_all()             // 9 std flags (IDs 1..9)
-  FlagSpec::register(tool_name_a, kind_a, 100)   // tool-specific
-  FlagSpec::register(tool_name_b, kind_b, 101)
+  flag_spec_reset()                                // ENH-030 v1.1.0
+  register_all()                                   // StdVocab, IDs 1..9
+  flag_spec_register(tool_name_a, kind_a, 100)     // tool-specific
+  flag_spec_register(tool_name_b, kind_b, 101)
   ...
-  SchemaEmit::reset()
-  SchemaEmit::register(&SCHEMA_NAME_A)  // tool's declared output schemas
-  SchemaEmit::register(&SCHEMA_NAME_B)  // (for --schema)
+  schema_emit_reset()                              // ENH-030 v1.1.0
+  schema_emit_register(&SCHEMA_NAME_A)             // declared output schemas
+  schema_emit_register(&SCHEMA_NAME_B)             // (for --schema)
   ...
-  ParsedArgs::reset()
+  parsed_args_reset()                              // ENH-030 v1.1.0
 
   // Path split (invocation-path agnostic downstream):
   let err = if invoked_via_semantic_pipe:
-              SchemaInvoke::parse_from_schema_record(rec_ptr, rec_len)
+              parse_from_schema_record(rec_ptr, rec_len)
             else:
-              Parser::parse_argv(argv, argc)
+              parse_argv(argv, argc)
   if err != ParsedArgs::ERR_OK { emit stderr diagnostic + exit code per I4 }
 
   // Dispatch by ID (same for both paths):

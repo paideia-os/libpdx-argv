@@ -99,30 +99,30 @@ module StdVocab = structure {
   pub let register_all : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-002 + ENH-010 StdVocab::register_all — registers the I3 9-flag standard vocabulary with FlagSpec via nine calls to FlagSpec::register/register_sep. Non-leaf; 1-push prologue (rbx, unused, for rsp alignment) → rsp%16: 8 → 0 for the nested calls. rdi/rsi/rdx are set per call to (name_ptr, kind, id). Six/seven of the flags are FKIND_BOOL; color is FKIND_ENUM; no-cap is FKIND_STR. ENH-010: color and no-cap use register_sep (not register) so Parser::parse_argv never accepts a lookahead value for them, matching their I3-mandated `=`/`:` spellings. Consumers that only need a subset (e.g. a tool with no --color) can pay the ~1µs cost of the extra registrations or register selected flags individually.",
+      justification: "libpdx-argv.M2-002 + ENH-010 + ENH-030 StdVocab::register_all — registers the I3 9-flag standard vocabulary with FlagSpec via nine calls to flag_spec_register / register_sep. Non-leaf; 1-push prologue (rbx, unused, for rsp alignment) → rsp%16: 8 → 0 for the nested calls. rdi/rsi/rdx are set per call to (name_ptr, kind, id). Six/seven of the flags are FKIND_BOOL; color is FKIND_ENUM; no-cap is FKIND_STR. ENH-010: color and no-cap use register_sep (not flag_spec_register) so parse_argv never accepts a lookahead value for them, matching their I3-mandated `=`/`:` spellings. Consumers that only need a subset (e.g. a tool with no --color) can pay the ~1µs cost of the extra registrations or register selected flags individually. ENH-030: the underlying appender was renamed from `register` to `flag_spec_register` to end the multi-module link collision — this call site now targets the new symbol.",
       block: {
         push rbx;                                // align rsp
 
         lea rdi, [rip + STD_NAME_HELP];    mov rsi, 0;    mov rdx, 1;
-        call register;
+        call flag_spec_register;
 
         lea rdi, [rip + STD_NAME_VERSION]; mov rsi, 0;    mov rdx, 2;
-        call register;
+        call flag_spec_register;
 
         lea rdi, [rip + STD_NAME_DRY_RUN]; mov rsi, 0;    mov rdx, 3;
-        call register;
+        call flag_spec_register;
 
         lea rdi, [rip + STD_NAME_JSON];    mov rsi, 0;    mov rdx, 4;
-        call register;
+        call flag_spec_register;
 
         lea rdi, [rip + STD_NAME_SCHEMA];  mov rsi, 0;    mov rdx, 5;
-        call register;
+        call flag_spec_register;
 
         lea rdi, [rip + STD_NAME_VERBOSE]; mov rsi, 0;    mov rdx, 6;
-        call register;
+        call flag_spec_register;
 
         lea rdi, [rip + STD_NAME_QUIET];   mov rsi, 0;    mov rdx, 7;
-        call register;
+        call flag_spec_register;
 
         // libpdx-argv.ENH-010: --color and --no-cap are registered
         // separator-required — their I3 spellings (--color=<mode>,

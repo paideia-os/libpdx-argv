@@ -24,8 +24,8 @@ libpdx-argv exposes two modules to its consumers:
 The consumer wires libpdx-argv into its own tool as follows:
 
 ```
-ParsedArgs::reset()
-let err = Parser::parse_argv(argv, argc)
+parsed_args_reset()                                        // ENH-030 v1.1.0
+let err = parse_argv(argv, argc)
 if err != ParsedArgs::ERR_OK { emit stderr diagnostic + exit code per I4 }
 // walk ParsedArgs::flag_names / flag_values / pos_ptrs to dispatch
 ```
@@ -229,15 +229,22 @@ through `ParsedArgs::flag_ids[k]` and `flag_kinds[k]` after the parse.
 **API surface** (three entry points, all in `FlagSpec` module):
 
 ```
-FlagSpec::reset()                        // clear the table
-FlagSpec::register(name_ptr, kind, id)   // append (name, kind, id)
-FlagSpec::lookup(name_ptr) -> (kind, id) // rax = kind, rdx = id
+flag_spec_reset()                            // clear the table
+flag_spec_register(name_ptr, kind, id)       // append (name, kind, id)
+lookup(name_ptr) -> (kind, id)               // rax = kind, rdx = id
 ```
 
-`register` silently drops past `SPEC_MAX = 32`; callers that need
-overflow detection compare `spec_count` against `SPEC_MAX` before the
-call. `lookup` is a linear scan (O(SPEC_MAX)) with an inline strcmp;
+`flag_spec_register` silently drops past `SPEC_MAX = 32`; callers that
+need overflow detection compare `spec_count` against `SPEC_MAX` before
+the call. `lookup` is a linear scan (O(SPEC_MAX)) with an inline strcmp;
 one call per parsed flag.
+
+**ENH-030 (v1.1.0) rename.** The three entry points above used to be
+`FlagSpec::reset` and `FlagSpec::register` (with `lookup` unchanged).
+Their unmangled bare symbols collided with `ParsedArgs::reset` /
+`SchemaEmit::reset` and `SchemaEmit::register` at link time whenever a
+consumer linked more than one of those objects together (which every
+real consumer does). The per-module prefix ends the collision.
 
 **Cat-M1 blocker fix.** The M1 parser always consumed `argv[i+1]` as
 a value for short flags when it did not start with `-` or NUL — under
@@ -604,20 +611,20 @@ let a huge `record_len` (bit 63 set) fail the `< 32` header-size gate
 even though the caller-supplied length was actually far larger than
 required. See `tests/parse_schema_record.pdx` cases 7–8.
 
-**Preconditions.** `ParsedArgs::reset()` and `FlagSpec` registration
+**Preconditions.** `parsed_args_reset()` and `FlagSpec` registration
 must have happened before the call. The consumer's `_start` sequence
 becomes:
 
 ```
-FlagSpec::reset()
-StdVocab::register_all()
-FlagSpec::register(tool_specific ...)
-ParsedArgs::reset()
+flag_spec_reset()                    // ENH-030 v1.1.0
+register_all()                       // StdVocab
+flag_spec_register(tool_specific ...)
+parsed_args_reset()
 
 if invoked_via_argv:
-    Parser::parse_argv(argv, argc)
+    parse_argv(argv, argc)
 else:                                # invoked via semantic-pipe
-    SchemaInvoke::parse_from_schema_record(rec_ptr, rec_len)
+    parse_from_schema_record(rec_ptr, rec_len)
 
 // downstream dispatch identical on both paths
 ```

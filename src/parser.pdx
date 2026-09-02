@@ -31,6 +31,23 @@
 //   storing it as a boolean. SchemaInvoke::parse_from_schema_record
 //   applies the identical policy on its own invocation path.
 //
+// libpdx-argv.ENH-026 (malformed-argv-slot classification):
+//   The classifier now rejects two argv shapes that fit neither the
+//   flag nor the positional grammar with
+//   ParsedArgs::ERR_UNKNOWN_ARG_FORM (3) and error_arg_index = the
+//   offending argv index:
+//     - empty string ""                      (byte0 == NUL)
+//     - bare "-"                             (byte0 == '-', byte1 == NUL)
+//   Bare "--" is UNCHANGED — it remains the M2-003 positional
+//   sentinel and sets ddash_seen. Slots that appear after the
+//   sentinel are always positional (via the ddash gate at loop head)
+//   and never reach the malformed classifier, so an empty "" or bare
+//   "-" AFTER `--` is stored as a positional as before. Pre-ENH-026
+//   the two shapes above landed in pos_ptrs (bare "-" was documented
+//   as "stdin convention" — tools that want the stdin idiom must now
+//   register it themselves, e.g. as a tool-specific "stdin" flag, or
+//   filter their argv before calling parse_argv).
+//
 // See design/architecture.md §4 (M1 state machine) and §9 (M2
 // extensions). Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12
 // (paideia-os).
@@ -88,7 +105,7 @@ module Parser = structure {
   pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2 + ENH-004 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration).",
+      justification: "libpdx-argv.M2 + ENH-004 + ENH-026 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -116,20 +133,32 @@ module Parser = structure {
         jne parse_argv_positional;
 
         // -- Classify by argv[i][0]
+        //    ENH-026: an empty argv slot ("") is malformed — it fits
+        //    neither the flag grammar (no leading '-') nor the
+        //    positional grammar (must be a non-empty bare string).
         xor rax, rax;
         mov_b rax, [rdx];
+        cmp rax, 0;
+        je parse_argv_unknown_arg_form;     // ENH-026: empty string
         cmp rax, 0x2D;                      // '-'
         je parse_argv_maybe_flag;
         jmp parse_argv_positional;
 
       parse_argv_maybe_flag:
         // Byte1 check: 0x2D = another '-' (long or ddash), NUL = bare '-'
+        //    ENH-026: a bare "-" is malformed — starts with '-' but
+        //    has no name byte after it, so it is neither a valid short
+        //    nor a valid long flag; and unlike ordinary positionals it
+        //    still starts with '-' so it is not a valid positional
+        //    either. Tools that want the historical stdin-'-' idiom
+        //    must filter their argv before calling parse_argv, or
+        //    register a tool-specific short-name for stdin.
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0x2D;
         je parse_argv_maybe_long_or_ddash;
         cmp rax, 0;
-        je parse_argv_positional;           // bare "-" is a positional
+        je parse_argv_unknown_arg_form;     // ENH-026: bare "-"
         jmp parse_argv_short_flag;
 
       parse_argv_maybe_long_or_ddash:
@@ -398,6 +427,10 @@ module Parser = structure {
 
       parse_argv_unknown_flag:
         mov rax, 12;                        // ERR_UNKNOWN_FLAG (ENH-004)
+        jmp parse_argv_fail;
+
+      parse_argv_unknown_arg_form:
+        mov rax, 3;                         // ERR_UNKNOWN_ARG_FORM (ENH-026)
         jmp parse_argv_fail;
 
       parse_argv_fail:

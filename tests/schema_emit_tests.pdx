@@ -43,7 +43,7 @@ module SchemaEmitTests = structure {
       block: {
         push rbx;
 
-        call reset;
+        call schema_emit_reset;
 
         call get_count;
         cmp rax, 0; jne se1_fail;
@@ -73,13 +73,13 @@ module SchemaEmitTests = structure {
         push rbx;
         push r15;
 
-        call reset;
+        call schema_emit_reset;
 
         lea rdi, [rip + sch_a];
-        call register;
+        call schema_emit_register;
 
         lea rdi, [rip + sch_b];
-        call register;
+        call schema_emit_register;
 
         call get_count;
         cmp rax, 2; jne se2_fail;
@@ -115,17 +115,17 @@ module SchemaEmitTests = structure {
       block: {
         push rbx;
 
-        call reset;
+        call schema_emit_reset;
 
-        lea rdi, [rip + sch_a]; call register;
-        lea rdi, [rip + sch_b]; call register;
-        lea rdi, [rip + sch_c]; call register;
-        lea rdi, [rip + sch_d]; call register;
-        lea rdi, [rip + sch_e]; call register;
-        lea rdi, [rip + sch_f]; call register;
-        lea rdi, [rip + sch_g]; call register;
-        lea rdi, [rip + sch_h]; call register;
-        lea rdi, [rip + sch_i]; call register;  // dropped
+        lea rdi, [rip + sch_a]; call schema_emit_register;
+        lea rdi, [rip + sch_b]; call schema_emit_register;
+        lea rdi, [rip + sch_c]; call schema_emit_register;
+        lea rdi, [rip + sch_d]; call schema_emit_register;
+        lea rdi, [rip + sch_e]; call schema_emit_register;
+        lea rdi, [rip + sch_f]; call schema_emit_register;
+        lea rdi, [rip + sch_g]; call schema_emit_register;
+        lea rdi, [rip + sch_h]; call schema_emit_register;
+        lea rdi, [rip + sch_i]; call schema_emit_register;  // dropped
 
         call get_count;
         cmp rax, 8; jne se3_fail;
@@ -153,9 +153,9 @@ module SchemaEmitTests = structure {
       block: {
         push rbx;
 
-        call reset;
+        call schema_emit_reset;
         lea rdi, [rip + sch_a];
-        call register;
+        call schema_emit_register;
 
         // count=1; idx=1 is OOR
         mov rdi, 1;
@@ -194,17 +194,17 @@ module SchemaEmitTests = structure {
         push rbx;
         push r15;
 
-        call reset;
-        lea rdi, [rip + sch_a]; call register;
-        lea rdi, [rip + sch_b]; call register;
-        lea rdi, [rip + sch_c]; call register;
+        call schema_emit_reset;
+        lea rdi, [rip + sch_a]; call schema_emit_register;
+        lea rdi, [rip + sch_b]; call schema_emit_register;
+        lea rdi, [rip + sch_c]; call schema_emit_register;
 
-        call reset;
+        call schema_emit_reset;
         call get_count;
         cmp rax, 0; jne se5_fail;
 
         lea rdi, [rip + sch_d];
-        call register;
+        call schema_emit_register;
 
         call get_count;
         cmp rax, 1; jne se5_fail;

@@ -20,8 +20,17 @@
 //     and 0xFF for FKIND_UNKNOWN in the parser).
 //   - r11 is scratch (used in every lea for cross-module bases).
 //   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
-//   - register() and reset() are leaf; lookup() is leaf (does not call
-//     other functions — it inlines the strcmp).
+//   - flag_spec_register() and flag_spec_reset() are leaf; lookup() is
+//     leaf (does not call other functions — it inlines the strcmp).
+//
+// libpdx-argv.ENH-030 (Wave 2 rename): what used to be `reset` /
+// `register` here are now `flag_spec_reset` / `flag_spec_register`.
+// Three modules each shipped a `reset` (ParsedArgs, FlagSpec,
+// SchemaEmit) and two shipped a `register` (FlagSpec, SchemaEmit);
+// linking any two of them together (which every real consumer needs)
+// failed with `multiple definition of 'reset'` / `... 'register'`. The
+// per-module prefix ends the collision at the source level; call sites
+// update to the new names one-to-one, no behavior change.
 
 module FlagSpec = structure {
   // -- Value kinds. Registered flags declare their argument type here. -
@@ -43,8 +52,8 @@ module FlagSpec = structure {
 
   pub let SPEC_MAX : u64 = 32
 
-  // Singleton storage. Reset by FlagSpec::reset(); registrations
-  // accumulate via FlagSpec::register(name, kind, id).
+  // Singleton storage. Reset by flag_spec_reset(); registrations
+  // accumulate via flag_spec_register(name, kind, id).
   pub let mut spec_names : [u64; 32] = uninit @align(8)  // NUL-term name ptr
   pub let mut spec_kinds : [u64; 32] = uninit @align(8)  // FKIND_* constant
   pub let mut spec_ids   : [u64; 32] = uninit @align(8)  // caller-chosen id
@@ -84,21 +93,23 @@ module FlagSpec = structure {
   pub let mut strict_mode : u64 = uninit @align(8)
 
   // ============================================================
-  // reset() — clear the registration table.
+  // flag_spec_reset() — clear the registration table.
   // Signature: () -> () !{mem} @{}
   // Leaf. No arguments.
   //
+  // ENH-030 rename (was `reset`; see module preamble for rationale).
+  //
   // Consumer usage:
-  //   FlagSpec::reset()
-  //   StdVocab::register_all()           // 9 std flags
-  //   FlagSpec::register(name, kind, id) // tool-specific flags
-  //   ParsedArgs::reset()
-  //   Parser::parse_argv(argv, argc)
+  //   flag_spec_reset()
+  //   register_all()                     // 9 std flags (StdVocab)
+  //   flag_spec_register(name, kind, id) // tool-specific flags
+  //   parsed_args_reset()
+  //   parse_argv(argv, argc)
   // ============================================================
-  pub let reset : () -> () !{mem} @{} =
+  pub let flag_spec_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 + ENH-004 FlagSpec::reset — zero spec_count so the next FlagSpec::register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant.",
+      justification: "libpdx-argv.M2-001 + ENH-004 + ENH-030 flag_spec_reset — zero spec_count so the next flag_spec_register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant. ENH-030 renames the exported symbol from `reset` to `flag_spec_reset` to end the multi-module link collision — body byte-identical.",
       block: {
         xor rax, rax;
         lea r11, [rip + spec_count];
@@ -116,13 +127,13 @@ module FlagSpec = structure {
   //         every consumer of strict_mode compares it with `cmp ..,
   //         0` so any nonzero value behaves as "on")
   //
-  // Leaf. Consumer usage (after FlagSpec::reset()):
-  //   FlagSpec::reset()
-  //   StdVocab::register_all()
-  //   FlagSpec::register(...)
-  //   FlagSpec::set_strict(1)          // opt in; default is 0
-  //   ParsedArgs::reset()
-  //   Parser::parse_argv(argv, argc)   // or SchemaInvoke equivalent
+  // Leaf. Consumer usage (after flag_spec_reset()):
+  //   flag_spec_reset()
+  //   register_all()                   // StdVocab
+  //   flag_spec_register(...)
+  //   set_strict(1)                    // opt in; default is 0
+  //   parsed_args_reset()
+  //   parse_argv(argv, argc)           // or parse_from_schema_record
   // ============================================================
   pub let set_strict : (u64) -> () !{mem} @{} =
     fn (on: u64) -> unsafe {
@@ -136,7 +147,7 @@ module FlagSpec = structure {
     }
 
   // ============================================================
-  // register(name_ptr, kind, id)
+  // flag_spec_register(name_ptr, kind, id)
   // Signature: (u64, u64, u64) -> () !{mem} @{}
   //   rdi = name_ptr (NUL-terminated string)
   //   rsi = kind (FKIND_* constant, 0..5)
@@ -148,19 +159,21 @@ module FlagSpec = structure {
   // no-ops past SPEC_MAX; callers that need overflow detection can
   // compare spec_count against SPEC_MAX before the call.
   //
+  // ENH-030 rename (was `register`; see module preamble).
+  //
   // Leaf. Register plan (all caller-save):
   //   rax = spec_count / scratch
   //   r11 = lea scratch for cross-module .bss bases
   // ============================================================
-  pub let register : (u64, u64, u64) -> () !{mem} @{} =
+  pub let flag_spec_register : (u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 + ENH-010 FlagSpec::register — appends (name, kind, id) at spec_count and increments, explicitly zeroing spec_sep_required[slot] so a slot index reused after a reset never inherits a stale separator-required flag from an earlier registration batch. Leaf; r11 for lea; rax as spec_count/scratch. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF).",
+      justification: "libpdx-argv.M2-001 + ENH-010 + ENH-030 flag_spec_register — appends (name, kind, id) at spec_count and increments, explicitly zeroing spec_sep_required[slot] so a slot index reused after a reset never inherits a stale separator-required flag from an earlier registration batch. Leaf; r11 for lea; rax as spec_count/scratch. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). ENH-030 renames the exported symbol from `register` to `flag_spec_register` (and its overflow label to flag_spec_register_full) to end the multi-module link collision — body byte-identical.",
       block: {
         lea r11, [rip + spec_count];
         mov rax, [r11];
         cmp rax, 32;                       // SPEC_MAX
-        jge register_full;
+        jge flag_spec_register_full;
 
         lea r11, [rip + spec_names];
         mov [r11 + rax*8], rdi;
@@ -176,7 +189,7 @@ module FlagSpec = structure {
         lea r11, [rip + spec_count];
         mov [r11], rax;
 
-      register_full:
+      flag_spec_register_full:
         ret;
       }
     }
@@ -185,19 +198,19 @@ module FlagSpec = structure {
   // register_sep(name_ptr, kind, id) — libpdx-argv.ENH-010
   // Signature: (u64, u64, u64) -> () !{mem} @{}
   //
-  // Identical to register() except spec_sep_required[slot] is set to
-  // 1: the parser will never accept a lookahead (`argv[i+1]`) value
-  // for this flag, only an inline `=`/`:` one. Use for a flag whose
-  // spelling is defined with a mandatory separator (I3's `--color=`,
-  // `--no-cap:`) so `--color --json` cannot swallow `--json` as the
-  // colour mode.
+  // Identical to flag_spec_register() except spec_sep_required[slot]
+  // is set to 1: the parser will never accept a lookahead (`argv[i+1]`)
+  // value for this flag, only an inline `=`/`:` one. Use for a flag
+  // whose spelling is defined with a mandatory separator (I3's
+  // `--color=`, `--no-cap:`) so `--color --json` cannot swallow
+  // `--json` as the colour mode.
   //
-  // Leaf. Register plan mirrors register().
+  // Leaf. Register plan mirrors flag_spec_register().
   // ============================================================
   pub let register_sep : (u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.ENH-010 FlagSpec::register_sep — same as register() but writes spec_sep_required[slot] = 1 instead of 0, marking the registration separator-required. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the literal 1.",
+      justification: "libpdx-argv.ENH-010 FlagSpec::register_sep — same as flag_spec_register() but writes spec_sep_required[slot] = 1 instead of 0, marking the registration separator-required. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the literal 1.",
       block: {
         lea r11, [rip + spec_count];
         mov rax, [r11];

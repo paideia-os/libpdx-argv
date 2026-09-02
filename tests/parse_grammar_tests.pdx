@@ -19,6 +19,15 @@
 //     inline =/: forms are unaffected; a plain register()-ed typed
 //     flag (older-than, in tests/parse_typed_args.pdx case1) still
 //     accepts lookahead, proving the policy is per-registration.
+//   - libpdx-argv.ENH-024 unregistered-slot skip in the finder
+//     scans (cases 21-23): find_flag_by_id(0), find_last_flag_by_id(0),
+//     and count_flag_by_id(0) all return the "not-found" sentinel
+//     even when the record contains permissive-mode unregistered
+//     flags (which store as id==0).
+//   - libpdx-argv.ENH-026 malformed-argv-slot classification
+//     (case 10 update + case 24): bare '-' (case 10) and the empty
+//     string "" (case 24) both fail with ERR_UNKNOWN_ARG_FORM=3;
+//     bare '--' (case 5) still sets the ddash sentinel unchanged.
 //
 // Module id in TestHarness::last_fail_tag: 1
 //
@@ -431,7 +440,7 @@ module ParseGrammarTests = structure {
         lea rdi, [rip + case7_short_name];
         mov rsi, 0;                          // FKIND_BOOL
         mov rdx, 100;
-        call register;
+        call flag_spec_register;
 
         lea r11, [rip + case7_short_arg];
         lea rbx, [rip + case7_argv];
@@ -546,11 +555,15 @@ module ParseGrammarTests = structure {
     }
 
   // ============================================================
-  // Case 10 — bare '-' is positional: `-`
+  // Case 10 — bare '-' → ERR_UNKNOWN_ARG_FORM (libpdx-argv.ENH-026)
   //   argv: "-\0"
-  //   Expected: err=0, flag_count=0, pos_count=1.
-  //   (Convention: '-' alone often means stdin; libpdx-argv treats it
-  //    as a positional and lets the tool interpret.)
+  //   Expected: err=ERR_UNKNOWN_ARG_FORM (=3), error_arg_index=0,
+  //             flag_count=0, pos_count=0.
+  //   Pre-ENH-026 this fixture landed in pos_ptrs (stdin convention).
+  //   ENH-026 reclassifies bare '-' as malformed (it fits neither the
+  //   flag grammar nor the positional grammar). Tools that want the
+  //   stdin idiom must filter argv or register a tool-specific short
+  //   flag for stdin; see doc/libpdx-argv.pdxdoc §FLAG GRAMMAR.
   // ============================================================
   pub let case10_bare_dash : [u8; 2] = "-\0"
   pub let mut case10_argv  : [u64; 1] = uninit @align(8)
@@ -558,7 +571,7 @@ module ParseGrammarTests = structure {
   pub let run_case10 : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M4-001 case10 — bare '-' is positional. Parser inspects byte1 after byte0=='-'; NUL at byte1 → treat as positional (matches the stdin convention). Verifies pos_count=1 and flag_count=0.",
+      justification: "libpdx-argv.M4-001 + ENH-026 case10 — bare '-' is malformed. Parser inspects byte1 after byte0=='-'; NUL at byte1 → ERR_UNKNOWN_ARG_FORM (=3, ENH-026), error_arg_index=0. flag_count and pos_count both remain 0 because the failure fires before any store. Regression witness for the stdin-convention behaviour change: any consumer that relied on '-' silently landing in pos_ptrs must now handle the ERR_UNKNOWN_ARG_FORM return or filter its argv upstream.",
       block: {
         push rbx;
 
@@ -571,6 +584,11 @@ module ParseGrammarTests = structure {
         lea rdi, [rip + case10_argv];
         mov rsi, 1;
         call parse_argv;
+        cmp rax, 3;                          // ERR_UNKNOWN_ARG_FORM
+        jne case10_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
         cmp rax, 0;
         jne case10_fail;
 
@@ -581,7 +599,7 @@ module ParseGrammarTests = structure {
 
         lea r11, [rip + pos_count];
         mov rax, [r11];
-        cmp rax, 1;
+        cmp rax, 0;
         jne case10_fail;
 
         call record_pass;
@@ -1160,6 +1178,256 @@ module ParseGrammarTests = structure {
 
       case20_fail:
         mov rdi, 0x100000014;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 21 — libpdx-argv.ENH-024 find_flag_by_id skips id==0.
+  //   Fixture: `--verbose --nosuchflag` under permissive mode.
+  //   After parse: flag_count=2, flag_ids[0]=STD_ID_VERBOSE=6,
+  //                flag_ids[1]=0 (unregistered).
+  //   Expected:
+  //     find_flag_by_id(0) == 32 (MAX_FLAGS; must NOT return slot 1)
+  //     find_flag_by_id(6) != 32 (registered flag still resolvable)
+  //   Pre-ENH-024 find_flag_by_id(0) returned 1 (the unregistered
+  //   slot), contradicting the "passing 0 returns MAX_FLAGS" contract
+  //   in parsed_args.pdx's own docstring.
+  // ============================================================
+  pub let case21_verbose      : [u8; 10] = "--verbose\0"
+  pub let case21_nosuchflag   : [u8; 13] = "--nosuchflag\0"
+  pub let mut case21_argv     : [u64; 2] = uninit @align(8)
+
+  pub let run_case21 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-024 case21 — regression fixture proving find_flag_by_id(0) never returns an unregistered-flag slot. Argv `--verbose --nosuchflag` under permissive mode (register_all only; no set_strict) stores verbose at slot 0 (id=6) and nosuchflag at slot 1 (id=0, FKIND_UNKNOWN). The scan must skip the id==0 slot and return MAX_FLAGS=32 for target 0. A second assertion confirms find_flag_by_id(6) still resolves the registered flag — the fix is skip-only, not a total block on scanning.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case21_verbose];
+        lea rbx, [rip + case21_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case21_nosuchflag];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case21_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0;
+        jne case21_fail;
+
+        // flag_count must be 2 (verbose stored, unregistered stored)
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case21_fail;
+
+        // find_flag_by_id(0) must return 32, NOT 1.
+        mov rdi, 0;
+        call find_flag_by_id;
+        cmp rax, 32;
+        jne case21_fail;
+
+        // find_flag_by_id(6) must still succeed (id=STD_ID_VERBOSE).
+        mov rdi, 6;
+        call find_flag_by_id;
+        cmp rax, 32;
+        je case21_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case21_fail:
+        mov rdi, 0x100000015;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 22 — libpdx-argv.ENH-024 find_last_flag_by_id skips id==0.
+  //   Same fixture and expectation shape as case21, but on the
+  //   downward-scan variant.
+  //   Expected:
+  //     find_last_flag_by_id(0) == 32 (must NOT return the tail
+  //                                    unregistered slot)
+  //     find_last_flag_by_id(6) != 32
+  // ============================================================
+  pub let case22_verbose      : [u8; 10] = "--verbose\0"
+  pub let case22_nosuchflag   : [u8; 13] = "--nosuchflag\0"
+  pub let mut case22_argv     : [u64; 2] = uninit @align(8)
+
+  pub let run_case22 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-024 case22 — same shape as case21 but exercises find_last_flag_by_id (the downward-scan variant). Argv `--verbose --nosuchflag`; the tail slot has id==0 (unregistered). Pre-ENH-024 find_last_flag_by_id(0) would return the tail slot (worst case: last-wins semantics latch onto the id==0 slot); ENH-024 skip-in-scan makes it return MAX_FLAGS=32. Second assertion: find_last_flag_by_id(6) still resolves --verbose at slot 0.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case22_verbose];
+        lea rbx, [rip + case22_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case22_nosuchflag];
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + case22_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0;
+        jne case22_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case22_fail;
+
+        mov rdi, 0;
+        call find_last_flag_by_id;
+        cmp rax, 32;
+        jne case22_fail;
+
+        mov rdi, 6;
+        call find_last_flag_by_id;
+        cmp rax, 32;
+        je case22_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case22_fail:
+        mov rdi, 0x100000016;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 23 — libpdx-argv.ENH-024 count_flag_by_id skips id==0.
+  //   Fixture: `--nosuchflag --noother --verbose` under permissive
+  //   mode. After parse: flag_count=3, flag_ids=[0,0,6].
+  //   Expected:
+  //     count_flag_by_id(0) == 0 (must NOT tally the two id==0 slots)
+  //     count_flag_by_id(6) == 1
+  // ============================================================
+  pub let case23_nosuchflag   : [u8; 13] = "--nosuchflag\0"
+  pub let case23_noother      : [u8; 10] = "--noother\0"
+  pub let case23_verbose      : [u8; 10] = "--verbose\0"
+  pub let mut case23_argv     : [u64; 3] = uninit @align(8)
+
+  pub let run_case23 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-024 case23 — count_flag_by_id skip. Argv holds two unregistered flags (id=0) plus one --verbose (id=6, STD_ID_VERBOSE). Pre-ENH-024 count_flag_by_id(0) returned 2 (tallying the unregistered slots); ENH-024 makes it return 0, preserving the '0 if never seen' contract. Second assertion: count_flag_by_id(6) still returns 1 — the skip is targeted at id==0 only.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea r11, [rip + case23_nosuchflag];
+        lea rbx, [rip + case23_argv];
+        mov [rbx + 0], r11;
+        lea r11, [rip + case23_noother];
+        mov [rbx + 8], r11;
+        lea r11, [rip + case23_verbose];
+        mov [rbx + 16], r11;
+
+        lea rdi, [rip + case23_argv];
+        mov rsi, 3;
+        call parse_argv;
+        cmp rax, 0;
+        jne case23_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne case23_fail;
+
+        mov rdi, 0;
+        call count_flag_by_id;
+        cmp rax, 0;
+        jne case23_fail;
+
+        mov rdi, 6;
+        call count_flag_by_id;
+        cmp rax, 1;
+        jne case23_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case23_fail:
+        mov rdi, 0x100000017;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 24 — libpdx-argv.ENH-026 empty argv slot → ERR_UNKNOWN_ARG_FORM.
+  //   Fixture: argv[0] points at a 1-byte NUL-only string (the
+  //   empty C-string ""). Parser byte0 check hits NUL immediately
+  //   and jumps to parse_argv_unknown_arg_form.
+  //   Expected: err=3, error_arg_index=0, flag_count=0, pos_count=0.
+  // ============================================================
+  pub let case24_empty : [u8; 1] = "\0"
+  pub let mut case24_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case24 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-026 case24 — empty argv slot is malformed. Fixture points argv[0] at a 1-byte NUL-only string (empty C-string). Parser's byte0==NUL check jumps to parse_argv_unknown_arg_form, sets ERR_UNKNOWN_ARG_FORM=3, error_arg_index=0, and returns before any store — flag_count and pos_count both stay 0. Pre-ENH-026 the empty string fell through to parse_argv_positional and landed in pos_ptrs[0], silently corrupting the tool's positional stream.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea r11, [rip + case24_empty];
+        lea rbx, [rip + case24_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case24_argv];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 3;                          // ERR_UNKNOWN_ARG_FORM
+        jne case24_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case24_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case24_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case24_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case24_fail:
+        mov rdi, 0x100000018;
         call record_fail;
         pop rbx;
         ret;

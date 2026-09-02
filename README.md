@@ -41,7 +41,8 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 `error_arg_index`, `emit_schema`, `ddash_seen`, `ddash_arg_index`.
 `MAX_FLAGS = MAX_POS = 32`. Error constants: `ERR_OK` 0,
 `ERR_FLAG_OVERFLOW` 1, `ERR_POS_OVERFLOW` 2, `ERR_UNKNOWN_ARG_FORM` 3
-(reserved), `ERR_CLUSTERED_SHORT` 4, `ERR_LONG_MISSING_NAME` 5,
+(empty `""` or bare `-`; `libpdx-argv.ENH-026`), `ERR_CLUSTERED_SHORT` 4,
+`ERR_LONG_MISSING_NAME` 5,
 `ERR_MISSING_VALUE` 6, `ERR_SCHEMA_BAD_MAGIC` 7,
 `ERR_SCHEMA_UNSUPPORTED_VERSION` 8, `ERR_SCHEMA_BAD_LAYOUT` 9,
 `ERR_SCHEMA_BAD_OFFSET` 10, `ERR_SCHEMA_UNTERMINATED` 11,
@@ -49,7 +50,7 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 
 | Function | Purpose |
 | --- | --- |
-| `reset() -> () !{mem} @{}` | Zero the bookkeeping slots so the next parse starts clean. Arrays are consumed by index, so only counters are cleared. |
+| `parsed_args_reset() -> () !{mem} @{}` | Zero the bookkeeping slots so the next parse starts clean. Arrays are consumed by index, so only counters are cleared. **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** |
 | `find_flag_by_id(id: u64) -> u64 !{mem} @{}` | Linear scan of `flag_ids`; returns the storage index `k`, or `32` (`MAX_FLAGS`) if that id was never seen. **First-wins** on a repeated flag (`libpdx-argv.ENH-008`). |
 | `find_last_flag_by_id(id: u64) -> u64 !{mem} @{}` | **(ENH-008)** Same as above but **last-wins** — scans downward, so a later occurrence of a repeated flag shadows an earlier one (e.g. `--color=auto --color=never` → `never`). |
 | `count_flag_by_id(id: u64) -> u64 !{mem} @{}` | **(ENH-008)** Number of stored flags with the given id (0 if never seen) — for the repeat-count idiom (`-v -v -v`). |
@@ -62,11 +63,11 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 
 | Function | Purpose |
 | --- | --- |
-| `reset() -> () !{mem} @{}` | Clear the registration table (zeroes `spec_count`). |
-| `register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. The flag may take its value inline (`=`/`:`) or via lookahead (`argv[i+1]`). |
-| `register_sep(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-010`)** Same as `register`, but the flag's value MUST arrive inline — the parser never accepts a lookahead value for it, even if `argv[i+1]` looks like a plausible one. Use for a flag whose I3 spelling mandates a separator (`--color=`, `--no-cap:`). |
+| `flag_spec_reset() -> () !{mem} @{}` | Clear the registration table (zeroes `spec_count`). **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** |
+| `flag_spec_register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. The flag may take its value inline (`=`/`:`) or via lookahead (`argv[i+1]`). **(Renamed from `register` in `libpdx-argv.ENH-030`, v1.1.0.)** |
+| `register_sep(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-010`)** Same as `flag_spec_register`, but the flag's value MUST arrive inline — the parser never accepts a lookahead value for it, even if `argv[i+1]` looks like a plausible one. Use for a flag whose I3 spelling mandates a separator (`--color=`, `--no-cap:`). |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
-| `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `Parser::parse_argv` and `SchemaInvoke::parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `reset()` restores 0. |
+| `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `parse_argv` and `parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `flag_spec_reset()` restores 0. |
 
 ### parser.pdx — `Parser`
 
@@ -79,7 +80,7 @@ flags one letter per hyphen (`-f`; clustered `-la` is rejected with
 `ERR_CLUSTERED_SHORT`); a bare `-` is positional; `--` is a sentinel after
 which every remaining argument is positional regardless of leading byte.
 Arity comes from `FlagSpec::lookup`: `FKIND_BOOL` and `FKIND_UNKNOWN` never
-consume a lookahead; a typed flag registered via `register()` consumes one
+consume a lookahead; a typed flag registered via `flag_spec_register()` consumes one
 if it has no inline value (`ERR_MISSING_VALUE` if none remains); a typed
 flag registered via **`register_sep()`** (`libpdx-argv.ENH-010`) never
 consumes a lookahead at all — only an inline `=`/`:` value satisfies it,
@@ -121,7 +122,7 @@ Wire constants: `SCHEMA_HEADER_SIZE` 32, `SCHEMA_FLAG_STRIDE` 16,
 | --- | --- |
 | `parse_from_schema_record(record_ptr: u64, record_len: u64) -> u64 !{mem} @{}` | The alternate invocation path: validate a v1 record, then fill the same `ParsedArgs` the argv path fills, consulting `FlagSpec::lookup` per flag. Returns `ERR_OK` or an `ERR_SCHEMA_*` / overflow code. |
 
-Preconditions mirror `parse_argv`: `ParsedArgs::reset()` first, `FlagSpec`
+Preconditions mirror `parse_argv`: `parsed_args_reset()` first, `FlagSpec`
 already populated. Stored pointers are interior pointers into the caller's
 record buffer and stay valid only while it is live.
 
@@ -153,8 +154,8 @@ stdout (no caps), so the actual printing is the consumer's job.
 
 | Function | Purpose |
 | --- | --- |
-| `reset() -> () !{mem} @{}` | Clear the schema-name table. |
-| `register(schema_name_ptr: u64) -> () !{mem} @{}` | Append one NUL-terminated schema-name pointer; silently drops past `SCHEMA_MAX`. |
+| `schema_emit_reset() -> () !{mem} @{}` | Clear the schema-name table. **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** |
+| `schema_emit_register(schema_name_ptr: u64) -> () !{mem} @{}` | Append one NUL-terminated schema-name pointer; silently drops past `SCHEMA_MAX`. **(Renamed from `register` in `libpdx-argv.ENH-030`, v1.1.0.)** |
 | `get_count() -> u64 !{mem} @{}` | Number of registered names. |
 | `get_name(idx: u64) -> u64 !{mem} @{}` | Pointer to `schema_names[idx]`, or `0` if out of range. |
 
@@ -245,13 +246,19 @@ tracked in this repo.
 
 ## Version
 
-**v1.0.0** — first signed release (2026-08-22); milestones M1–M5 all closed.
-`VERSION` carries `1.0.0`; `manifest.pdxsig` is the dual-signed release
-manifest; `doc/libpdx-argv.pdxdoc` is the `doc libpdx-argv` page per I7; and
-`pkgs/mirror.entry` is the admission entry for the `pkgs.paideia-os` mirror.
-See [`CHANGELOG.md`](CHANGELOG.md) for the 1.0 entry, `STATUS.md` for the
-per-milestone rollup, and `design/tooling/r49-r50-plan.md` §5.12 in
-[paideia-os](https://github.com/paideia-os/paideia-os) for the wave rubric.
+**v1.1.0** — post-1.0 enhancement tranche (2026-09-02); folds Wave 1
+(`libpdx-argv.ENH-022` / `ENH-023` / `ENH-029` — test-module rename,
+smoke-driver qualification, `pkgs/consumers.list` scaffold) and Wave 2
+(`libpdx-argv.ENH-030` — cross-module symbol rename to end the
+`multiple definition of 'reset'` / `... 'register'` link error every
+downstream P0 tool hit). See [`CHANGELOG.md`](CHANGELOG.md) for the 1.1
+entry and the full post-1.0 tranche it groups; `VERSION` carries
+`1.1.0`; `manifest.pdxsig` version-bumps in the same commit;
+`STATUS.md` and `design/tooling/r49-r50-plan.md` §5.12 in
+[paideia-os](https://github.com/paideia-os/paideia-os) carry the wave
+rubric context. The v1.0.0 entry (first signed release, 2026-08-22,
+milestones M1–M5 all closed) is left in place per this repo's policy
+of not rewriting a signed release's history silently.
 
 ## Examples
 
@@ -259,12 +266,12 @@ per-milestone rollup, and `design/tooling/r49-r50-plan.md` §5.12 in
 consults `FlagSpec` to decide flag arity.
 
 ```pdx
-FlagSpec::reset()
-StdVocab::register_all()                              // the 9 I3 flags, ids 1..9
-FlagSpec::register(&MY_NAME_OUT, FlagSpec::FKIND_STR,  100)
-FlagSpec::register(&MY_NAME_MAX, FlagSpec::FKIND_SIZE, 101)
-ParsedArgs::reset()
-let rc = Parser::parse_argv(argv, argc)               // 0 = ERR_OK
+flag_spec_reset()
+register_all()                                        // the 9 I3 flags, ids 1..9
+flag_spec_register(&MY_NAME_OUT, FlagSpec::FKIND_STR,  100)
+flag_spec_register(&MY_NAME_MAX, FlagSpec::FKIND_SIZE, 101)
+parsed_args_reset()
+let rc = parse_argv(argv, argc)                       // 0 = ERR_OK
 ```
 
 **Dispatch by id, then decode the value.** `find_flag_by_id` returns `32`
@@ -289,10 +296,10 @@ if m != 32 {
 everything downstream reads `ParsedArgs` unchanged.
 
 ```pdx
-FlagSpec::reset()
-StdVocab::register_all()
-ParsedArgs::reset()
-let rc = SchemaInvoke::parse_from_schema_record(rec_ptr, rec_len)
+flag_spec_reset()
+register_all()
+parsed_args_reset()
+let rc = parse_from_schema_record(rec_ptr, rec_len)
 // rc == 7/8/9 -> bad magic / unsupported version / bad layout
 ```
 

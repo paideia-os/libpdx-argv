@@ -69,7 +69,7 @@ module ParseTypedArgsTests = structure {
         lea rdi, [rip + name_older_than];
         mov rsi, 3;
         mov rdx, 100;
-        call register;
+        call flag_spec_register;
 
         lea r11, [rip + f_older_flag];
         lea rbx, [rip + argv1];
@@ -125,7 +125,7 @@ module ParseTypedArgsTests = structure {
         lea rdi, [rip + name_older_than];
         mov rsi, 3;
         mov rdx, 100;
-        call register;
+        call flag_spec_register;
 
         lea r11, [rip + f_older_flag];
         lea rbx, [rip + argv2];
@@ -166,7 +166,7 @@ module ParseTypedArgsTests = structure {
         lea rdi, [rip + name_older_than];
         mov rsi, 3;
         mov rdx, 100;
-        call register;
+        call flag_spec_register;
 
         lea r11, [rip + f_older_eq];
         lea rbx, [rip + argv5];
@@ -221,7 +221,7 @@ module ParseTypedArgsTests = structure {
         lea rdi, [rip + name_n_short];
         mov rsi, 2;                          // FKIND_INT
         mov rdx, 101;
-        call register;
+        call flag_spec_register;
 
         lea r11, [rip + f_n_short];
         lea rbx, [rip + argv3];
@@ -274,7 +274,7 @@ module ParseTypedArgsTests = structure {
         lea rdi, [rip + name_n_short];
         mov rsi, 2;
         mov rdx, 101;
-        call register;
+        call flag_spec_register;
 
         lea r11, [rip + f_n_short];
         lea rbx, [rip + argv4];

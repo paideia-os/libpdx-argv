@@ -15,19 +15,27 @@
 //
 // The three-call shape mirrors FlagSpec:
 //
-//   SchemaEmit::reset()                    // clear
-//   SchemaEmit::register(schema_name_ptr)  // append
+//   schema_emit_reset()                    // clear
+//   schema_emit_register(schema_name_ptr)  // append
 //   ...
-//   SchemaEmit::get_count() -> u64         // read for iteration
-//   SchemaEmit::get_name(idx) -> u64       // per-slot ptr (0 if OOR)
+//   get_count() -> u64                     // read for iteration
+//   get_name(idx) -> u64                   // per-slot ptr (0 if OOR)
 //
 // Consumer pattern:
 //
 //   at _start:
-//     SchemaEmit::reset()
-//     SchemaEmit::register(&SCHEMA_NAME_A)  // e.g. "MyToolRecord@0.1\0"
-//     SchemaEmit::register(&SCHEMA_NAME_B)
+//     schema_emit_reset()
+//     schema_emit_register(&SCHEMA_NAME_A)  // "MyToolRecord@0.1\0"
+//     schema_emit_register(&SCHEMA_NAME_B)
 //     ...
+//
+// libpdx-argv.ENH-030 (Wave 2 rename): what used to be `reset` /
+// `register` here are now `schema_emit_reset` / `schema_emit_register`.
+// Three modules each shipped a `reset` (ParsedArgs, FlagSpec,
+// SchemaEmit) and two shipped a `register` (FlagSpec, SchemaEmit);
+// linking any two together (which every real consumer needs) failed
+// with `multiple definition of 'reset'` / `... 'register'`. The
+// per-module prefix ends the collision at the source level.
 //
 //   at --schema handling:
 //     let k = ParsedArgs::find_flag_by_id(StdVocab::STD_ID_SCHEMA)
@@ -73,15 +81,17 @@ module SchemaEmit = structure {
   pub let mut schema_count : u64      = uninit @align(8)
 
   // ============================================================
-  // reset() — clear the schema-name table.
+  // schema_emit_reset() — clear the schema-name table.
   // Signature: () -> () !{mem} @{}
   // Leaf. Zeroes schema_count; the schema_names array is consumed by
   // index so stale trailing entries are unreachable.
+  //
+  // ENH-030 rename (was `reset`; see module preamble).
   // ============================================================
-  pub let reset : () -> () !{mem} @{} =
+  pub let schema_emit_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M3-003 SchemaEmit::reset — zero schema_count so the next SchemaEmit::register writes at slot 0. Leaf; r11 scratch; xor rax,rax produces the zero constant.",
+      justification: "libpdx-argv.M3-003 + ENH-030 schema_emit_reset — zero schema_count so the next schema_emit_register writes at slot 0. Leaf; r11 scratch; xor rax,rax produces the zero constant. ENH-030 renames the exported symbol from `reset` to `schema_emit_reset` to end the multi-module link collision — body byte-identical.",
       block: {
         xor rax, rax;
         lea r11, [rip + schema_count];
@@ -91,7 +101,7 @@ module SchemaEmit = structure {
     }
 
   // ============================================================
-  // register(schema_name_ptr) -> ()
+  // schema_emit_register(schema_name_ptr) -> ()
   // Signature: (u64) -> () !{mem} @{}
   //   rdi = schema_name_ptr — NUL-terminated string; e.g. a
   //         per-tool .rodata symbol like "MyToolRecord@0.1\0".
@@ -100,14 +110,16 @@ module SchemaEmit = structure {
   // drops past SCHEMA_MAX. Callers wanting overflow detection can
   // read schema_count against SCHEMA_MAX after their batch.
   //
+  // ENH-030 rename (was `register`; see module preamble).
+  //
   // Leaf. Register plan (all caller-save):
   //   rax = schema_count / scratch
   //   r11 = lea scratch for cross-module .bss bases
   // ============================================================
-  pub let register : (u64) -> () !{mem} @{} =
+  pub let schema_emit_register : (u64) -> () !{mem} @{} =
     fn (schema_name_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M3-003 SchemaEmit::register — appends a NUL-terminated schema-name pointer at slot schema_count. Silently no-ops past SCHEMA_MAX (=8) so a consumer that over-registers surfaces the miss via get_count() vs its call count rather than as a run-time fault. Leaf; r11 lea scratch; rax as spec_count/scratch. The MAX-check uses cmp rax, 8 (well ≤ 0x7FFFFFFF).",
+      justification: "libpdx-argv.M3-003 + ENH-030 schema_emit_register — appends a NUL-terminated schema-name pointer at slot schema_count. Silently no-ops past SCHEMA_MAX (=8) so a consumer that over-registers surfaces the miss via get_count() vs its call count rather than as a run-time fault. Leaf; r11 lea scratch; rax as spec_count/scratch. The MAX-check uses cmp rax, 8 (well ≤ 0x7FFFFFFF). ENH-030 renames the exported symbol from `register` to `schema_emit_register` to end the multi-module link collision — body byte-identical.",
       block: {
         lea r11, [rip + schema_count];
         mov rax, [r11];

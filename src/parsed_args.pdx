@@ -12,7 +12,18 @@ module ParsedArgs = structure {
   pub let ERR_OK                : u64 = 0
   pub let ERR_FLAG_OVERFLOW     : u64 = 1
   pub let ERR_POS_OVERFLOW      : u64 = 2
-  pub let ERR_UNKNOWN_ARG_FORM  : u64 = 3   // reserved; not currently set
+  // ENH-026 (libpdx-argv.ENH-026, wired 2026-09-02): argv slot is
+  // neither flag-shaped (starts with '-' AND has at least one byte
+  // after) NOR a valid positional (does NOT start with '-' AND is
+  // non-empty). Concrete triggers today:
+  //   - empty argv slot (""), and
+  //   - bare "-" (starts with '-', nothing after — not a flag; also
+  //     not treated as a positional under ENH-026 semantics).
+  // Bare "--" is out of scope: it is the M2-003 positional-sentinel
+  // and continues to set ddash_seen (see Parser::parse_argv). Slots
+  // that appear after the sentinel are always positional and never
+  // reach the malformed classifier.
+  pub let ERR_UNKNOWN_ARG_FORM  : u64 = 3   // malformed argv slot (ENH-026)
   pub let ERR_CLUSTERED_SHORT   : u64 = 4   // set by M1-002 for -la et al
   pub let ERR_LONG_MISSING_NAME : u64 = 5   // "--" or "--=foo"
   // Added by M2-001 (typed flags):
@@ -68,14 +79,21 @@ module ParsedArgs = structure {
   pub let mut ddash_seen        : u64       = uninit @align(8)
   pub let mut ddash_arg_index   : u64       = uninit @align(8)
 
-  // reset() — clear the M1 + M2 bookkeeping slots.
+  // parsed_args_reset() — clear the M1 + M2 bookkeeping slots.
   // The flag_names / flag_values / flag_ids / flag_kinds / pos_ptrs
   // arrays are consumed by index up to flag_count / pos_count, so
   // stale trailing entries are unreachable and do not need zeroing.
-  pub let reset : () -> () !{mem} @{} =
+  //
+  // libpdx-argv.ENH-030 (Wave 2 rename): this used to be `reset`;
+  // renamed to `parsed_args_reset` because three sibling modules
+  // (FlagSpec, SchemaEmit) each shipped their own `reset` and every
+  // real consumer links at least two of them together, producing a
+  // fatal `multiple definition of 'reset'` at link time. Per-module
+  // prefix ends the collision at the source level.
+  pub let parsed_args_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M1-001 + M2 additions: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count.",
+      justification: "libpdx-argv.M1-001 + M2 additions + ENH-030 rename: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count. ENH-030 renames the exported symbol from `reset` to `parsed_args_reset` to end the multi-module link collision — body byte-identical.",
       block: {
         xor rax, rax;                            // rax = 0
         lea r11, [rip + flag_count];      mov [r11], rax;
@@ -97,10 +115,25 @@ module ParsedArgs = structure {
   //   if k != 32 { ... --help was seen ... }
   //
   // Signature: (u64) -> u64 !{mem} @{}
-  // rdi (in)  = target id (0 = "no id / unregistered" — never matches
-  //             registered flags, so passing 0 always returns 32)
-  // rax (out) = k (0..flag_count-1) if a flag with that id was stored;
-  //             else 32 (== MAX_FLAGS).
+  // rdi (in)  = target id (0 = "no id / unregistered" — this scan
+  //             SKIPS any slot whose flag_ids[k] is 0, so passing 0
+  //             ALWAYS returns 32 regardless of how many unregistered
+  //             flags are in the record; see ENH-024)
+  // rax (out) = k (0..flag_count-1) if a flag with a NONZERO id
+  //             matching rdi was stored; else 32 (== MAX_FLAGS).
+  //
+  // ENH-024 rationale (libpdx-argv.ENH-024): permissive mode stores
+  // an unregistered flag with flag_ids[k] = 0 (parser.pdx sets
+  // r15 = rdx from FlagSpec::lookup, and lookup returns id=0 for
+  // FKIND_UNKNOWN). Before ENH-024 the scan below matched any slot
+  // whose id equalled the caller-supplied rdi, INCLUDING id==0 slots
+  // when the caller passed 0 — which contradicted the "passing 0
+  // always returns 32" contract in the docstring. Skipping id==0
+  // slots restores the contract without changing behaviour for any
+  // caller passing a legitimate (nonzero) id: id 0 is reserved for
+  // "unregistered" in the FlagSpec id-space (per StdVocab: standard
+  // vocabulary is 1..9, tool-specific ids start at 100), so no
+  // registered flag can have id==0 to be legitimately looked up.
   //
   // Duplicate-flag policy (libpdx-argv.ENH-008): every occurrence of a
   // repeated flag gets its own slot (Parser::parse_argv never
@@ -125,7 +158,7 @@ module ParsedArgs = structure {
   pub let find_flag_by_id : (u64) -> u64 !{mem} @{} =
     fn (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-002 find_flag_by_id — linear scan over the flag_ids table returning the storage index k, or MAX_FLAGS (=32) if the id was never registered against a seen flag. Leaf; only caller-save regs used. r8 hoists the flag_ids base so the loop body issues one indexed load per probe. Return uses `mov rax, 32` which fits ≤ 0x7FFFFFFF trivially. Never faults: the loop bound (flag_count, read once at head) is ≤ MAX_FLAGS by construction (Parser enforces the cap before every write into flag_ids).",
+      justification: "libpdx-argv.M2-002 + ENH-024 find_flag_by_id — linear scan over the flag_ids table returning the storage index k, or MAX_FLAGS (=32) if the id was never registered against a seen flag. ENH-024 adds an id==0 skip inside the loop body: permissive-mode unregistered flags land in flag_ids[k] with id==0 (parser.pdx line ~196 stores r15=rdx from FlagSpec::lookup, and lookup returns id=0 for FKIND_UNKNOWN), and the pre-ENH-024 scan would erroneously match such a slot if the caller passed 0 as the target id — contradicting the 'passing 0 returns MAX_FLAGS' docstring contract. Behaviour for any legitimate (nonzero) target is unchanged: registered ids are ≥ 1 (StdVocab 1..9; tool-specific ≥ 100), so a nonzero rdi never compares equal to an id==0 slot anyway; the skip is defensively correct. Leaf; only caller-save regs used. r8 hoists the flag_ids base so the loop body issues one indexed load per probe. Return uses `mov rax, 32` which fits ≤ 0x7FFFFFFF trivially. Never faults: the loop bound (flag_count, read once at head) is ≤ MAX_FLAGS by construction (Parser enforces the cap before every write into flag_ids).",
       block: {
         xor rcx, rcx;                            // rcx = i = 0
         lea r11, [rip + flag_count];
@@ -137,9 +170,12 @@ module ParsedArgs = structure {
         jge ffbi_not_found;
 
         mov rdx, [r8 + rcx*8];                   // rdx = flag_ids[i]
+        cmp rdx, 0;                              // ENH-024: skip unregistered
+        je ffbi_skip;
         cmp rdx, rdi;
         je ffbi_found;
 
+      ffbi_skip:
         add rcx, 1;
         jmp ffbi_loop;
 
@@ -153,10 +189,15 @@ module ParsedArgs = structure {
       }
     }
 
-  // find_last_flag_by_id(id) -> k   [libpdx-argv.ENH-008]
-  //   rdi (in)  = target id
+  // find_last_flag_by_id(id) -> k   [libpdx-argv.ENH-008 + ENH-024]
+  //   rdi (in)  = target id (0 = "no id / unregistered" — this scan
+  //               SKIPS id==0 slots, so passing 0 ALWAYS returns 32
+  //               regardless of how many unregistered flags are
+  //               stored; see ENH-024 on find_flag_by_id above for
+  //               the full rationale)
   //   rax (out) = k of the HIGHEST-indexed (last-parsed) flag with
-  //               that id, or MAX_FLAGS (=32) if none.
+  //               a NONZERO id matching rdi, or MAX_FLAGS (=32) if
+  //               none.
   //
   // Last-wins companion to find_flag_by_id: scans downward from
   // flag_count-1 so a later occurrence of a repeated flag always
@@ -172,7 +213,7 @@ module ParsedArgs = structure {
   pub let find_last_flag_by_id : (u64) -> u64 !{mem} @{} =
     fn (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.ENH-008 find_last_flag_by_id — downward linear scan over flag_ids returning the highest-indexed match (last-wins), or MAX_FLAGS (=32) if the id was never stored. Leaf; only caller-save regs used. Mirrors find_flag_by_id's O(MAX_FLAGS) shape and MAX_FLAGS sentinel exactly, differing only in scan direction — the two functions are deliberately symmetric so a reader who understands one understands the other.",
+      justification: "libpdx-argv.ENH-008 + ENH-024 find_last_flag_by_id — downward linear scan over flag_ids returning the highest-indexed match (last-wins), or MAX_FLAGS (=32) if the id was never stored. ENH-024 skips id==0 slots (permissive-mode unregistered flags) inside the loop for the same reason as find_flag_by_id: id 0 is reserved as the 'unregistered' sentinel in the FlagSpec id-space, so the skip is behaviour-preserving for any legitimate (nonzero) target and closes the pre-ENH-024 hole where passing 0 would erroneously match an unregistered slot. Leaf; only caller-save regs used. Mirrors find_flag_by_id's O(MAX_FLAGS) shape and MAX_FLAGS sentinel exactly, differing only in scan direction — the two functions are deliberately symmetric so a reader who understands one understands the other.",
       block: {
         lea r11, [rip + flag_count];
         mov rcx, [r11];                          // rcx = flag_count
@@ -184,6 +225,8 @@ module ParsedArgs = structure {
 
         sub rcx, 1;                              // rcx = k (highest unvisited index)
         mov rdx, [r8 + rcx*8];                    // rdx = flag_ids[k]
+        cmp rdx, 0;                              // ENH-024: skip unregistered
+        je flfbi_loop;
         cmp rdx, rdi;
         je flfbi_found;
 
@@ -199,10 +242,14 @@ module ParsedArgs = structure {
       }
     }
 
-  // count_flag_by_id(id) -> u64   [libpdx-argv.ENH-008]
-  //   rdi (in)  = target id
+  // count_flag_by_id(id) -> u64   [libpdx-argv.ENH-008 + ENH-024]
+  //   rdi (in)  = target id (0 = "no id / unregistered" — this scan
+  //               SKIPS id==0 slots, so passing 0 ALWAYS returns 0
+  //               regardless of how many unregistered flags are
+  //               stored; see ENH-024 on find_flag_by_id above for
+  //               the full rationale)
   //   rax (out) = number of stored flags whose flag_ids[k] == id
-  //               (0 if never seen)
+  //               AND flag_ids[k] != 0 (0 if never seen)
   //
   // For the repeat-count idiom (`-v -v -v` raising verbosity by 3
   // steps) where a consumer needs "how many times", not "which slot".
@@ -217,7 +264,7 @@ module ParsedArgs = structure {
   pub let count_flag_by_id : (u64) -> u64 !{mem} @{} =
     fn (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.ENH-008 count_flag_by_id — full linear scan over flag_ids tallying every match. Leaf; only caller-save regs used. Unlike find_flag_by_id/find_last_flag_by_id this never early-exits (every slot must be inspected to count them all), so it is always O(flag_count) rather than best-case O(1).",
+      justification: "libpdx-argv.ENH-008 + ENH-024 count_flag_by_id — full linear scan over flag_ids tallying every match. ENH-024 skips id==0 slots (permissive-mode unregistered flags) so that passing 0 as the target returns 0, not the number of unregistered flags in the record; behaviour-preserving for any legitimate (nonzero) target because id 0 is reserved as the 'unregistered' sentinel in the FlagSpec id-space. Leaf; only caller-save regs used. Unlike find_flag_by_id/find_last_flag_by_id this never early-exits (every slot must be inspected to count them all), so it is always O(flag_count) rather than best-case O(1).",
       block: {
         xor rax, rax;                            // rax = count = 0
         xor rcx, rcx;                            // rcx = i = 0
@@ -230,6 +277,8 @@ module ParsedArgs = structure {
         jge cfbi_done;
 
         mov rdx, [r8 + rcx*8];                    // rdx = flag_ids[i]
+        cmp rdx, 0;                               // ENH-024: skip unregistered
+        je cfbi_advance;
         cmp rdx, rdi;
         jne cfbi_advance;
         add rax, 1;

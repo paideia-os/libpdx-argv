@@ -4,7 +4,162 @@ All notable changes to `libpdx-argv` are recorded here. The format is
 loosely modelled on Keep-a-Changelog, adapted to the PaideiaOS milestone
 rubric in `design/tooling/r49-r50-plan.md` §5.
 
-## Unreleased — ENH-012..ENH-029 tranche (post-1.1)
+## 1.1.0 — 2026-09-02
+
+Post-1.0 enhancement tranche. Groups Wave 1 (`ENH-022` / `ENH-023` /
+`ENH-029`, closed earlier this pass) with Wave 2 (`ENH-030`, closed
+today) — pulled forward from the deferred post-1.1 slot after
+`ENH-030` surfaced as the blocker every downstream P0-tool link hit.
+Also folds forward the `ENH-024` (find_flag_by_id 0-skip) and
+`ENH-026` (wire ERR_UNKNOWN_ARG_FORM) fixes and the `ENH-012`
+witness closure that had been sitting in Unreleased.
+
+Wave grouping (in ENH-order for the SemVer diff table):
+
+  Wave 1 (test/scaffolding — no source ABI change):
+    ENH-022 #32  rename test modules to *Tests
+    ENH-023 #33  qualify smoke-driver cross-module call sites
+    ENH-029 #39  scaffold pkgs/consumers.list
+
+  Wave 2 (source ABI change — cross-module symbol rename):
+    ENH-030 #40  rename module-scope colliding exports (reset, register)
+
+  Correctness fixes (behaviour-preserving except case10 regrade):
+    ENH-024 #34  find_flag_by_id(0) skips unregistered slots
+    ENH-026 #36  wire ERR_UNKNOWN_ARG_FORM (3) real path
+
+  Documentation/witness closures:
+    ENH-012 #22  --foo=bar / --foo bar equals-form witness
+
+The 1.1.0 line is the coordination point for downstream repos:
+consumers that pinned 1.0.0 keep working; consumers that bump to
+1.1.0 update their bare-name call sites to the new mangled
+`parsed_args_reset` / `flag_spec_reset` / `flag_spec_register` /
+`schema_emit_reset` / `schema_emit_register` names once, and
+subsequently link cleanly against every other consumer of the same
+library on the same link line — the previous multi-`reset` /
+multi-`register` link error is definitively gone.
+
+### ENH-030 — Rename module-scope colliding exports (Closes #40)
+
+Every real consumer of `libpdx-argv` links at least two of
+`parsed_args.o`, `flag_spec.o`, `schema_emit.o` on the same link
+line. Pre-fix, each of those objects defined a global `reset` (three
+strong `T` symbols with the same name), and `flag_spec.o` + `schema_emit.o`
+each defined a global `register` (two more). `ld -r libpdx-argv/build-out/{parsed_args,flag_spec,schema_emit}.o`
+failed with:
+
+    multiple definition of 'reset';   ... first defined here
+    multiple definition of 'register'; ... first defined here
+
+which is exactly what the satellite adoption preflight hit. The
+in-tree `tests/harness.pdx::full_reset` also relied on this and
+issued three bare `call reset;` instructions — a real bug, because
+the linker collapses those three sites onto the single winning
+`reset` symbol and only ONE of the three modules ever got its state
+cleared per test case (which one depended on link order). Wave 1
+worked around this at the test-module boundary but did not touch
+the library-side exports; ENH-030 fixes it at the source of the
+collision by giving every exported function a per-module prefix:
+
+  ParsedArgs::reset      -> parsed_args_reset
+  FlagSpec::reset        -> flag_spec_reset
+  FlagSpec::register     -> flag_spec_register
+  SchemaEmit::reset      -> schema_emit_reset
+  SchemaEmit::register   -> schema_emit_register
+
+The three `reset` / two `register` bodies are byte-identical
+across the rename. The internal overflow label in `flag_spec.pdx`
+(`register_full`) is also renamed to `flag_spec_register_full` —
+that label was already local, so this is defensive against a
+future cross-object jump-label collision, not a fix for an
+observable one.
+
+Call-site updates (all in-tree; consumers update in their own
+repos as they bump their libpdx-argv pin):
+
+  - src/std_vocab.pdx           7× `call register` → `call flag_spec_register`
+  - tests/harness.pdx           3× `call reset` → the three explicit `_reset` names
+                                (fixes the "only one state actually cleared" bug)
+  - tests/schema_emit_tests.pdx `call reset` / `call register` → `call schema_emit_*`
+  - tests/parse_typed_args_tests.pdx / parse_grammar_tests.pdx
+                                `call register` (3-arg FlagSpec) → `call flag_spec_register`
+
+Post-rename symbol audit:
+
+  $ nm -g build-out/{parsed_args,flag_spec,schema_emit,parser,schema_invoke,std_vocab,typed,help_backend}.o \
+      | awk '$2=="T"{print $3}' | sort | uniq -d
+  (empty)
+
+Downstream signal that confirms the mangling was planned in
+advance: `paideia-satellites/ls/src/argv_surface.pdx:263` already
+references `parsed_args_reset` as an unresolved external. With
+ENH-030 landed that reference resolves.
+
+### ENH-024 — `find_flag_by_id(0)` skips unregistered slots (Closes #34)
+
+Under permissive mode (`FlagSpec::strict_mode == 0`, the default),
+`Parser::parse_argv` stores an unregistered flag with `flag_ids[k] = 0`
+(the sentinel `FlagSpec::lookup` returns for `FKIND_UNKNOWN`). The
+pre-fix scans in `ParsedArgs::find_flag_by_id`,
+`ParsedArgs::find_last_flag_by_id`, and `ParsedArgs::count_flag_by_id`
+matched any slot whose id equalled the caller-supplied `rdi` — so
+passing `0` returned the unregistered slot's index (or its tally),
+contradicting the "passing 0 returns MAX_FLAGS / count of 0" contract
+in the finders' own docstrings.
+
+Fix: insert a `cmp rdx, 0; je <skip>` inside every scan loop so an
+id==0 slot is never matched, regardless of the caller's target id.
+Behaviour is preserved for any legitimate target: id 0 is reserved
+as the "unregistered" sentinel in the `FlagSpec` id-space (StdVocab
+occupies 1..9; tool-specific ids start at 100), so no registered
+flag can have id==0 to be legitimately looked up. Docstrings on all
+three functions are updated to explicitly document the skip and
+its rationale; the `ERR_UNKNOWN_ARG_FORM` comment in
+`src/parsed_args.pdx` is unrelated (see ENH-026 below).
+
+New regression coverage: `tests/parse_grammar_tests.pdx` cases 21-23
+(one per finder function; smoke driver wired). Each parses a
+mixed argv where a registered flag (`--verbose`, id=6) sits beside
+one or more unregistered flags, then asserts the finder returns
+the not-found sentinel for target 0 while still resolving the
+registered flag correctly.
+
+### ENH-026 — Wire `ERR_UNKNOWN_ARG_FORM` (3) real path (Closes #36)
+
+`ParsedArgs::ERR_UNKNOWN_ARG_FORM = 3` had been declared since M1
+but marked "reserved; not currently set". This wave wires a real
+firing path in `Parser::parse_argv`: an argv slot is now rejected
+with error code 3 (and `error_arg_index = the offending index`)
+when it fits neither the flag grammar nor the positional grammar.
+Concrete triggers today:
+
+  - empty string `""` argv slot (byte0 == NUL);
+  - bare `-` (byte0 == '-', byte1 == NUL).
+
+Bare `--` is UNCHANGED — it remains the M2-003 positional sentinel
+(`ddash_seen` is set and every subsequent argv slot goes to
+`pos_ptrs` regardless of leading byte). Slots that appear after
+`--` are always positional and never reach the malformed
+classifier, so an empty `""` or bare `-` AFTER `--` is stored as
+a positional (unchanged pre-ENH-026 behaviour).
+
+Behaviour change for bare `-`: pre-ENH-026 `case10` in
+`tests/parse_grammar_tests.pdx` documented the fixture as "bare '-'
+is positional (matches the stdin convention)". ENH-026 reclassifies
+it as malformed. Tools that want the stdin idiom must filter argv
+upstream or register a tool-specific short-name for stdin. Case 10
+is updated to expect `ERR_UNKNOWN_ARG_FORM` (=3) with
+`error_arg_index=0` and `flag_count==pos_count==0`; the module
+docstring `.section FLAG GRAMMAR` in `doc/libpdx-argv.pdxdoc`
+records the change explicitly.
+
+New regression coverage: `tests/parse_grammar_tests.pdx` case 24
+(empty string `""` triggers ERR_UNKNOWN_ARG_FORM). Case 10 is now
+also part of the ENH-026 witness set. `doc/libpdx-argv.pdxdoc` §237
+is rewritten from "reserved; no code path returns it yet" to the
+concrete trigger list, and the README error-code line for code 3 is
+updated to name ENH-026.
 
 ### ENH-022 — Rename test modules to `*Tests` (Closes #32)
 

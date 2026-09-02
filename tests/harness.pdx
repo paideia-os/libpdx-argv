@@ -20,8 +20,8 @@
 // ---------------------
 //   - Module TestHarness (PascalCase basename).
 //   - record_pass / record_fail are leaf; r11 lea scratch.
-//   - full_reset is non-leaf (calls ParsedArgs::reset + FlagSpec::reset
-//     + SchemaEmit::reset); 1-push prologue (rbx, unused) aligns
+//   - full_reset is non-leaf (calls parsed_args_reset + flag_spec_reset
+//     + schema_emit_reset); 1-push prologue (rbx, unused) aligns
 //     rsp%16 to 0 for the three nested calls.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 //   - Every cmp reg, imm ≤ 0x7FFFFFFF.
@@ -120,9 +120,9 @@ module Harness = structure {
   //
   // Consumer usage (per test case):
   //   TestHarness::full_reset()
-  //   FlagSpec::register(...)              // per-test registrations
+  //   flag_spec_register(...)              // per-test registrations
   //   ...prepare argv...
-  //   let err = Parser::parse_argv(argv, argc)
+  //   let err = parse_argv(argv, argc)
   //   ...assert on ParsedArgs...
   //   TestHarness::record_pass() OR TestHarness::record_fail(tag)
   //
@@ -131,13 +131,13 @@ module Harness = structure {
   pub let full_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M4-001 TestHarness::full_reset — sequences ParsedArgs::reset + FlagSpec::reset + SchemaEmit::reset so the next fixture starts from known-clean state. Non-leaf; 1-push (rbx) aligns rsp%16 to 0 for the three nested calls. The tally counters are intentionally not touched — reset_tally is a separate call so tests can advance the tally across multiple full_reset boundaries.",
+      justification: "libpdx-argv.M4-001 + ENH-030 TestHarness::full_reset — sequences parsed_args_reset + flag_spec_reset + schema_emit_reset so the next fixture starts from known-clean state. Pre-ENH-030 this issued three bare `call reset;` instructions, which only worked because each object had its own `reset` symbol — link-time collision was the whole point of ENH-030. Post-rename the three calls are explicit and every reset is reachable by name from any object on the link line. Non-leaf; 1-push (rbx) aligns rsp%16 to 0 for the three nested calls. The tally counters are intentionally not touched — reset_tally is a separate call so tests can advance the tally across multiple full_reset boundaries.",
       block: {
         push rbx;
 
-        call reset;
-        call reset;
-        call reset;
+        call parsed_args_reset;
+        call flag_spec_reset;
+        call schema_emit_reset;
 
         pop rbx;
         ret;

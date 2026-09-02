@@ -1,7 +1,7 @@
 .pdxdoc-version 1
 .tool           libpdx-argv
 .kind           library
-.version        1.0.0
+.version        1.1.0
 .author         paideia-os-team
 .wave           R49
 .summary        CLI argument parsing (long primary, short one-per-hyphen)
@@ -15,16 +15,24 @@ libpdx-argv - argv parser for PaideiaOS tools
     #include this library in a tool's link line via `deps.list`
     then, at _start:
 
-        FlagSpec::reset()
-        StdVocab::register_all()
-        FlagSpec::register(<tool-flag-name>, <kind>, <id>)
+        flag_spec_reset()
+        register_all()                                        // StdVocab
+        flag_spec_register(<tool-flag-name>, <kind>, <id>)
         ...
-        ParsedArgs::reset()
-        let err = Parser::parse_argv(argv, argc)
+        parsed_args_reset()
+        let err = parse_argv(argv, argc)
 
     or, when invoked through a semantic pipe:
 
-        let err = SchemaInvoke::parse_from_schema_record(rec_ptr, rec_len)
+        let err = parse_from_schema_record(rec_ptr, rec_len)
+
+    ENH-030 (v1.1.0) renamed three previously-colliding globals:
+    `ParsedArgs::reset`   -> parsed_args_reset
+    `FlagSpec::reset`     -> flag_spec_reset
+    `FlagSpec::register`  -> flag_spec_register
+    `SchemaEmit::reset`   -> schema_emit_reset
+    `SchemaEmit::register`-> schema_emit_register
+    Pre-1.1 call sites that still use the bare names will not link.
 
 .section DESCRIPTION
 libpdx-argv turns a `_start`-time argv (or an equivalent
@@ -51,7 +59,13 @@ The R49 grammar is fixed (see D3 in `design/tooling/plan.md`):
   --foo=bar         long flag with inline value
   -x                single-letter short flag (one per hyphen)
   --                sentinel; all remaining tokens are positional
-  -                 bare hyphen; positional (stdin convention)
+  -                 bare hyphen; REJECTED with ERR_UNKNOWN_ARG_FORM
+                     (`libpdx-argv.ENH-026`). Tools that want the
+                     stdin idiom must filter argv or register a
+                     tool-specific stdin flag; the parser no longer
+                     silently accepts `-` as a positional.
+  ""                empty argv slot; REJECTED with ERR_UNKNOWN_ARG_FORM
+                     (`libpdx-argv.ENH-026`).
 
 .section BREAKS WITH POSIX
 Clustered short flags (`-la`, `-abc`) are REJECTED with error
@@ -62,7 +76,7 @@ consume an argument (e.g. `-n 5` in `head`). See D3 for the full
 rationale.
 
 Long flags may accept a `=` separator OR a lookahead token, at
-the tool's choice per `FlagSpec::register` kind. The `:` separator
+the tool's choice per `flag_spec_register` kind. The `:` separator
 is reserved for `--no-cap:<name>` (I3-vocabulary) and for future
 namespaced-flag forms; consumer tools may not repurpose it.
 
@@ -109,7 +123,7 @@ accepts `--color auto` or `--no-cap KIND_TTY` as a lookahead form —
 only the inline spellings shown above. `--color file.txt` fails
 `ERR_MISSING_VALUE` rather than swallowing `file.txt` as the colour
 mode. A tool's own lookahead-permitted typed flags (registered via
-the plain `FlagSpec::register`) are unaffected.
+the plain `flag_spec_register`) are unaffected.
 
 .section TYPED FLAG ARGUMENTS
 `Typed::parse_int_u64` / `parse_size` / `parse_timespan` decode
@@ -169,10 +183,10 @@ loader-supplied cap chain decides whether the doc invocation is
 permitted.
 
 .section --SCHEMA
-`SchemaEmit::register(schema_name_ptr)` at init lets a tool
+`schema_emit_register(schema_name_ptr)` at init lets a tool
 publish which schemas it emits on stdout under normal operation.
 `--schema` is ordinary `StdVocab` id 5 (see STANDARD FLAGS above)
-— `Parser::parse_argv` stores it like any other registered flag;
+— `parse_argv` stores it like any other registered flag;
 it does not intercept it specially. The consumer's dispatch loop
 checks `ParsedArgs::find_flag_by_id(StdVocab::STD_ID_SCHEMA)`,
 and on a hit walks `SchemaEmit::get_count` / `SchemaEmit::get_name`
@@ -234,11 +248,17 @@ whole-buffer header failure.
                                      silently accepted as boolean
                                      unless strict mode is enabled.)
 
-`ERR_UNKNOWN_ARG_FORM` (3) is reserved in `parsed_args.pdx` but no
-code path returns it yet. Typed-decode failures (`Typed::parse_*`
-returning `ok == 0`) do not set `error_code` at all — see TYPED FLAG
-ARGUMENTS above — and the schema-record path's only failure codes
-are the four listed above; no other constant exists for it.
+`ERR_UNKNOWN_ARG_FORM` (3) fires when an argv slot is neither
+flag-shaped (starts with `-` AND has at least one byte after) NOR a
+valid positional (does NOT start with `-` AND is non-empty)
+(`libpdx-argv.ENH-026`). Concrete triggers today: an empty string
+`""` argv slot, and bare `-`. Bare `--` remains the M2-003
+positional sentinel (unchanged) and does not fire this code. Slots
+that appear after the `--` sentinel are always positional and never
+reach the malformed classifier. Typed-decode failures
+(`Typed::parse_*` returning `ok == 0`) do not set `error_code` at
+all — see TYPED FLAG ARGUMENTS above — and the schema-record path's
+only failure codes are the four listed above.
 
 This library does not itself call `exit` or prescribe a process exit
 status for any code above — mapping `ParsedArgs::error_code` to a

@@ -22,14 +22,21 @@ real and, on the text-CLI side, complete:
 
 | Module | Entry points | State |
 |---|---|---|
-| `ParsedArgs` | `reset`, `find_flag_by_id` + 13 storage slots + 10 `ERR_*` | implemented |
-| `FlagSpec` | `reset`, `register`, `lookup` | implemented |
+| `ParsedArgs` | `parsed_args_reset`, `find_flag_by_id` + 13 storage slots + 10 `ERR_*` | implemented |
+| `FlagSpec` | `flag_spec_reset`, `flag_spec_register`, `register_sep`, `set_strict`, `lookup` | implemented |
 | `Parser` | `parse_argv` | implemented |
 | `Typed` | `parse_int_u64`, `parse_size`, `parse_timespan` | implemented |
 | `StdVocab` | `register_all` + 9 ids + 9 `.rodata` names | implemented |
 | `SchemaInvoke` | `parse_from_schema_record` | implemented, **unvalidated** (§2.1) |
 | `HelpBackend` | `DOC_TOOL_NAME`, `fill_doc_argv` | implemented |
-| `SchemaEmit` | `reset`, `register`, `get_count`, `get_name` | implemented |
+| `SchemaEmit` | `schema_emit_reset`, `schema_emit_register`, `get_count`, `get_name` | implemented |
+
+**ENH-030 (Wave 2, 2026-09-02):** Three modules (`ParsedArgs`,
+`FlagSpec`, `SchemaEmit`) each shipped an unmangled `reset` and two
+shipped an unmangled `register`. Linking any pair together produced a
+fatal `multiple definition of 'reset'` / `... 'register'`, blocking
+every real consumer (all 6 P0 tools link at least two of the three
+modules). Table above records the post-rename mangled names.
 
 No `TODO`/`FIXME`/stub markers survive in `src/`. The argv state machine,
 the `FlagSpec`-driven arity decision (the cat-M1 fix), the `--` sentinel,
