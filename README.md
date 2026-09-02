@@ -192,6 +192,11 @@ repo for pipe schema definitions. The decoder here is self-contained:
 
 ## Callers
 
+Authoritative machine-readable list: [`pkgs/consumers.list`](pkgs/consumers.list)
+(scaffolded by `libpdx-argv.ENH-029`, 2026-09-02). This section mirrors
+that list in prose; keep the two in sync in every commit that adds or
+removes a consumer.
+
 Verified (`libpdx-argv.ENH-011`, 2026-08-25) by grepping each tool's own
 `src/` for a call into this library's symbols (`parse_argv`,
 `parsed_args_reset`, `register_all`, `parse_from_schema_record`,

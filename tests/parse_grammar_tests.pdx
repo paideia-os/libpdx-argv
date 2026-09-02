@@ -43,7 +43,7 @@
 //   - Byte loads use xor rax, rax; mov_b rax, [ptr] per #1248.
 //   - r11 lea scratch (cross-module .bss).
 
-module ParseGrammar = structure {
+module ParseGrammarTests = structure {
 
   // -- Fail-tag helpers: (1 << 32) | case_number. Encoded as literal
   // -- constants so record_fail's `mov rdi, TAG` fits imm32 for

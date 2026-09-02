@@ -24,7 +24,7 @@
 //     record_pass (which clobbers rdx).
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module ParseTypedValues = structure {
+module ParseTypedValuesTests = structure {
 
   // -- Fixture bytestrings (all NUL-terminated) --
   pub let f_int_zero    : [u8; 2]  = "0\0"

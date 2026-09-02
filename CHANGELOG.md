@@ -4,7 +4,64 @@ All notable changes to `libpdx-argv` are recorded here. The format is
 loosely modelled on Keep-a-Changelog, adapted to the PaideiaOS milestone
 rubric in `design/tooling/r49-r50-plan.md` §5.
 
-## Unreleased — ENH-012..ENH-021 tranche (post-1.1)
+## Unreleased — ENH-012..ENH-029 tranche (post-1.1)
+
+### ENH-022 — Rename test modules to `*Tests` (Closes #32)
+
+Test-side rename only; no behavior change. Every test module under
+`tests/` that previously shared a `PascalCase` name with its production
+counterpart under `src/` is renamed to `<Name>Tests` to eliminate the
+module-namespace collision:
+
+  - `tests/parse_grammar.pdx`       — `ParseGrammar`       → `ParseGrammarTests`
+  - `tests/parse_typed_values.pdx`  — `ParseTypedValues`   → `ParseTypedValuesTests`
+  - `tests/parse_typed_args.pdx`    — `ParseTypedArgs`     → `ParseTypedArgsTests`
+  - `tests/parse_std_vocab.pdx`     — `ParseStdVocab`      → `ParseStdVocabTests`
+  - `tests/parse_schema_record.pdx` — `ParseSchemaRecord`  → `ParseSchemaRecordTests`
+  - `tests/help_backend.pdx`        — `HelpBackend`        → `HelpBackendTests`
+  - `tests/schema_emit.pdx`         — `SchemaEmit`         → `SchemaEmitTests`
+
+`tests/README.md` §Layout and `design/architecture.md` §11.2 already
+carried the `*Tests` names ahead of code (documented in the ENH-022
+audit); this change brings the source into line with the docs.
+`tests/harness.pdx` (`Harness`) and `tests/smoke_driver.pdx`
+(`SmokeDriver`) do not collide and are untouched.
+
+### ENH-023 — Qualify smoke-driver cross-module call sites (Closes #33)
+
+`tests/smoke_driver.pdx` `_start` previously issued ~65 unqualified
+`call run_caseN` (and `call run_all_9` / `call run_ids_unique`)
+instructions. Six different test modules each declare `pub let
+run_case1`, so the calls were ambiguous at link time. Every
+cross-module call in the smoke driver is now fully qualified:
+
+  - `call run_case1..20`   → `call ParseGrammarTests::run_case1..20`
+  - `call run_case1..24`   → `call ParseTypedValuesTests::run_case1..24`
+  - `call run_case1..5`    → `call ParseTypedArgsTests::run_case1..5`
+  - `call run_all_9`       → `call ParseStdVocabTests::run_all_9`
+  - `call run_ids_unique`  → `call ParseStdVocabTests::run_ids_unique`
+  - `call run_case1..10`   → `call ParseSchemaRecordTests::run_case1..10`
+  - `call run_case1..3`    → `call HelpBackendTests::run_case1..3`
+  - `call run_case1..5`    → `call SchemaEmitTests::run_case1..5`
+  - `call reset_tally`     → `call Harness::reset_tally`
+  - `call exit`            → `call SysExit::exit`
+
+`SysExit::exit` remains a link-time symbol supplied by the smoke-binary
+wiring layer (see ENH-007 / #14). Cross-module unqualified calls that
+remain inside individual test-module bodies (`call record_pass`,
+`call record_fail`, `call full_reset`, plus src-module calls such as
+`call parse_argv` and `call lookup`) are out of scope for this wave
+and will be addressed together with the ENH-007 runnable-smoke wiring.
+
+### ENH-029 — Scaffold `pkgs/consumers.list` (Closes #39)
+
+New file `pkgs/consumers.list` enumerates the 6 verified downstream
+callers (pkg, ls, cp, mkdir, mv, rm) with per-consumer symbol
+summaries. Data is derived from the ENH-011 audit already documented
+in `README.md` §Callers; the README §Callers preamble now names
+`pkgs/consumers.list` as the authoritative machine-readable source and
+declares itself the prose mirror. No downstream consumer is added or
+removed by this change.
 
 ### ENH-012 — `--foo=bar` / `--foo bar` equals-form witness (Closes #22)
 

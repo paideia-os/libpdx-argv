@@ -25,7 +25,7 @@
 //   - run_* fns non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module ParseTypedArgs = structure {
+module ParseTypedArgsTests = structure {
 
   // FlagSpec name literals (NUL-term).
   pub let name_older_than : [u8; 11] = "older-than\0"

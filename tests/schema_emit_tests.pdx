@@ -17,7 +17,7 @@
 //   - run_* fns non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module SchemaEmit = structure {
+module SchemaEmitTests = structure {
 
   // Sample schema-name literals (NUL-term). Consumers would supply
   // real-shape names like "PackageManifest@0.1\0"; here we only need

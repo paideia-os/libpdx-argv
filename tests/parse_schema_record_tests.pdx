@@ -45,7 +45,7 @@
 //     needed for non-ASCII bytes (magic + version + counts qwords).
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module ParseSchemaRecord = structure {
+module ParseSchemaRecordTests = structure {
 
   // ============================================================
   // Case 1 — Happy path.

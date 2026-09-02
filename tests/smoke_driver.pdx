@@ -53,90 +53,90 @@ module SmokeDriver = structure {
         push rbx;
 
         // Zero the tally counters. All test modules increment them.
-        call reset_tally;
+        call Harness::reset_tally;
 
         // --- ParseGrammarTests (module id 1) ------------------------
-        call run_case1;
-        call run_case2;
-        call run_case3;
-        call run_case4;
-        call run_case5;
-        call run_case6;
-        call run_case7;
-        call run_case8;
-        call run_case9;
-        call run_case10;
-        call run_case11;
-        call run_case12;
-        call run_case13;
-        call run_case14;
-        call run_case15;
-        call run_case16;
-        call run_case17;
-        call run_case18;
-        call run_case19;
-        call run_case20;
+        call ParseGrammarTests::run_case1;
+        call ParseGrammarTests::run_case2;
+        call ParseGrammarTests::run_case3;
+        call ParseGrammarTests::run_case4;
+        call ParseGrammarTests::run_case5;
+        call ParseGrammarTests::run_case6;
+        call ParseGrammarTests::run_case7;
+        call ParseGrammarTests::run_case8;
+        call ParseGrammarTests::run_case9;
+        call ParseGrammarTests::run_case10;
+        call ParseGrammarTests::run_case11;
+        call ParseGrammarTests::run_case12;
+        call ParseGrammarTests::run_case13;
+        call ParseGrammarTests::run_case14;
+        call ParseGrammarTests::run_case15;
+        call ParseGrammarTests::run_case16;
+        call ParseGrammarTests::run_case17;
+        call ParseGrammarTests::run_case18;
+        call ParseGrammarTests::run_case19;
+        call ParseGrammarTests::run_case20;
 
         // --- ParseTypedValuesTests (module id 2) --------------------
-        call run_case1;
-        call run_case2;
-        call run_case3;
-        call run_case4;
-        call run_case5;
-        call run_case6;
-        call run_case7;
-        call run_case8;
-        call run_case9;
-        call run_case10;
-        call run_case11;
-        call run_case12;
-        call run_case13;
-        call run_case14;
-        call run_case15;
-        call run_case16;
-        call run_case17;
-        call run_case18;
-        call run_case19;
-        call run_case20;
-        call run_case21;
-        call run_case22;
-        call run_case23;
-        call run_case24;
+        call ParseTypedValuesTests::run_case1;
+        call ParseTypedValuesTests::run_case2;
+        call ParseTypedValuesTests::run_case3;
+        call ParseTypedValuesTests::run_case4;
+        call ParseTypedValuesTests::run_case5;
+        call ParseTypedValuesTests::run_case6;
+        call ParseTypedValuesTests::run_case7;
+        call ParseTypedValuesTests::run_case8;
+        call ParseTypedValuesTests::run_case9;
+        call ParseTypedValuesTests::run_case10;
+        call ParseTypedValuesTests::run_case11;
+        call ParseTypedValuesTests::run_case12;
+        call ParseTypedValuesTests::run_case13;
+        call ParseTypedValuesTests::run_case14;
+        call ParseTypedValuesTests::run_case15;
+        call ParseTypedValuesTests::run_case16;
+        call ParseTypedValuesTests::run_case17;
+        call ParseTypedValuesTests::run_case18;
+        call ParseTypedValuesTests::run_case19;
+        call ParseTypedValuesTests::run_case20;
+        call ParseTypedValuesTests::run_case21;
+        call ParseTypedValuesTests::run_case22;
+        call ParseTypedValuesTests::run_case23;
+        call ParseTypedValuesTests::run_case24;
 
         // --- ParseTypedArgsTests (module id 3) ----------------------
-        call run_case1;
-        call run_case2;
-        call run_case3;
-        call run_case4;
-        call run_case5;
+        call ParseTypedArgsTests::run_case1;
+        call ParseTypedArgsTests::run_case2;
+        call ParseTypedArgsTests::run_case3;
+        call ParseTypedArgsTests::run_case4;
+        call ParseTypedArgsTests::run_case5;
 
         // --- ParseStdVocabTests (module id 5) -----------------------
-        call run_all_9;
-        call run_ids_unique;
+        call ParseStdVocabTests::run_all_9;
+        call ParseStdVocabTests::run_ids_unique;
 
         // --- ParseSchemaRecordTests (module id 6) -------------------
-        call run_case1;
-        call run_case2;
-        call run_case3;
-        call run_case4;
-        call run_case5;
-        call run_case6;
-        call run_case7;
-        call run_case8;
-        call run_case9;
-        call run_case10;
+        call ParseSchemaRecordTests::run_case1;
+        call ParseSchemaRecordTests::run_case2;
+        call ParseSchemaRecordTests::run_case3;
+        call ParseSchemaRecordTests::run_case4;
+        call ParseSchemaRecordTests::run_case5;
+        call ParseSchemaRecordTests::run_case6;
+        call ParseSchemaRecordTests::run_case7;
+        call ParseSchemaRecordTests::run_case8;
+        call ParseSchemaRecordTests::run_case9;
+        call ParseSchemaRecordTests::run_case10;
 
         // --- HelpBackendTests (module id 7) -------------------------
-        call run_case1;
-        call run_case2;
-        call run_case3;
+        call HelpBackendTests::run_case1;
+        call HelpBackendTests::run_case2;
+        call HelpBackendTests::run_case3;
 
         // --- SchemaEmitTests (module id 8) --------------------------
-        call run_case1;
-        call run_case2;
-        call run_case3;
-        call run_case4;
-        call run_case5;
+        call SchemaEmitTests::run_case1;
+        call SchemaEmitTests::run_case2;
+        call SchemaEmitTests::run_case3;
+        call SchemaEmitTests::run_case4;
+        call SchemaEmitTests::run_case5;
 
         // Pack tally: (pass << 16) | fail
         lea r11, [rip + pass_count];
@@ -148,7 +148,7 @@ module SmokeDriver = structure {
 
         // Hand to SysExit::exit(code).
         mov rdi, rax;
-        call exit;
+        call SysExit::exit;
         // NORETURN; unreachable.
         pop rbx;
         ret;

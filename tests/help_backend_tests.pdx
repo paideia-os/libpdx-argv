@@ -19,7 +19,7 @@
 //   - run_* fns non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module HelpBackend = structure {
+module HelpBackendTests = structure {
 
   // Caller-owned argv scratch for fill_doc_argv.
   pub let mut argv_scratch : [u64; 2] = uninit @align(8)

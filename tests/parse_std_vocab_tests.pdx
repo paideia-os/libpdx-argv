@@ -15,7 +15,7 @@
 //   - run_all is non-leaf; 1-push (rbx) prologue.
 //   - No test mnemonic; every zero-check via cmp reg, 0.
 
-module ParseStdVocab = structure {
+module ParseStdVocabTests = structure {
 
   // -- Argv entries for the full sweep (9 flags — 7 bool + color + no-cap).
   pub let a_help    : [u8; 7]  = "--help\0"
