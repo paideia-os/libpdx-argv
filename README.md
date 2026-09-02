@@ -218,6 +218,25 @@ this library:
   `call parse_argv`.
 - [rm](https://github.com/paideia-os/rm) — `src/main.pdx:130`
   `call parse_argv`.
+- [mkfs.pdxfs](https://github.com/paideia-satellites/mkfs.pdxfs) —
+  `src/argv.pdx` R90-XREPO ENH-030 shim: `flag_spec_reset` +
+  `flag_spec_register` x11 + `parsed_args_reset` + `parse_argv` +
+  `parse_int_u64` x2, walks `flag_ids[]`/`flag_values[]`/`pos_ptrs[]`
+  to populate the tool's own fixed-offset ParsedArgv struct (11 flags:
+  --force / --dry-run / --verbose / --upgrade / --help / --encrypt /
+  --label / --journal-size / --sig-key / --passphrase-fd / --quota).
+- [mount.pdxfs](https://github.com/paideia-satellites/mount.pdxfs) —
+  `src/argv.pdx` R90-XREPO ENH-030 shim: `flag_spec_reset` +
+  `flag_spec_register` x8 + `parsed_args_reset` + `parse_argv` +
+  `parse_int_u64` x2, walks the same singletons (8 flags: --ro /
+  --noexec / --verbose / --dry-run / --all / --snapshot-list /
+  --snapshot / --passphrase-fd; --snapshot=<slot> ORs PA_FLAG_RO
+  alongside its own presence bit).
+- [umount.pdxfs](https://github.com/paideia-satellites/umount.pdxfs) —
+  `src/argv.pdx` R90-XREPO ENH-030 shim: `flag_spec_reset` +
+  `flag_spec_register` x4 + `parsed_args_reset` + `parse_argv`
+  (4 boolean flags: --lazy / --force / --verbose / --dry-run;
+  no `parse_int_u64` needed, no value-carrying flags).
 
 Checked and **not** a caller, with the real reason each isn't:
 

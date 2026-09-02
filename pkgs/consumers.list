@@ -26,7 +26,22 @@ paideia-os/mkdir/src/mkdir.pdx:1210                — parse_argv
 paideia-os/mv/src/argv.pdx:194                     — parse_argv
 paideia-os/rm/src/main.pdx:130                     — parse_argv
 
-# Total: 6 P0 tools of the R49+R50 sweep. The three remaining P0 tools
-# (cat, doc, shell) are documented in README §Callers as non-callers with
-# their reasons (scheduled M3 migration, planned M2 migration, and
-# libpdx-argv.ENH-006 caller-owned-context prerequisite respectively).
+# R90-XREPO satellite cascade (ENH-030 rename adoption, 2026-09-02):
+# three volume-tooling satellites migrated their handwritten argv
+# scanners onto libpdx-argv. Each satellite's src/argv.pdx keeps its
+# same public entry point (argv_parse) as a thin wire-in shim that
+# calls flag_spec_reset + flag_spec_register (per-flag) + parsed_args_
+# reset + parse_argv, then walks ParsedArgs::flag_ids[]/flag_values[]/
+# pos_ptrs[] once to populate the caller's fixed-offset ParsedArgv
+# struct. mkfs.pdxfs uses parse_int_u64 for --journal-size /
+# --passphrase-fd; mount.pdxfs uses it for --snapshot / --passphrase-fd.
+mkfs.pdxfs/src/argv.pdx                            — flag_spec_reset, flag_spec_register (x11), parsed_args_reset, parse_argv, parse_int_u64 (x2), flag_count, flag_ids, flag_values, pos_count, pos_ptrs
+mount.pdxfs/src/argv.pdx                           — flag_spec_reset, flag_spec_register (x8), parsed_args_reset, parse_argv, parse_int_u64 (x2), flag_count, flag_ids, flag_values, pos_count, pos_ptrs
+umount.pdxfs/src/argv.pdx                          — flag_spec_reset, flag_spec_register (x4), parsed_args_reset, parse_argv, flag_count, flag_ids, pos_count, pos_ptrs
+
+# Total: 9 consumers — 6 P0 tools of the R49+R50 sweep plus the 3
+# R90-XREPO volume-tooling satellites. The three remaining P0 tools
+# (cat, doc, shell) are documented in README §Callers as non-callers
+# with their reasons (scheduled M3 migration, planned M2 migration,
+# and libpdx-argv.ENH-006 caller-owned-context prerequisite
+# respectively).
