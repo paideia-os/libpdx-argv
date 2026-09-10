@@ -73,7 +73,8 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 
 | Function | Purpose |
 | --- | --- |
-| `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). |
+| `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). Treats `argv[0]` as an ordinary argv slot — callers invoked from `_start` should either pre-skip the program-name slot themselves or call `parse_argv_skipping_zero` (see next row). |
+| `parse_argv_skipping_zero(argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-031`)** Thin wrapper: advances `argv` by one pointer slot and decrements `argc` by 1 before invoking `parse_argv`, so a consumer that received `(argv, argc)` at `_start` per the frozen `execve` ABI (`design/user/execve-abi.md`) can hand them through unmodified without the program name landing in `pos_ptrs[0]`. `argc == 0` short-circuits to `parse_argv(argv, 0)`, which returns `ERR_OK` immediately without dereferencing `argv`. Every satellite `_start` consumer (`pkg`, `ls`, `cp`, `mkdir`, `mv`, `rm`, `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) wants this shape; the bare `parse_argv` remains the lower-level primitive for callers that have already pre-skipped or synthesised argv themselves. |
 
 Grammar: long flags `--foo`, `--foo=bar`, `--foo:bar`, `--foo bar`; short
 flags one letter per hyphen (`-f`; clustered `-la` is rejected with
@@ -282,7 +283,9 @@ of not rewriting a signed release's history silently.
 ## Examples
 
 **Bootstrap and parse.** Registration must precede the parse — the parser
-consults `FlagSpec` to decide flag arity.
+consults `FlagSpec` to decide flag arity. Consumers invoked from `_start`
+should call `parse_argv_skipping_zero` so `argv[0]` (the program name)
+does not land in `pos_ptrs[0]`.
 
 ```pdx
 flag_spec_reset()
@@ -290,7 +293,8 @@ register_all()                                        // the 9 I3 flags, ids 1..
 flag_spec_register(&MY_NAME_OUT, FlagSpec::FKIND_STR,  100)
 flag_spec_register(&MY_NAME_MAX, FlagSpec::FKIND_SIZE, 101)
 parsed_args_reset()
-let rc = parse_argv(argv, argc)                       // 0 = ERR_OK
+let rc = parse_argv_skipping_zero(argv, argc)         // 0 = ERR_OK
+// (or: parse_argv(argv+8, argc-1) — same effect, hand-computed offset)
 ```
 
 **Dispatch by id, then decode the value.** `find_flag_by_id` returns `32`

@@ -18,8 +18,12 @@ libpdx-argv exposes two modules to its consumers:
   consumer reads after `parse_argv` returns. Error-code constants live
   here so callers can distinguish "unknown flag form" from
   "clustered short flag" without pattern-matching on messages.
-- `Parser` (`src/parser.pdx`) — one entry point:
-  `parse_argv(argv_ptr: u64, argc: u64) -> u64`.
+- `Parser` (`src/parser.pdx`) — two entry points:
+  `parse_argv(argv_ptr: u64, argc: u64) -> u64` (the primitive) and
+  `parse_argv_skipping_zero(argv_ptr: u64, argc: u64) -> u64`
+  (`libpdx-argv.ENH-031`; a thin wrapper that drops `argv[0]` — the
+  program-name slot every `_start` receives per the frozen execve ABI
+  — before invoking `parse_argv`, see §4).
 
 The consumer wires libpdx-argv into its own tool as follows:
 
@@ -124,6 +128,29 @@ pos_count++`. Overflow past `MAX_POS` sets `ERR_POS_OVERFLOW`.
 against `MAX_FLAGS` / `MAX_POS` **before** the write. Overflow sets
 `error_code` and stops the walk. This never violates the paideia-as
 `cmp reg, imm` constraint — the constants are ≤ 0x7FFFFFFF.
+
+**`argv[0]` convention (`libpdx-argv.ENH-031`, post-1.1.0).**
+`Parser::parse_argv` treats every `argv[i]` — including `argv[0]` — as
+a real argv slot to classify. Every satellite `_start` passes
+`argv[0] = program_name` per the frozen `execve` ABI
+(`design/user/execve-abi.md`); a caller that hands the un-adjusted
+`(argv, argc)` it received at `_start` straight to `parse_argv` gets
+the program name silently captured into `pos_ptrs[0]` — the exact bug
+`paideia-satellites/ls`'s `src/argv_surface.pdx:266-268` shipped with
+before ENH-031. Rather than re-litigate the design as "parser must
+skip the program name" (which breaks every non-`_start` caller that
+already synthesised argv without a program name — the smoke driver
+and every schema-record test module) the M1 semantics are kept
+byte-identical and a companion entry point,
+`Parser::parse_argv_skipping_zero`, is added. It advances `argv` by
+one pointer slot and decrements `argc` by 1, then forwards to
+`parse_argv`. `argc == 0` short-circuits to `parse_argv(argv, 0)`,
+which returns `ERR_OK` immediately without dereferencing `argv`, so
+the helper is safe on an empty or nil argv. Every `_start` consumer
+should call the wrapper; the bare `parse_argv` is retained as the
+lower-level primitive that classifies exactly what it is handed. See
+`src/parser.pdx` `parse_argv_skipping_zero` for the two-instruction
+core (`add rdi, 8; sub rsi, 1`) and its 1-push alignment prologue.
 
 ## 5. Short-flag rejection contract (M1-002)
 

@@ -1,5 +1,8 @@
 // src/parser.pdx — libpdx-argv.M1-001 + M1-002 + M2-001 + M2-002 + M2-003
-// Parser: entry point parse_argv(argv, argc) → error_code.
+//               + ENH-031 (argv[0]-skip wrapper)
+// Parser: entry points parse_argv(argv, argc) → error_code
+//         and parse_argv_skipping_zero(argv, argc) → error_code
+//         (thin wrapper that drops argv[0] before forwarding).
 //
 // M1 grammar (unchanged interpretation):
 //   long flags  : --foo, --foo=bar, --foo bar
@@ -461,6 +464,63 @@ module Parser = structure {
         pop r13;
         pop r12;
         pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // parse_argv_skipping_zero(argv, argc) → u64
+  //
+  // libpdx-argv.ENH-031 (post-1.1.0). Thin wrapper over parse_argv that
+  // drops argv[0] — the program-name slot every satellite _start passes
+  // per the frozen execve ABI (design/user/execve-abi.md) — before
+  // forwarding into the standard parser. Consumers can hand the argv
+  // pointer and argc they received at _start unmodified; the wrapper
+  // isolates the +1/-1 offset arithmetic every caller would otherwise
+  // re-implement (see paideia-satellites/ls src/argv_surface.pdx which
+  // silently captured its own program name into pos_ptrs[0] pre-ENH-031).
+  //
+  //   rdi = argv (u64* array, argv[0] is the program name)
+  //   rsi = argc (count of entries in argv, including argv[0])
+  //   rax = same as parse_argv (ERR_OK or one of the ERR_* codes).
+  //
+  // When argc == 0 the call short-circuits to a bare parse_argv on the
+  // caller's pointer with count 0 — parse_argv's loop head condition
+  // (`cmp r13, r12; jge parse_argv_done_ok`) returns ERR_OK immediately
+  // without dereferencing argv, so a nil argv pointer is also safe on
+  // this path. The argc == 0 guard is what keeps `add rdi, 8; sub rsi,
+  // 1` from advancing past the end of a zero-length argv or wrapping
+  // the count to 0xFFFF...FFFF.
+  //
+  // Non-leaf (calls parse_argv). One-push prologue (rbx unused, pushed
+  // purely for alignment) brings rsp%16 to 0 for the nested call, per
+  // the same pattern StdVocab::register_all uses for its FlagSpec calls.
+  // rax survives the pop rbx / ret path (rbx is callee-save and unused;
+  // no instruction between the call return and the epilogue touches rax).
+  //
+  // Register plan:
+  //   rdi = argv (adjusted in-place when argc > 0)
+  //   rsi = argc (decremented in-place when argc > 0)
+  //   rbx = scratch (unused, pushed only for stack alignment)
+  //   rax = return value from parse_argv (passed through unchanged)
+  pub let parse_argv_skipping_zero : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-031 Parser::parse_argv_skipping_zero — thin wrapper over parse_argv that skips argv[0] (the program-name slot every satellite _start passes per the frozen execve ABI). Consumer hands the un-adjusted argv/argc it received at _start; the wrapper advances rdi by 8 (one pointer slot) and decrements rsi by 1, then tail-calls parse_argv. Non-leaf: 1-push prologue (rbx unused, for rsp alignment) → rsp%16: 8 → 0 for the nested parse_argv call. Guards argc==0 by forwarding to parse_argv with the caller's (argv, 0) unchanged — parse_argv's loop-head check (cmp r13, r12; jge done_ok) returns ERR_OK immediately without dereferencing argv, so a zero-length argv (nil pointer included) is safe. Every consumer of libpdx-argv called from _start (pkg, ls, cp, mkdir, mv, rm, mkfs.pdxfs, mount.pdxfs, umount.pdxfs) wants this shape; pre-ENH-031 each caller had to know to pass argv+8, argc-1 or accept the program name landing in pos_ptrs[0]. The wrapper is symmetrically safe on the FlagSpec-registration precondition: it does not touch FlagSpec/ParsedArgs state, so the same parsed_args_reset() + registration sequence documented for parse_argv applies unchanged.",
+      block: {
+        push rbx;                           // align rsp (rsp%16: 8 → 0)
+
+        // argc == 0 → nothing to skip; fall through to parse_argv on
+        // (argv, 0) which returns ERR_OK immediately.
+        cmp rsi, 0;
+        je parse_argv_skipzero_forward;
+
+        add rdi, 8;                         // argv += 1 pointer slot
+        sub rsi, 1;                         // argc -= 1
+
+      parse_argv_skipzero_forward:
+        call parse_argv;                    // rax = parse_argv result
+
         pop rbx;
         ret;
       }

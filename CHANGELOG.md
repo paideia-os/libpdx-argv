@@ -4,6 +4,58 @@ All notable changes to `libpdx-argv` are recorded here. The format is
 loosely modelled on Keep-a-Changelog, adapted to the PaideiaOS milestone
 rubric in `design/tooling/r49-r50-plan.md` §5.
 
+## Unreleased
+
+### ENH-031 — `argv[0]`-skip convention: `parse_argv_skipping_zero` helper (Closes #41)
+
+`Parser::parse_argv` has always treated `argv[0]` as a real argv slot
+to classify — the `_start` program-name slot every satellite receives
+per the frozen `execve` ABI (`design/user/execve-abi.md`) lands in
+`pos_ptrs[0]` unless the caller skipped it explicitly. Neither
+`README.md` nor `design/architecture.md` had documented the required
+skip, and the `paideia-satellites/ls` reference consumer at
+`src/argv_surface.pdx:266-268` demonstrated the failure mode by
+silently capturing its own program name as `_as_path_ptr`.
+
+Rather than change `parse_argv`'s classification semantics (which
+would silently break every non-`_start` caller — the smoke driver,
+every schema-record test module, and every fixture whose synthesised
+argv does not include a program name), ENH-031 adds a companion entry
+point that isolates the `+1`/`-1` offset every `_start` consumer
+would otherwise re-implement:
+
+    Parser::parse_argv_skipping_zero(argv, argc) -> u64
+
+Semantics: advance `argv` by one pointer slot (`add rdi, 8`),
+decrement `argc` by 1 (`sub rsi, 1`), then forward to `parse_argv`
+via a nested `call`. Return value is `parse_argv`'s return value
+unchanged. `argc == 0` short-circuits to `parse_argv(argv, 0)`,
+which returns `ERR_OK` immediately without dereferencing `argv` (the
+loop-head `cmp r13, r12; jge parse_argv_done_ok` fires on the first
+iteration), so the wrapper is safe on an empty or nil argv.
+
+Alignment discipline: non-leaf; 1-push (`rbx`, unused) prologue
+brings `rsp%16` to 0 for the nested `parse_argv` call — the same
+pattern `StdVocab::register_all` uses for its `FlagSpec` calls. `rax`
+survives the `pop rbx; ret` epilogue because `rbx` is callee-save
+and no instruction between the nested-call return and the epilogue
+touches `rax`.
+
+Documentation:
+
+  - `README.md` §parser.pdx table adds a row for the new entry point
+    and notes that `parse_argv` remains the lower-level primitive.
+  - `README.md` "Bootstrap and parse" example updated to call
+    `parse_argv_skipping_zero` with a one-line note showing the
+    hand-computed offset alternative.
+  - `design/architecture.md` §1 public surface lists both entry
+    points; §4 "Parser state machine" gains an "argv[0] convention"
+    subsection linking to `design/user/execve-abi.md`.
+
+No existing consumer's behaviour changes — `parse_argv` is untouched.
+The new symbol is purely additive; downstream repos that want the
+helper adopt it on the same commit that bumps their `libpdx-argv` pin.
+
 ## 1.1.0 — 2026-09-02
 
 Post-1.0 enhancement tranche. Groups Wave 1 (`ENH-022` / `ENH-023` /
