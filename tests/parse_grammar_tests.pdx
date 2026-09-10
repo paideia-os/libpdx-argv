@@ -28,6 +28,20 @@
 //     (case 10 update + case 24): bare '-' (case 10) and the empty
 //     string "" (case 24) both fail with ERR_UNKNOWN_ARG_FORM=3;
 //     bare '--' (case 5) still sets the ddash sentinel unchanged.
+//   - libpdx-argv.ENH-027 ERR_FLAG_OVERFLOW / ERR_POS_OVERFLOW
+//     boundary matrix (cases 25-30). Design/architecture.md §11
+//     had punted these to "M4+ stretch" and both error codes were
+//     unreachable from the test surface even though the parser has
+//     always raised them. The six new cases sit against the
+//     `cmp rcx, 32; jge parse_argv_flag_overflow` and
+//     `cmp rax, 32; jge parse_argv_pos_overflow` gates in src/
+//     parser.pdx: 25/28 exercise the last-valid boundary (32 stores
+//     succeed, ERR_OK); 26/29 the first-refused boundary (33rd
+//     store trips overflow with error_arg_index=32 and the count
+//     preserved at 32); 27/30 the deep-beyond variant (40 args,
+//     same failure signature — regression witness that neither
+//     the fail path nor the count reset changes shape past the
+//     first refusal). MAX_FLAGS == MAX_POS == 32 per parsed_args.pdx.
 //
 // Module id in TestHarness::last_fail_tag: 1
 //
@@ -1428,6 +1442,348 @@ module ParseGrammarTests = structure {
 
       case24_fail:
         mov rdi, 0x100000018;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 25 — libpdx-argv.ENH-027 ERR_FLAG_OVERFLOW boundary
+  //   (last-valid): exactly MAX_FLAGS=32 long flags MUST all store.
+  //   Fixture fills argv with 32 pointers to the same permissive-mode
+  //   flag `--f\0` (unregistered under FKIND_UNKNOWN; ENH-008 permits
+  //   duplicate storage). Verifies err=ERR_OK, flag_count=32.
+  //
+  //   Sits directly against `cmp rcx, 32; jge parse_argv_flag_overflow`
+  //   in src/parser.pdx: the 32nd store enters with rcx=31, passes the
+  //   gate, writes flag_ids[31], and bumps flag_count to 32. Any
+  //   off-by-one that flips the gate direction (jle vs jge, or gates
+  //   against 31) surfaces here first.
+  // ============================================================
+  pub let case25_flag     : [u8; 4]  = "--f\0"
+  pub let mut case25_argv : [u64; 32] = uninit @align(8)
+
+  pub let run_case25 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-027 case25 — MAX_FLAGS=32 boundary (last-valid). Fills case25_argv[0..31] with pointers to the same `--f\\0` fixture via a forward index loop (rcx=0..31, mov [rbx+rcx*8], r11), then calls parse_argv(argc=32). Parser stores each occurrence — duplicates are permitted by ENH-008 last-wins semantics and the flag itself lands in permissive mode (FlagSpec::reset leaves strict_mode=0 and no register_all call is issued). Verifies err=ERR_OK (0) and flag_count=32 (every slot filled, the gate exactly satisfied). Non-leaf: 1-push (rbx) aligns rsp%16 for the nested full_reset/parse_argv/record_* calls. Encoder-safe: `sub rcx, 1` / `add rcx, 1` / `cmp rcx, 32` are all imm8 and rcx never exceeds MAX_FLAGS during setup.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // argv[i] = &case25_flag for i in 0..32
+        lea r11, [rip + case25_flag];
+        lea rbx, [rip + case25_argv];
+        xor rcx, rcx;
+      case25_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 32;
+        jne case25_fill;
+
+        lea rdi, [rip + case25_argv];
+        mov rsi, 32;
+        call parse_argv;
+        cmp rax, 0;                          // ERR_OK
+        jne case25_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case25_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case25_fail:
+        mov rdi, 0x100000019;                // (1<<32) | 25
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 26 — libpdx-argv.ENH-027 ERR_FLAG_OVERFLOW first-refused:
+  //   MAX_FLAGS+1 = 33 long flags. The 33rd store must trip overflow.
+  //   Expected: err=ERR_FLAG_OVERFLOW (=1), error_arg_index=32
+  //   (the 0-based loop index at the refused store; r13 at parse_fail),
+  //   flag_count=32 (the count is not rolled back — the gate fires
+  //   BEFORE the store, so 32 preserved entries remain visible).
+  // ============================================================
+  pub let case26_flag     : [u8; 4]  = "--f\0"
+  pub let mut case26_argv : [u64; 33] = uninit @align(8)
+
+  pub let run_case26 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-027 case26 — MAX_FLAGS+1 first-refused. Fills 33 argv slots with the same permissive-mode `--f\\0` pointer and calls parse_argv(argc=33). Parser processes 32 flags into flag_ids/flag_kinds (rcx 0..31), then on the 33rd iteration finds rcx=32 at the store gate and jumps to parse_argv_flag_overflow — mov rax, 1 (ERR_FLAG_OVERFLOW), jmp parse_argv_fail — writing error_code=1 and error_arg_index=r13=32 before restoring callee-save regs. Verifies err=1, error_arg_index=32, flag_count=32 (the pre-store gate leaves the count untouched at exactly MAX_FLAGS). This is the primary fingerprint for the overflow path — any refactor that moves the gate to POST-store or that rolls flag_count back on failure changes one of the three observables.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea r11, [rip + case26_flag];
+        lea rbx, [rip + case26_argv];
+        xor rcx, rcx;
+      case26_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 33;
+        jne case26_fill;
+
+        lea rdi, [rip + case26_argv];
+        mov rsi, 33;
+        call parse_argv;
+        cmp rax, 1;                          // ERR_FLAG_OVERFLOW
+        jne case26_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case26_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case26_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case26_fail:
+        mov rdi, 0x10000001A;                // (1<<32) | 26
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 27 — libpdx-argv.ENH-027 ERR_FLAG_OVERFLOW deep-beyond:
+  //   MAX_FLAGS+8 = 40 long flags. Same failure signature as case 26 —
+  //   the parser must stop at the 33rd arg regardless of how many more
+  //   flags trail behind it. Regression witness that neither the fail
+  //   path nor the count preservation changes shape past the first
+  //   refusal (i.e. the parser does NOT keep scanning and rewriting).
+  //   Expected: err=1, error_arg_index=32, flag_count=32.
+  // ============================================================
+  pub let case27_flag     : [u8; 4]  = "--f\0"
+  pub let mut case27_argv : [u64; 40] = uninit @align(8)
+
+  pub let run_case27 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-027 case27 — MAX_FLAGS+8 deep-beyond. Fills 40 argv slots and calls parse_argv(argc=40). Failure signature is identical to case26 (err=1, error_arg_index=32, flag_count=32): the fail path unconditionally returns from parse_argv_fail, so the extra 7 trailing args in this fixture are never inspected. Guards against a future refactor that might, for example, keep the loop running past overflow to collect additional diagnostics — such a refactor would change one of the three observables here (typically error_arg_index would drift to 39 or flag_count would grow past 32). The argc=40 imm fits well within the 0x7FFFFFFF cmp cap.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea r11, [rip + case27_flag];
+        lea rbx, [rip + case27_argv];
+        xor rcx, rcx;
+      case27_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 40;
+        jne case27_fill;
+
+        lea rdi, [rip + case27_argv];
+        mov rsi, 40;
+        call parse_argv;
+        cmp rax, 1;                          // ERR_FLAG_OVERFLOW
+        jne case27_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case27_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case27_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case27_fail:
+        mov rdi, 0x10000001B;                // (1<<32) | 27
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 28 — libpdx-argv.ENH-027 ERR_POS_OVERFLOW boundary
+  //   (last-valid): exactly MAX_POS=32 positionals MUST all store.
+  //   Fixture fills argv with 32 pointers to the same bareword `x\0`
+  //   (no leading '-', not the '--' sentinel — the positional path
+  //   handles it via parse_argv_positional). Verifies err=ERR_OK,
+  //   pos_count=32.
+  //
+  //   Sits against `cmp rax, 32; jge parse_argv_pos_overflow` in
+  //   src/parser.pdx (rax holds pos_count at the gate). Symmetric to
+  //   case25 but through the positional storage path.
+  // ============================================================
+  pub let case28_pos      : [u8; 2]  = "x\0"
+  pub let mut case28_argv : [u64; 32] = uninit @align(8)
+
+  pub let run_case28 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-027 case28 — MAX_POS=32 boundary (last-valid). Fills case28_argv[0..31] with pointers to the same `x\\0` bareword and calls parse_argv(argc=32). Parser routes each arg through parse_argv_positional (byte0!='-'), stores pos_ptrs[m]=arg, bumps pos_count. On the 32nd iteration rax=31 at the store gate, passes, writes pos_ptrs[31], count reaches 32. Verifies err=ERR_OK, pos_count=32. Bareword `x\\0` deliberately avoids the ENH-026 empty-string trap (case24) and the bare-'-' trap (case10) — both of which now short-circuit to ERR_UNKNOWN_ARG_FORM before the positional path fires.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // argv[i] = &case28_pos for i in 0..32
+        lea r11, [rip + case28_pos];
+        lea rbx, [rip + case28_argv];
+        xor rcx, rcx;
+      case28_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 32;
+        jne case28_fill;
+
+        lea rdi, [rip + case28_argv];
+        mov rsi, 32;
+        call parse_argv;
+        cmp rax, 0;                          // ERR_OK
+        jne case28_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case28_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case28_fail:
+        mov rdi, 0x10000001C;                // (1<<32) | 28
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 29 — libpdx-argv.ENH-027 ERR_POS_OVERFLOW first-refused:
+  //   MAX_POS+1 = 33 positionals. The 33rd store must trip overflow.
+  //   Expected: err=ERR_POS_OVERFLOW (=2), error_arg_index=32,
+  //   pos_count=32 (pre-store gate; count not rolled back).
+  //   Symmetric fingerprint to case26 on the positional path.
+  // ============================================================
+  pub let case29_pos      : [u8; 2]  = "x\0"
+  pub let mut case29_argv : [u64; 33] = uninit @align(8)
+
+  pub let run_case29 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-027 case29 — MAX_POS+1 first-refused. Fills 33 argv slots with `x\\0` and calls parse_argv(argc=33). Parser stores 32 positionals then, on the 33rd iteration, hits `cmp rax, 32; jge parse_argv_pos_overflow` with rax=32, jumps to the fail path (mov rax, 2 for ERR_POS_OVERFLOW), and writes error_code=2 + error_arg_index=r13=32 before restoring callee-save regs. Verifies err=2, error_arg_index=32, pos_count=32 (pre-store gate leaves the count untouched at exactly MAX_POS). Primary fingerprint for the positional overflow path; mirrors case26's role for the flag path.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea r11, [rip + case29_pos];
+        lea rbx, [rip + case29_argv];
+        xor rcx, rcx;
+      case29_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 33;
+        jne case29_fill;
+
+        lea rdi, [rip + case29_argv];
+        mov rsi, 33;
+        call parse_argv;
+        cmp rax, 2;                          // ERR_POS_OVERFLOW
+        jne case29_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case29_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case29_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case29_fail:
+        mov rdi, 0x10000001D;                // (1<<32) | 29
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 30 — libpdx-argv.ENH-027 ERR_POS_OVERFLOW deep-beyond:
+  //   MAX_POS+8 = 40 positionals. Same failure signature as case 29 —
+  //   the parser must stop at the 33rd arg regardless of trailer.
+  //   Expected: err=2, error_arg_index=32, pos_count=32.
+  //   Symmetric to case27 on the positional path.
+  // ============================================================
+  pub let case30_pos      : [u8; 2]  = "x\0"
+  pub let mut case30_argv : [u64; 40] = uninit @align(8)
+
+  pub let run_case30 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-027 case30 — MAX_POS+8 deep-beyond. Fills 40 argv slots with `x\\0` and calls parse_argv(argc=40). Failure signature is identical to case29 (err=2, error_arg_index=32, pos_count=32): fail path returns unconditionally, so the extra 7 trailing positionals are never inspected. Guards against a future refactor that might keep scanning past overflow (which would drift error_arg_index toward 39 or grow pos_count past 32). The argc=40 imm is safely within the 0x7FFFFFFF cmp cap.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea r11, [rip + case30_pos];
+        lea rbx, [rip + case30_argv];
+        xor rcx, rcx;
+      case30_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 40;
+        jne case30_fill;
+
+        lea rdi, [rip + case30_argv];
+        mov rsi, 40;
+        call parse_argv;
+        cmp rax, 2;                          // ERR_POS_OVERFLOW
+        jne case30_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case30_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne case30_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case30_fail:
+        mov rdi, 0x10000001E;                // (1<<32) | 30
         call record_fail;
         pop rbx;
         ret;

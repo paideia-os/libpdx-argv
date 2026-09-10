@@ -80,6 +80,12 @@ module SmokeDriver = structure {
         call ParseGrammarTests::run_case22;
         call ParseGrammarTests::run_case23;
         call ParseGrammarTests::run_case24;
+        call ParseGrammarTests::run_case25;
+        call ParseGrammarTests::run_case26;
+        call ParseGrammarTests::run_case27;
+        call ParseGrammarTests::run_case28;
+        call ParseGrammarTests::run_case29;
+        call ParseGrammarTests::run_case30;
 
         // --- ParseTypedValuesTests (module id 2) --------------------
         call ParseTypedValuesTests::run_case1;
