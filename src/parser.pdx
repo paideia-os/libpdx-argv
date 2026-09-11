@@ -10,6 +10,9 @@
 //               + ENH-019 (STRING flag enum validation via
 //                          register_string_enum + post-store
 //                          allowed-set walk, Closes #29)
+//               + ENH-020 (git-shape subcommand dispatch via
+//                          FlagSpec::register_subcommands +
+//                          pre-loop dispatch phase, Closes #30)
 // Parser: entry points parse_argv_ex(argv, argc, parse_flags) →
 //         error_code (the ENH-017 primary), parse_argv(argv, argc) →
 //         error_code (thin wrapper passing parse_flags = 0 — the
@@ -208,6 +211,82 @@
 //
 //   New klog tag: `pdxargv.string-enum`.
 //
+// libpdx-argv.ENH-020 (git-shape subcommand dispatch, Closes #30):
+//   A caller enables git-shape subcommand dispatch by installing a
+//   subcommand table via FlagSpec::register_subcommands(table_ptr,
+//   count) at bootstrap. Each SubSpec entry (SUBSPEC_STRIDE = 40
+//   bytes) carries {name_ptr, id, flag_specs_ptr, flag_count,
+//   help_ptr}; each entry in a SubSpec's flag_specs array
+//   (SUBFLAGSPEC_STRIDE = 24 bytes) carries {name_ptr, kind, id}
+//   mirroring FlagSpec's 3-arg register surface.
+//
+//   Dispatch phase (runs BEFORE the main argv walk, gated on
+//   subcommand_table_ptr != 0):
+//     1. Skip argv[0] as program name (r13 starts at 1 for every
+//        table-registered parse; the pre-ENH-020 argv[0]-included
+//        semantic is preserved for callers that never register a
+//        sub table).
+//     2. If argc < 2 → no dispatch; walk starts at r13 = 1 with the
+//        top-level FlagSpec table intact.
+//     3. If argv[1] starts with '-' OR is empty → treat as
+//        top-level flag: no dispatch, top-level FlagSpec intact,
+//        walk starts at r13 = 1. This is what makes
+//        `git --version` still trigger the StdVocab --version
+//        auto-emit (assuming the caller registered StdVocab at
+//        top level via `register_all`).
+//     4. Otherwise, walk the sub table byte-comparing (case-
+//        sensitive) argv[1] against each SubSpec.name via the same
+//        inline xor+mov_b+cmp strcmp shape FlagSpec::lookup uses.
+//        First match wins.
+//     5. On match: publish the matched SubSpec.id into
+//        ParsedArgs::subcommand_id, then hoist SubSpec.flag_specs_ptr
+//        + SubSpec.flag_count into callee-save r14/r15, call
+//        flag_spec_reset (wipes the top-level table AND the sub
+//        table pointer/count so no nested dispatch fires from
+//        inside the sub's parse), then walk the flag_specs array
+//        calling flag_spec_register(name, kind, id) per entry.
+//        The parse loop then starts at r13 = 2 (both argv[0] and
+//        argv[1] are consumed — argv[0] as program name, argv[1]
+//        as the sub name).
+//     6. On no match: rax = ERR_UNKNOWN_SUBCOMMAND (19), r13 = 1
+//        (the offending argv slot), jump to parse_argv_fail. No
+//        FlagSpec state is touched on this path — the reject
+//        happens BEFORE the flag_spec_reset + sub install block,
+//        so a caller inspecting FlagSpec after the fail sees the
+//        top-level table intact (a subsequent flag_spec_reset
+//        from the harness zeroes it as usual). This mirrors
+//        ENH-013's cluster-fail "no partial commit" discipline.
+//
+//   StdVocab precedence (`--version` / `--help` at top level): a
+//   flag-shaped argv[1] skips the sub table walk entirely — the
+//   parser proceeds into the main loop with the top-level
+//   FlagSpec intact, so `--version` / `--help` fire their auto-
+//   emit or normal-store paths exactly as they do without a sub
+//   table. This matches the git-shape convention where
+//   `git --version` prints the top-level version but
+//   `git commit --version` (if a tool registers --version inside
+//   the commit sub's flag_specs) prints the sub's version.
+//
+//   The dispatch phase runs on parse_argv_ex only (parse_argv is
+//   still the thin wrapper); the ENH-017 collect-all bit is
+//   orthogonal: an unknown-subcommand fail is a hard-stop
+//   (routed through parse_argv_fail, not parse_argv_maybe_collect),
+//   because no ParsedArgs storage was ever attempted — the
+//   accumulator semantic (advance past the offending slot and
+//   keep parsing) has no coherent meaning when the flag spec
+//   table itself was not installed.
+//
+//   Nested subcommands (`pkg install --dry-run …` where `install`
+//   would itself carry sub-subs) are out of scope for ENH-020;
+//   the flag_spec_reset on match wipes the sub table pointer so
+//   the sub's parse never re-enters the dispatch phase. A
+//   follow-on ENH would re-install a per-sub sub table before
+//   the sub's parse; the semver-safe shape is a
+//   SubSpec.sub_table_ptr / sub_table_count pair the parser reads
+//   between the flag_spec_reset and the flag_spec_register loop.
+//
+//   New klog tag: `pdxargv.subcommand`.
+//
 // libpdx-argv.ENH-026 (malformed-argv-slot classification):
 //   The classifier now rejects two argv shapes that fit neither the
 //   flag nor the positional grammar with
@@ -232,8 +311,13 @@
 // Cross-module symbols read/written (all resolved by unqualified name):
 //   ParsedArgs:      flag_names, flag_values, flag_count, pos_ptrs,
 //                    pos_count, error_code, error_arg_index, emit_schema,
-//                    flag_ids, flag_kinds, ddash_seen, ddash_arg_index
-//   FlagSpec::       lookup (called via qualified name)
+//                    flag_ids, flag_kinds, ddash_seen, ddash_arg_index,
+//                    subcommand_id (ENH-020, Closes #30)
+//   FlagSpec::       lookup (called via qualified name),
+//                    subcommand_table_ptr, subcommand_table_count
+//                    (read by ENH-020 dispatch phase),
+//                    flag_spec_reset, flag_spec_register (called by
+//                    ENH-020 dispatch phase on match)
 //   VersionBackend:: override_enabled, emit_default (ENH-032, Closes #25)
 //   HelpBackend::    doc_backend_unavailable, emit_from_argspec
 //                    (ENH-014, Closes #24)
@@ -326,7 +410,7 @@ module Parser = structure {
   pub let parse_argv_ex : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) (parse_flags: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2 + ENH-004 + ENH-013 + ENH-014 + ENH-017 + ENH-019 + ENH-026 + ENH-032 parse_argv_ex entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-017 (Closes #27) generalises the pre-ENH-017 parse_argv into a three-argument primary — the third argument (parse_flags: u64) is spilled to [rsp+0] (the alignment-pad slot the 6-push prologue already reserves; ENH-017 repurposes that byte-for-byte-idle padding without changing the prologue shape) and reloaded on every recoverable-fail gate. Bit 0 (ARGV_COLLECT_ALL_ERRORS): parser records each fail into ParsedArgs::error_ring_* and advances past the offending argv slot instead of returning; up to MAX_COLLECTED_ERRORS (16) records accumulate before subsequent fails are silently dropped from the ring. Also enables inline FKIND_INT value validation: after every store whose kind == 2 (FKIND_INT) and value != 0, calls Typed::parse_int_u64(value) and records ERR_BAD_INT (17) on ok == 0. Bit unset (parse_argv thin wrapper) preserves the pre-ENH-017 return-on-first-error behavior byte-for-byte, including that no inline INT validation is performed. First-error semantics: the FIRST error observed always writes error_code / error_arg_index and lands in error_ring[0]; the return value on any exit path with ring content is that first-error code (parse_argv_epilogue reads error_ring_codes[0] into rax before ret). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default and returns ERR_VERSION_EMITTED (13). ENH-014 (Closes #24): matching id 1 with HelpBackend::doc_backend_unavailable != 0 calls emit_from_argspec and returns ERR_HELP_EMITTED (15). These two auto-emit paths deliberately terminate the parse (they are success signals for the tool's exit-immediately behavior); they are NOT routed through the collect-all recovery machinery even when the bit is set. ENH-013 (Closes #23): the parse_argv_short_clustered arm is no longer an unconditional ERR_CLUSTERED_SHORT reject — it two-passes the cluster (validation via cluster_probe, dispatch via cluster_scratch_buf indexed by flag_count*2) and either expands `-abc` into three flag_count++ stores or fails with ERR_CLUSTER_WITH_ARITY (16) at the first value-consuming kind. ENH-019 (Closes #29): after every long-flag or short-flag store whose kind == FKIND_STR (1) AND value != null AND FlagSpec::last_lookup_allowed_count (published by the preceding call lookup, same shape as last_lookup_sep_required) is nonzero, the parser walks the caller-registered allowed-values array (an array of NUL-terminated string pointers, byte-compared case-sensitive via the same inline xor+mov_b+cmp shape lookup itself uses) and fails ERR_STRING_ENUM (18) on no match via parse_argv_string_enum → parse_argv_maybe_collect. The gate is on BOTH parse_argv and parse_argv_ex (independent of the ARGV_COLLECT_ALL_ERRORS bit) because the allowed set is a per-registration property opted into at register_string_enum time; the empty-set default (count == 0) skips the walk so every non-string-enum FKIND_STR registration preserves pre-ENH-019 behaviour. The cluster path is BOOL-only per ENH-013's admissibility rule, so no enum walk fires there. The same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for every added nested call (lookup/parse_int_u64/emit_default/emit_from_argspec).",
+      justification: "libpdx-argv.M2 + ENH-004 + ENH-013 + ENH-014 + ENH-017 + ENH-019 + ENH-020 + ENH-026 + ENH-032 parse_argv_ex entry point. ENH-020 (Closes #30): pre-loop subcommand dispatch phase gated on FlagSpec::subcommand_table_ptr != 0. When installed, argv[0] is skipped as program name (r13 starts at 1 by default), and if argv[1] is a plausible non-flag non-empty candidate the parser inline-strcmps it against each SubSpec.name in the caller-owned table (40-byte stride). First match wins → publish SubSpec.id into ParsedArgs::subcommand_id, hoist SubSpec.flag_specs_ptr / flag_count into callee-save r14/r15, call flag_spec_reset (wipes top-level FlagSpec AND the sub table pointer so no nested dispatch fires from the sub's own parse), then walk flag_specs (24-byte stride) calling flag_spec_register(name, kind, id) per entry; loop then starts at r13=2. Flag-shaped argv[1] (byte0 == '-') OR empty argv[1] OR missing argv[1] → no dispatch, top-level FlagSpec intact, loop starts at r13=1 (so StdVocab's --version / --help still fire from `git --version` / `git --help`). Non-flag argv[1] with no SubSpec match → ERR_UNKNOWN_SUBCOMMAND (19) via parse_argv_fail (hard-stop; no partial FlagSpec state touched — the reject happens BEFORE the flag_spec_reset in the match arm). The prologue's 6-push + sub rsp,8 keeps rsp%16 = 0 across the added flag_spec_reset and flag_spec_register nested calls in the match path (both callees preserve r13/r14/r15 since those are SysV callee-save; the callees themselves only clobber rax/rcx/r11 per their docstrings, so no stack spill of loop state is needed). --- Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-017 (Closes #27) generalises the pre-ENH-017 parse_argv into a three-argument primary — the third argument (parse_flags: u64) is spilled to [rsp+0] (the alignment-pad slot the 6-push prologue already reserves; ENH-017 repurposes that byte-for-byte-idle padding without changing the prologue shape) and reloaded on every recoverable-fail gate. Bit 0 (ARGV_COLLECT_ALL_ERRORS): parser records each fail into ParsedArgs::error_ring_* and advances past the offending argv slot instead of returning; up to MAX_COLLECTED_ERRORS (16) records accumulate before subsequent fails are silently dropped from the ring. Also enables inline FKIND_INT value validation: after every store whose kind == 2 (FKIND_INT) and value != 0, calls Typed::parse_int_u64(value) and records ERR_BAD_INT (17) on ok == 0. Bit unset (parse_argv thin wrapper) preserves the pre-ENH-017 return-on-first-error behavior byte-for-byte, including that no inline INT validation is performed. First-error semantics: the FIRST error observed always writes error_code / error_arg_index and lands in error_ring[0]; the return value on any exit path with ring content is that first-error code (parse_argv_epilogue reads error_ring_codes[0] into rax before ret). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default and returns ERR_VERSION_EMITTED (13). ENH-014 (Closes #24): matching id 1 with HelpBackend::doc_backend_unavailable != 0 calls emit_from_argspec and returns ERR_HELP_EMITTED (15). These two auto-emit paths deliberately terminate the parse (they are success signals for the tool's exit-immediately behavior); they are NOT routed through the collect-all recovery machinery even when the bit is set. ENH-013 (Closes #23): the parse_argv_short_clustered arm is no longer an unconditional ERR_CLUSTERED_SHORT reject — it two-passes the cluster (validation via cluster_probe, dispatch via cluster_scratch_buf indexed by flag_count*2) and either expands `-abc` into three flag_count++ stores or fails with ERR_CLUSTER_WITH_ARITY (16) at the first value-consuming kind. ENH-019 (Closes #29): after every long-flag or short-flag store whose kind == FKIND_STR (1) AND value != null AND FlagSpec::last_lookup_allowed_count (published by the preceding call lookup, same shape as last_lookup_sep_required) is nonzero, the parser walks the caller-registered allowed-values array (an array of NUL-terminated string pointers, byte-compared case-sensitive via the same inline xor+mov_b+cmp shape lookup itself uses) and fails ERR_STRING_ENUM (18) on no match via parse_argv_string_enum → parse_argv_maybe_collect. The gate is on BOTH parse_argv and parse_argv_ex (independent of the ARGV_COLLECT_ALL_ERRORS bit) because the allowed set is a per-registration property opted into at register_string_enum time; the empty-set default (count == 0) skips the walk so every non-string-enum FKIND_STR registration preserves pre-ENH-019 behaviour. The cluster path is BOOL-only per ENH-013's admissibility rule, so no enum walk fires there. The same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for every added nested call (lookup/parse_int_u64/emit_default/emit_from_argspec).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -346,7 +430,152 @@ module Parser = structure {
 
         mov rbx, rdi;                       // rbx = argv base
         mov r12, rsi;                       // r12 = argc
-        xor r13, r13;                       // r13 = i = 0
+        xor r13, r13;                       // r13 = i = 0 (default: no sub dispatch)
+
+        // -- ENH-020 (Closes #30) subcommand dispatch phase ------------
+        // Gated on FlagSpec::subcommand_table_ptr != 0. See the module-
+        // level preamble ENH-020 note for the full state-machine. In
+        // brief:
+        //   - Pointer OR count == 0                → no dispatch, r13=0
+        //   - argc < 2                             → no dispatch, r13=1
+        //   - argv[1][0] == '-' OR argv[1][0] == 0 → no dispatch, r13=1
+        //   - argv[1] matches a SubSpec.name       → install sub's
+        //                                            flag_specs, r13=2
+        //   - argv[1] present but no match         → ERR_UNKNOWN_SUBCOMMAND
+        //                                            via parse_argv_fail
+        //
+        // Register plan (all callee-save; leaf-safe across nested calls):
+        //   r13 = final loop start index (0 / 1 / 2 by dispatch outcome;
+        //         also reused as the scan index inside the dispatch phase
+        //         itself since the parse loop has not yet started)
+        //   r14 = subcommand_table_ptr, then sub's flag_specs_ptr
+        //   r15 = subcommand_table_count, then sub's flag_count
+        //   rax, rcx, r8, r9, r11 = scratch (all caller-save)
+        //
+        // rdx holds argv[1] throughout the sub-name walk; every strcmp
+        // iteration takes a fresh copy into rsi so the walk cursor never
+        // clobbers the base pointer. flag_spec_reset / flag_spec_register
+        // clobber only rax/rcx/r11 (per their docstrings), so r13/r14/r15
+        // survive both nested calls without a stack spill.
+        lea r11, [rip + subcommand_table_ptr];
+        mov rax, [r11];
+        cmp rax, 0;
+        je parse_argv_loop_head;            // no table → r13 stays 0
+
+        // Table registered. Skip argv[0] as program name by default.
+        mov r13, 1;
+
+        lea r11, [rip + subcommand_table_count];
+        mov r15, [r11];
+        cmp r15, 0;
+        je parse_argv_loop_head;            // empty table → no dispatch
+
+        cmp r12, 2;
+        jl parse_argv_loop_head;            // no argv[1] → no dispatch
+
+        mov rdx, [rbx + 8];                 // rdx = argv[1]
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je parse_argv_loop_head;            // empty argv[1] → no dispatch
+        cmp rax, 0x2D;                      // '-'
+        je parse_argv_loop_head;            // flag-shaped argv[1] → no
+                                            // dispatch (StdVocab handles
+                                            // --version/--help at top level)
+
+        // argv[1] is a plausible sub-name candidate. Walk the sub table.
+        lea r11, [rip + subcommand_table_ptr];
+        mov r14, [r11];                     // r14 = table_ptr
+        mov r13, 0;                         // r13 = scan_idx (temporary; overwritten below)
+
+      parse_argv_sub_scan_head:
+        cmp r13, r15;
+        jge parse_argv_sub_unknown;
+
+        // entry_ptr = r14 + r13 * 40. Use shl+add (no 2-op imul; the
+        // shift form stays inside the R49 encoder subset).
+        mov r8, r13;
+        shl r8, 5;                          // r13 * 32
+        mov r9, r13;
+        shl r9, 3;                          // r13 * 8
+        add r8, r9;                         // r13 * 40
+        add r8, r14;                        // &sub_table[r13]
+
+        mov rdi, [r8 + 0];                  // sub.name (SUBSPEC_OFF_NAME = 0)
+        mov rsi, rdx;                       // fresh argv[1] cursor
+
+      parse_argv_sub_strcmp_head:
+        xor rax, rax; mov_b rax, [rdi];
+        xor r9, r9;   mov_b r9, [rsi];
+        cmp rax, r9;
+        jne parse_argv_sub_scan_next;
+        cmp rax, 0;
+        je parse_argv_sub_match;
+        add rdi, 1;
+        add rsi, 1;
+        jmp parse_argv_sub_strcmp_head;
+
+      parse_argv_sub_scan_next:
+        add r13, 1;
+        jmp parse_argv_sub_scan_head;
+
+      parse_argv_sub_match:
+        // r8 = matched SubSpec entry pointer. Publish subcommand_id,
+        // hoist flag_specs_ptr / flag_count into r14/r15 (callee-save
+        // → survive both nested calls), then reset FlagSpec and
+        // register each SubFlagSpec entry.
+        mov rax, [r8 + 8];                  // SUBSPEC_OFF_ID
+        lea r11, [rip + subcommand_id];
+        mov [r11], rax;
+
+        mov r14, [r8 + 16];                 // SUBSPEC_OFF_FLAG_SPECS
+        mov r15, [r8 + 24];                 // SUBSPEC_OFF_FLAG_COUNT
+
+        call flag_spec_reset;               // wipes top-level table AND
+                                            // the sub table pointer/count
+                                            // (no nested dispatch fires
+                                            // from the sub's own parse)
+
+        xor r13, r13;                       // r13 = flag_specs walk idx
+
+      parse_argv_sub_reg_head:
+        cmp r13, r15;
+        jge parse_argv_sub_reg_done;
+
+        // entry_ptr = r14 + r13 * 24 (SUBFLAGSPEC_STRIDE).
+        mov r8, r13;
+        shl r8, 4;                          // r13 * 16
+        mov r9, r13;
+        shl r9, 3;                          // r13 * 8
+        add r8, r9;                         // r13 * 24
+        add r8, r14;                        // &flag_specs[r13]
+
+        mov rdi, [r8 + 0];                  // SUBFLAGSPEC_OFF_NAME
+        mov rsi, [r8 + 8];                  // SUBFLAGSPEC_OFF_KIND
+        mov rdx, [r8 + 16];                 // SUBFLAGSPEC_OFF_ID
+        call flag_spec_register;            // preserves r13/r14/r15
+                                            // (uses only rax/rcx/r11 +
+                                            // its own push rbx for align)
+
+        add r13, 1;
+        jmp parse_argv_sub_reg_head;
+
+      parse_argv_sub_reg_done:
+        // Both argv[0] (program name) and argv[1] (sub name) consumed.
+        mov r13, 2;
+        jmp parse_argv_loop_head;
+
+      parse_argv_sub_unknown:
+        // argv[1] is a plausible candidate but no SubSpec.name matched.
+        // Route through the hard-fail path — ENH-017 collect-all mode
+        // is inapplicable (no ParsedArgs storage attempted; no way to
+        // advance-past coherently), and no FlagSpec state was touched
+        // (this label runs BEFORE the flag_spec_reset in the match
+        // path), so a caller inspecting FlagSpec after the fail sees
+        // the top-level table intact.
+        mov rax, 19;                        // ERR_UNKNOWN_SUBCOMMAND
+        mov r13, 1;                         // argv_index = 1
+        jmp parse_argv_fail;
 
       parse_argv_loop_head:
         cmp r13, r12;

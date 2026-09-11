@@ -496,6 +496,46 @@ whole-buffer header failure.
                                      at the dispatch site. Klog tag:
                                      pdxargv.int-range.
 
+  ERR_UNKNOWN_SUBCOMMAND (19)      caller-installed subcommand
+                                     table saw no SubSpec.name that
+                                     byte-matches (case-sensitive)
+                                     the argv slot the parser
+                                     selected as the subcommand-
+                                     name candidate — today argv[1]
+                                     when it is present, non-empty,
+                                     and does not start with `-`
+                                     (libpdx-argv.ENH-020, #30). Set
+                                     by Parser::parse_argv_ex only,
+                                     and only when
+                                     FlagSpec::subcommand_table_ptr
+                                     is nonzero (`register_subcommands`
+                                     was called). A parser that sees
+                                     the ptr == 0 short-circuits the
+                                     dispatch phase entirely, so
+                                     every pre-ENH-020 consumer that
+                                     never installs a table sees no
+                                     behavior change on this code.
+                                     Routed through the hard-stop
+                                     path (parse_argv_fail) rather
+                                     than the ENH-017 recoverable
+                                     router because no ParsedArgs
+                                     storage was ever attempted and
+                                     no coherent advance-past
+                                     recovery exists (the sub's
+                                     flag_spec table was not
+                                     installed, so every subsequent
+                                     argv slot would either fail
+                                     under strict mode or store
+                                     ambiguously under permissive
+                                     mode). No FlagSpec state is
+                                     touched on this path — the
+                                     reject happens BEFORE the
+                                     match-arm's flag_spec_reset +
+                                     sub install, so a caller's
+                                     post-parse inspection sees the
+                                     top-level table intact. Klog
+                                     tag: pdxargv.subcommand.
+
 `ERR_UNKNOWN_ARG_FORM` (3) fires when an argv slot is neither
 flag-shaped (starts with `-` AND has at least one byte after) NOR a
 valid positional (does NOT start with `-` AND is non-empty)
@@ -678,6 +718,31 @@ in .rodata (27 chars + NUL).
                        the parse under both modes; ring caps silently
                        (extra errors dropped from the ring, parse
                        still advances).
+
+  Unreleased          libpdx-argv.ENH-020 (Closes #30) — git-shape
+                       subcommand dispatch. Adds
+                       FlagSpec::register_subcommands (installs a
+                       caller-owned SubSpec table at 40-byte stride;
+                       each SubSpec holds {name, id, flag_specs_ptr,
+                       flag_count, help_ptr}; each SubFlagSpec entry
+                       at 24-byte stride mirrors flag_spec_register's
+                       {name, kind, id} tuple), a pre-loop dispatch
+                       phase in Parser::parse_argv_ex that skips
+                       argv[0] as program name when a table is
+                       installed and dispatches on argv[1] (flag-
+                       shaped argv[1] short-circuits so
+                       git --version still triggers StdVocab; match
+                       calls flag_spec_reset + re-registers the
+                       sub's flag_specs and starts the loop at
+                       argv[2]; non-flag argv[1] with no match
+                       fires ERR_UNKNOWN_SUBCOMMAND=19 via hard-
+                       stop). Adds ParsedArgs::subcommand_id (0 if
+                       no dispatch happened; matched sub's id
+                       otherwise) and ERR_UNKNOWN_SUBCOMMAND=19.
+                       Callers who never call register_subcommands
+                       see zero behavior change — the phase
+                       short-circuits at the null-pointer check.
+                       Klog tag: pdxargv.subcommand.
 
 .section AUTHORS
   paideia-os-team.  Repo: github.com/paideia-os/libpdx-argv.

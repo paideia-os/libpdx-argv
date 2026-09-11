@@ -1,0 +1,515 @@
+// tests/parse_subcommands.pdx — libpdx-argv.ENH-020 (Closes #30)
+// Git-shape subcommand dispatch regression fixtures.
+//
+// ENH-020 lets a caller register a `SubSpec` table via
+// `FlagSpec::register_subcommands(table_ptr, count)`. When
+// `Parser::parse_argv_ex` sees a table installed AND argv[1] is a
+// plausible non-flag candidate, it inline-strcmps the candidate
+// against each SubSpec.name; a match installs that sub's
+// `flag_specs` array (via a nested `flag_spec_reset` +
+// `flag_spec_register` loop) and starts the main argv walk at
+// argv[2]. A non-flag candidate that matches no SubSpec fails
+// `ERR_UNKNOWN_SUBCOMMAND` (19) via the hard-fail path.
+//
+// Six cases cover:
+//   1. `["git", "commit", "--message", "hi"]` — dispatch to
+//      commit, --message consumes lookahead "hi" as its value.
+//      Fingerprint: subcommand_id=1, flag_count=1,
+//      find_flag_by_id(200) != 32, err_code=0.
+//   2. `["git", "push", "--force"]` — dispatch to push, --force
+//      stored as boolean. Fingerprint: subcommand_id=2,
+//      flag_count=1, find_flag_by_id(201) != 32.
+//   3. `["git", "clone"]` — unknown subcommand. Fingerprint:
+//      rax=19, error_code=19, error_arg_index=1, subcommand_id=0
+//      (never overwritten because dispatch fails BEFORE the
+//      publish store).
+//   4. `["git", "--version"]` — argv[1] is a flag; sub dispatch
+//      short-circuits, StdVocab's --version auto-emit fires with
+//      the top-level FlagSpec table still intact. Fingerprint:
+//      rax=13 (ERR_VERSION_EMITTED), subcommand_id=0.
+//   5. `["--json"]` — WITHOUT any subcommand table registered:
+//      parse_argv is byte-for-byte unchanged (no argv[0] skip,
+//      no dispatch phase entered). Fingerprint: rax=0,
+//      flag_count=1, pos_count=0, subcommand_id=0. This is the
+//      "50 existing matrix cases unchanged" witness the issue
+//      calls out.
+//   6. `["git", "commit", "--message=hi"]` — inline `=` form
+//      inside a dispatched sub. Same expected result as case 1,
+//      exercising the parser's name-walk / in-place NUL-terminate
+//      / value-pointer publish path with sub's flag_specs
+//      installed rather than top-level's.
+//
+// Module id in TestHarness::last_fail_tag: 10 (next after
+// SchemaEmitTests=8; 9 was reserved for parse_mixed and remains
+// unclaimed).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseSubcommandsTests (PascalCase basename).
+//   - run_case* fns non-leaf; 1-push (rbx) prologue where they
+//     have no other callee-save spill; larger prologues where a
+//     case needs r15 too.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max seen: 200, 201, 32).
+//   - The sub_table + per-sub flag_specs arrays are populated at
+//     test time by `setup_sub_table` (a shared helper each case
+//     re-invokes after full_reset); paideia-as 0.36 does not
+//     support pointer-typed initializer lists in .rodata, so we
+//     stage the pointers into .bss slots at bootstrap.
+
+module ParseSubcommands = structure {
+
+  // -- Subcommand names (SubSpec.name pointees; NUL-terminated) -------
+  pub let name_commit  : [u8; 7]  = "commit\0"
+  pub let name_push    : [u8; 5]  = "push\0"
+
+  // -- Per-sub flag names (SubFlagSpec.name_ptr pointees) -------------
+  pub let name_message : [u8; 8]  = "message\0"
+  pub let name_force   : [u8; 6]  = "force\0"
+
+  // -- SubSpec.help pointees. Not consulted by the ENH-020 parser
+  // -- dispatch; reserved for a follow-on `sub --help` traversal.
+  pub let help_commit  : [u8; 15] = "commit changes\0"
+  pub let help_push    : [u8; 14] = "push branches\0"
+
+  // -- Argv literals. Every argv slot must be writable (the parser's
+  // -- inline `=` / `:` walk in-place NUL-terminates at the separator
+  // -- byte per parse_argv_name_has_sep). Follow the existing
+  // -- ParseTypedArgsTests case3 precedent: `pub let X : [u8; N] =
+  // -- "..."` places the literal in a section the parser can write
+  // -- into. Bare flag literals never carry an inline separator so
+  // -- they are also fine.
+  pub let a_git        : [u8; 4]  = "git\0"
+  pub let a_clone      : [u8; 6]  = "clone\0"
+  pub let a_flag_msg   : [u8; 10] = "--message\0"
+  pub let a_flag_force : [u8; 8]  = "--force\0"
+  pub let a_flag_msg_eq: [u8; 13] = "--message=hi\0"
+  pub let a_hi         : [u8; 3]  = "hi\0"
+  pub let a_version    : [u8; 10] = "--version\0"
+  pub let a_json       : [u8; 7]  = "--json\0"
+
+  // -- SubFlagSpec entries: {name_ptr, kind, id} = 24 bytes / 3 u64. -
+  // -- commit_specs[0..3] = { &name_message, FKIND_STR (1), id=200 }
+  // -- push_specs  [0..3] = { &name_force,   FKIND_BOOL (0), id=201 }
+  pub let mut commit_specs : [u64; 3] = uninit @align(8)
+  pub let mut push_specs   : [u64; 3] = uninit @align(8)
+
+  // -- SubSpec table: 2 entries × 40 bytes = 80 bytes = 10 u64.
+  // --   [0..5]  commit: {&name_commit, id=1, &commit_specs, 1, &help_commit}
+  // --   [5..10] push  : {&name_push,   id=2, &push_specs,   1, &help_push}
+  pub let mut sub_table : [u64; 10] = uninit @align(8)
+
+  // -- Per-case argv backing arrays (bss; filled inline) -------------
+  pub let mut argv_case1 : [u64; 4] = uninit @align(8)   // git commit --message hi
+  pub let mut argv_case2 : [u64; 3] = uninit @align(8)   // git push --force
+  pub let mut argv_case3 : [u64; 2] = uninit @align(8)   // git clone
+  pub let mut argv_case4 : [u64; 2] = uninit @align(8)   // git --version
+  pub let mut argv_case5 : [u64; 1] = uninit @align(8)   // --json
+  pub let mut argv_case6 : [u64; 3] = uninit @align(8)   // git commit --message=hi
+
+  // ============================================================
+  // setup_sub_table()
+  // Signature: () -> () !{mem} @{}
+  //
+  // Test-time initialiser for the SubSpec + SubFlagSpec byte layouts.
+  // paideia-as 0.36 does not currently accept a mix of pointer- and
+  // integer-typed values in a `pub let` initializer list, so we
+  // populate the mutable .bss slots here and every case calls this
+  // helper right after `full_reset` (which zeros ParsedArgs / FlagSpec /
+  // etc. but does NOT touch these test-owned .bss buffers).
+  //
+  // Byte layout of each 40-byte SubSpec entry (see FlagSpec's
+  // SUBSPEC_OFF_* constants for the same names):
+  //   +0   name_ptr
+  //   +8   id
+  //   +16  flag_specs_ptr
+  //   +24  flag_count
+  //   +32  help_ptr
+  //
+  // Byte layout of each 24-byte SubFlagSpec entry:
+  //   +0   name_ptr
+  //   +8   kind
+  //   +16  id
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = scratch (holds the value being stored)
+  //   r11 = lea scratch (row base for both table and per-sub arrays)
+  //
+  // No cmp instructions; every store is a plain qword mov with an
+  // imm ≤ 72 (well ≤ 0x7FFFFFFF). No test mnemonic; no reserved-word
+  // labels needed (no branches).
+  // ============================================================
+  pub let setup_sub_table : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) test helper — populates ParseSubcommandsTests's SubSpec table and per-sub SubFlagSpec arrays at test time. Two SubSpec entries (commit id=1 with --message FKIND_STR id=200; push id=2 with --force FKIND_BOOL id=201) plus the pointer initialisers into commit_specs and push_specs. Leaf; only caller-save regs. Every store is a plain [r11 + imm], reg with imm ≤ 72 (well inside imm8 → imm32 encoder subset). Two full lea rax for each pointer initialiser (paideia-as 0.36 does not support a `lea [r11 + N], addr` two-operand form; every pointer store is a lea-into-scratch then store-through-r11 pair).",
+      block: {
+        // commit_specs = { &name_message, FKIND_STR (1), 200 }
+        lea r11, [rip + commit_specs];
+        lea rax, [rip + name_message];
+        mov [r11 + 0], rax;
+        mov rax, 1;                          // FKIND_STR
+        mov [r11 + 8], rax;
+        mov rax, 200;
+        mov [r11 + 16], rax;
+
+        // push_specs = { &name_force, FKIND_BOOL (0), 201 }
+        lea r11, [rip + push_specs];
+        lea rax, [rip + name_force];
+        mov [r11 + 0], rax;
+        xor rax, rax;                        // FKIND_BOOL
+        mov [r11 + 8], rax;
+        mov rax, 201;
+        mov [r11 + 16], rax;
+
+        // sub_table[0..5]: commit entry
+        lea r11, [rip + sub_table];
+        lea rax, [rip + name_commit];
+        mov [r11 + 0], rax;                  // name_ptr
+        mov rax, 1;
+        mov [r11 + 8], rax;                  // id
+        lea rax, [rip + commit_specs];
+        mov [r11 + 16], rax;                 // flag_specs_ptr
+        mov rax, 1;
+        mov [r11 + 24], rax;                 // flag_count
+        lea rax, [rip + help_commit];
+        mov [r11 + 32], rax;                 // help_ptr
+
+        // sub_table[5..10]: push entry (byte offset 40)
+        lea rax, [rip + name_push];
+        mov [r11 + 40], rax;
+        mov rax, 2;
+        mov [r11 + 48], rax;
+        lea rax, [rip + push_specs];
+        mov [r11 + 56], rax;
+        mov rax, 1;
+        mov [r11 + 64], rax;
+        lea rax, [rip + help_push];
+        mov [r11 + 72], rax;
+
+        ret;
+      }
+    }
+
+  // ============================================================
+  // run_case1  Dispatch to commit; --message consumes "hi" lookahead.
+  //   Setup: sub_table installed; commit sub carries --message FKIND_STR id=200.
+  //   argv: ["git", "commit", "--message", "hi"]
+  //   Expected: rax=0, subcommand_id=1, flag_count=1,
+  //             find_flag_by_id(200) != 32, error_code=0.
+  // ============================================================
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) case1 — commit dispatch + lookahead value. argv[0]='git' skipped as program name; argv[1]='commit' matches SubSpec[0].name → subcommand_id=1 published, top-level FlagSpec wiped, commit_specs re-registered (--message FKIND_STR id=200). Loop starts at argv[2]='--message', consumes argv[3]='hi' as the lookahead value. Verifies the store block populated flag_ids so find_flag_by_id(200) returns a valid slot. 1-push (rbx) prologue aligns rsp%16 for the nested full_reset + setup_sub_table + register_subcommands + parse_argv + find_flag_by_id calls. Module id 10, case 1 → tag 0xA00000001 on fail.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call setup_sub_table;
+
+        // Install the sub table (2 entries).
+        lea rdi, [rip + sub_table];
+        mov rsi, 2;
+        call register_subcommands;
+
+        // Fill argv_case1[0..4] with the four argv slot pointers.
+        lea rbx, [rip + argv_case1];
+        lea r11, [rip + a_git];        mov [rbx + 0],  r11;
+        lea r11, [rip + name_commit];  mov [rbx + 8],  r11;
+        lea r11, [rip + a_flag_msg];   mov [rbx + 16], r11;
+        lea r11, [rip + a_hi];         mov [rbx + 24], r11;
+
+        lea rdi, [rip + argv_case1];
+        mov rsi, 4;
+        call parse_argv;
+        cmp rax, 0; jne sub_case1_fail;
+
+        // subcommand_id == 1
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case1_fail;
+
+        // flag_count == 1
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case1_fail;
+
+        // find_flag_by_id(200) != 32
+        mov rdi, 200;
+        call find_flag_by_id;
+        cmp rax, 32; je sub_case1_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sub_case1_fail:
+        mov rdi, 0xA00000001;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // run_case2  Dispatch to push; --force stored as boolean.
+  //   argv: ["git", "push", "--force"]
+  //   Expected: rax=0, subcommand_id=2, flag_count=1,
+  //             find_flag_by_id(201) != 32.
+  // ============================================================
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) case2 — push dispatch + boolean flag. Same shape as case1 but the sub is push (id=2) with --force FKIND_BOOL id=201; the boolean kind means the parser never consumes a lookahead value, so argc=3 is sufficient (no fourth slot needed). Verifies the second SubSpec entry (offset 40 in the table) is reachable — a stride miscalculation in the sub table walk would break case2 while leaving case1 green. Module id 10, case 2 → tag 0xA00000002.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call setup_sub_table;
+
+        lea rdi, [rip + sub_table];
+        mov rsi, 2;
+        call register_subcommands;
+
+        lea rbx, [rip + argv_case2];
+        lea r11, [rip + a_git];        mov [rbx + 0],  r11;
+        lea r11, [rip + name_push];    mov [rbx + 8],  r11;
+        lea r11, [rip + a_flag_force]; mov [rbx + 16], r11;
+
+        lea rdi, [rip + argv_case2];
+        mov rsi, 3;
+        call parse_argv;
+        cmp rax, 0; jne sub_case2_fail;
+
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        cmp rax, 2; jne sub_case2_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case2_fail;
+
+        mov rdi, 201;
+        call find_flag_by_id;
+        cmp rax, 32; je sub_case2_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sub_case2_fail:
+        mov rdi, 0xA00000002;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // run_case3  Unknown subcommand → ERR_UNKNOWN_SUBCOMMAND.
+  //   argv: ["git", "clone"]
+  //   Expected: rax=19, error_code=19, error_arg_index=1,
+  //             subcommand_id=0 (dispatch failed BEFORE the publish).
+  // ============================================================
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) case3 — unknown subcommand hard-fail. Sub table has commit + push; argv[1]='clone' matches neither. The dispatch phase's parse_argv_sub_unknown label routes to parse_argv_fail with rax=19 and r13=1, so error_code=19, error_arg_index=1, and ring[0]=(19,1). subcommand_id stays 0 because the publish store happens only in parse_argv_sub_match, not on the unknown path. Module id 10, case 3 → tag 0xA00000003.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call setup_sub_table;
+
+        lea rdi, [rip + sub_table];
+        mov rsi, 2;
+        call register_subcommands;
+
+        lea rbx, [rip + argv_case3];
+        lea r11, [rip + a_git];    mov [rbx + 0], r11;
+        lea r11, [rip + a_clone];  mov [rbx + 8], r11;
+
+        lea rdi, [rip + argv_case3];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 19; jne sub_case3_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 19; jne sub_case3_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case3_fail;
+
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        cmp rax, 0; jne sub_case3_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sub_case3_fail:
+        mov rdi, 0xA00000003;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // run_case4  Flag-shaped argv[1] → StdVocab precedence.
+  //   argv: ["git", "--version"]  with StdVocab register_all
+  //         AND sub table installed.
+  //   Expected: rax=13 (ERR_VERSION_EMITTED — auto-emit fires),
+  //             subcommand_id=0 (no dispatch attempted because
+  //             argv[1] starts with '-').
+  // ============================================================
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) case4 — StdVocab precedence over subcommand dispatch. Sub table + StdVocab both registered; argv[1]='--version' starts with '-' so the dispatch phase's flag-shaped short-circuit fires (jump to parse_argv_loop_head with r13=1, top-level FlagSpec intact). The main loop enters at argv[1]='--version', looks up in StdVocab (id=STD_ID_VERSION=2, FKIND_BOOL), stores, and the ENH-032 auto-emit dispatch fires because VersionBackend::override_enabled == 0 (full_reset via pdxargv_version_reset). Verifies the git-shape `git --version` idiom keeps working when a sub table is installed. Module id 10, case 4 → tag 0xA00000004.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call setup_sub_table;
+        call register_all;                   // StdVocab
+
+        lea rdi, [rip + sub_table];
+        mov rsi, 2;
+        call register_subcommands;
+
+        lea rbx, [rip + argv_case4];
+        lea r11, [rip + a_git];      mov [rbx + 0], r11;
+        lea r11, [rip + a_version];  mov [rbx + 8], r11;
+
+        lea rdi, [rip + argv_case4];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 13; jne sub_case4_fail;    // ERR_VERSION_EMITTED
+
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        cmp rax, 0; jne sub_case4_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sub_case4_fail:
+        mov rdi, 0xA00000004;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // run_case5  Without any sub table registered, parse behaviour
+  //             is byte-for-byte pre-ENH-020.
+  //   Setup: StdVocab registered; NO register_subcommands call.
+  //   argv: ["--json"]
+  //   Expected: rax=0, flag_count=1, pos_count=0,
+  //             subcommand_id=0 (never touched — dispatch phase
+  //             short-circuits at the null pointer check),
+  //             find_flag_by_id(STD_ID_JSON=4) != 32.
+  // ============================================================
+  pub let run_case5 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) case5 — no-sub-table backward-compat witness. Deliberately does NOT call register_subcommands (nor does it call setup_sub_table); the parser sees subcommand_table_ptr == 0 and skips the ENH-020 dispatch phase entirely (r13 stays 0; argv[0] is treated as an ordinary token per the pre-ENH-020 M2 shape). Parses ['--json'] with StdVocab installed; verifies flag_count=1, --json id (STD_ID_JSON=4) reachable, subcommand_id=0. This is the '50 existing matrix cases unchanged' regression witness the issue text calls out — a bug in the dispatch phase's null-pointer gate would break case5 while leaving cases 1-4 green. Module id 10, case 5 → tag 0xA00000005.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;                   // StdVocab only, no sub table
+
+        lea rbx, [rip + argv_case5];
+        lea r11, [rip + a_json];  mov [rbx + 0], r11;
+
+        lea rdi, [rip + argv_case5];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 0; jne sub_case5_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case5_fail;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 0; jne sub_case5_fail;
+
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        cmp rax, 0; jne sub_case5_fail;
+
+        mov rdi, 4;                          // STD_ID_JSON
+        call find_flag_by_id;
+        cmp rax, 32; je sub_case5_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sub_case5_fail:
+        mov rdi, 0xA00000005;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // run_case6  Dispatched sub + inline `=` form.
+  //   argv: ["git", "commit", "--message=hi"]
+  //   Expected: rax=0, subcommand_id=1, flag_count=1,
+  //             find_flag_by_id(200) != 32 (find the --message slot).
+  //   Exercises: the sub's FlagSpec install correctly routes an
+  //             inline-value flag through the main parser's
+  //             parse_argv_name_has_sep path (the parser walks the
+  //             '=' separator, writes NUL in place, and publishes
+  //             the value pointer past the NUL). A regression in
+  //             the sub install (e.g. wrong kind or id copy) would
+  //             break this case while leaving case1 (lookahead
+  //             form) green.
+  // ============================================================
+  pub let run_case6 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) case6 — inline `=` form after dispatch. Same commit-dispatch shape as case1 but the third argv slot is `--message=hi` (one string, not two). The parser's parse_argv_name_has_sep path in-place NUL-terminates the '=' and stores 'hi' as flag_values[k]; we verify only the storage-side observables (subcommand_id + flag_count + find_flag_by_id) rather than the byte content of flag_values[k] to keep this test independent of the parser's internal cursor discipline. Module id 10, case 6 → tag 0xA00000006.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call setup_sub_table;
+
+        lea rdi, [rip + sub_table];
+        mov rsi, 2;
+        call register_subcommands;
+
+        lea rbx, [rip + argv_case6];
+        lea r11, [rip + a_git];         mov [rbx + 0],  r11;
+        lea r11, [rip + name_commit];   mov [rbx + 8],  r11;
+        lea r11, [rip + a_flag_msg_eq]; mov [rbx + 16], r11;
+
+        lea rdi, [rip + argv_case6];
+        mov rsi, 3;
+        call parse_argv;
+        cmp rax, 0; jne sub_case6_fail;
+
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case6_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne sub_case6_fail;
+
+        mov rdi, 200;
+        call find_flag_by_id;
+        cmp rax, 32; je sub_case6_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      sub_case6_fail:
+        mov rdi, 0xA00000006;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+}

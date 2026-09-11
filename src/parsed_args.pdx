@@ -225,6 +225,37 @@ module ParsedArgs = structure {
   //
   // New klog tag: `pdxargv.string-enum`.
   pub let ERR_STRING_ENUM               : u64 = 18
+  // Added by libpdx-argv.ENH-020 (Closes #30): a caller-registered
+  // subcommand table did NOT contain an entry whose name byte-matches
+  // (case-sensitive) the argv slot the parser selected as the
+  // subcommand-name candidate (today: argv[1] when it is present, is
+  // non-empty, and does not start with '-'). Set only by
+  // `Parser::parse_argv_ex` and only when `FlagSpec::subcommand_table_ptr`
+  // is nonzero — a parse against a callee that never called
+  // `FlagSpec::register_subcommands` never trips this code, because
+  // the dispatch phase short-circuits at the pointer check before
+  // ever comparing names. `error_arg_index` records the argv slot of
+  // the offending candidate (today always 1; a future ENH may extend
+  // the classifier to scan for the first non-flag past argv[1] and
+  // adjust accordingly).
+  //
+  // Store discipline: no partial FlagSpec install happens on this
+  // path — the parser jumps to `parse_argv_fail` BEFORE the
+  // `flag_spec_reset` + sub's `flag_specs` re-registration block, so
+  // a caller inspecting FlagSpec state after an unknown-subcommand
+  // reject sees the top-level table as it was before the parse
+  // started (a `flag_spec_reset` from the harness before the next
+  // parse still applies). This mirrors the ENH-013 cluster fail
+  // (no partial ParsedArgs storage) so consumer diagnostics are
+  // consistent across the two "reject before commit" fail shapes.
+  //
+  // Nested / multi-level subcommands (`pkg install --dry-run …`
+  // style, where `install` would itself have sub-subs) are out of
+  // scope for ENH-020 — a nested table trips the same code at the
+  // outer level today; the semver-safe extension is a future ENH.
+  //
+  // New klog tag: `pdxargv.subcommand`.
+  pub let ERR_UNKNOWN_SUBCOMMAND        : u64 = 19
 
   // --- ENH-017 collect-all-errors mode (Closes #27) -------------------
   // `Parser::parse_argv_ex(argv, argc, parse_flags)` opts into
@@ -301,6 +332,21 @@ module ParsedArgs = structure {
   pub let mut ddash_seen        : u64       = uninit @align(8)
   pub let mut ddash_arg_index   : u64       = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-020 (Closes #30): the id of the
+  // subcommand the parser dispatched to (from the matched
+  // `SubSpec.id` field), or 0 if no dispatch happened (either
+  // because no subcommand table was registered, or because the
+  // registered table saw no valid candidate at argv[1] — a flag
+  // slot, a bare `--` sentinel-shaped slot before it reaches the
+  // dispatch phase, or the argv was short enough to have no
+  // argv[1]). The 0 sentinel is safe: a caller registering
+  // subcommands should choose ids ≥ 1 (SubSpec.id == 0 is reserved
+  // for "no dispatch"), and any legitimate dispatch overwrites
+  // this slot with the sub's nonzero id inside `parse_argv_ex`
+  // before the main argv walk starts. Zeroed by
+  // `parsed_args_reset` so each parse starts with a clean slot.
+  pub let mut subcommand_id     : u64       = uninit @align(8)
+
   // Added by libpdx-argv.ENH-017 (Closes #27): parallel arrays that
   // together hold the accumulated (err_code, argv_index) pairs from
   // the current parse. `error_ring_count` is the live entry count
@@ -336,7 +382,7 @@ module ParsedArgs = structure {
   pub let parsed_args_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M1-001 + M2 additions + ENH-017 + ENH-030 rename: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count. ENH-017 adds error_ring_count — the error_ring_codes / error_ring_indices arrays are consumed by index up to error_ring_count, so trailing entries stay stale and error_at() gates reads on the count. ENH-030 renames the exported symbol from `reset` to `parsed_args_reset` to end the multi-module link collision — body otherwise byte-identical to the M1 shape.",
+      justification: "libpdx-argv.M1-001 + M2 additions + ENH-017 + ENH-020 + ENH-030 rename: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count. ENH-017 adds error_ring_count — the error_ring_codes / error_ring_indices arrays are consumed by index up to error_ring_count, so trailing entries stay stale and error_at() gates reads on the count. ENH-020 (Closes #30) adds subcommand_id — zeroed here so a parse against a caller that never registered a subcommand table (subcommand_table_ptr == 0) or that hit the argv[1]-is-flag / argv[1]-absent short-circuit still reads back subcommand_id == 0 as the 'no dispatch' sentinel. ENH-030 renames the exported symbol from `reset` to `parsed_args_reset` to end the multi-module link collision — body otherwise byte-identical to the M1 shape.",
       block: {
         xor rax, rax;                            // rax = 0
         lea r11, [rip + flag_count];        mov [r11], rax;
@@ -347,6 +393,7 @@ module ParsedArgs = structure {
         lea r11, [rip + ddash_seen];        mov [r11], rax;
         lea r11, [rip + ddash_arg_index];   mov [r11], rax;
         lea r11, [rip + error_ring_count];  mov [r11], rax;
+        lea r11, [rip + subcommand_id];     mov [r11], rax;
         ret;
       }
     }

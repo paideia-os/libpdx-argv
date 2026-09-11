@@ -79,7 +79,25 @@ check is orthogonal to ENH-017's collect-mode opt-in. Empty
 allowed_count is the "gate OFF" sentinel and preserves pre-ENH-019
 behavior for every consumer that never called
 `register_string_enum`. The stored flag slot is NOT rolled back —
-same discipline as `ERR_BAD_INT`).
+same discipline as `ERR_BAD_INT`),
+`ERR_UNKNOWN_SUBCOMMAND` 19 (`libpdx-argv.ENH-020`, Closes #30 — a
+caller-installed subcommand table did NOT contain an entry whose
+name byte-matches the argv slot the parser selected as the
+subcommand-name candidate (today: argv[1] when it is present,
+non-empty, and does not start with `-`). Fires only when the caller
+has called `FlagSpec::register_subcommands`; a parser that sees
+`subcommand_table_ptr == 0` short-circuits the dispatch phase
+entirely, so pre-ENH-020 consumers see zero behavior change. The
+fail is a hard-stop — routed through `parse_argv_fail`, not the
+ENH-017 recoverable router — because no ParsedArgs storage was
+attempted and no coherent "advance past this slot" recovery exists
+when the flag_spec table for `argv[2..]` was never installed. No
+FlagSpec state is touched on this path so a caller's post-parse
+inspection sees the top-level table intact).
+
+ENH-020 additions (all in `ParsedArgs`): `subcommand_id : u64`
+(.bss) — the id of the dispatched sub, or `0` if no dispatch
+happened; zeroed by `parsed_args_reset`.
 
 ENH-017 additions: `ARGV_COLLECT_ALL_ERRORS = 1` (bit 0 of
 `parse_argv_ex`'s third argument — turns on multi-error accumulation
@@ -114,6 +132,7 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `register_int(name_ptr: u64, id: u64, min: u64, max: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Register an INT-kinded flag (kind fixed to `FKIND_INT`) with an inclusive unsigned `[min, max]` interval published into new `spec_min` / `spec_max` slots. `Typed::parse_int_u64_ranged` reads the pair (either forwarded by the consumer or recovered via `get_range_by_id`) and rejects a decoded value outside the interval with `ERR_INT_RANGE`. Sentinel: `(min = 0, max = 0)` means "range OFF" — the plain `flag_spec_register` path writes exactly this, so every existing INT registration is transparent to the gate. |
 | `get_range_by_id(id: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Multi-return `(min in rax, max in rdx)` — companion accessor for the range slots `register_int` publishes. Returns `(0, 0)` both for an unregistered id AND for a flag registered without a range — indistinguishable at this API, by design; callers that need to tell them apart call `lookup()` first. |
 | `register_string_enum(name_ptr: u64, id: u64, allowed_ptr: u64, allowed_count: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-019`, Closes #29)** Register a STR-kinded flag (kind fixed to `FKIND_STR`) with a caller-owned array of NUL-terminated-string pointers (`*const *const u8`) as the allowed-values gate. The parser byte-compares (case-sensitive) every captured value against every entry in the array and rejects a no-match value with `ERR_STRING_ENUM` (18). Sentinel: `allowed_count = 0` means "gate OFF" — behaviour identical to a plain `flag_spec_register(name, FKIND_STR, id)`, so a caller who wants no gate can call either path. The gate fires on BOTH `parse_argv` and `parse_argv_ex` (independent of `ARGV_COLLECT_ALL_ERRORS`) because the allowed set is a per-registration opt-in. |
+| `register_subcommands(table_ptr: u64, count: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-020`, Closes #30)** Install a git-shape subcommand table. `table_ptr` points at a caller-owned array of `SubSpec` entries (`SUBSPEC_STRIDE = 40` bytes each: `{name_ptr, id, flag_specs_ptr, flag_count, help_ptr}` — see `SUBSPEC_OFF_*` for the field offsets); each `SubSpec.flag_specs_ptr` points at an array of `SubFlagSpec` entries (`SUBFLAGSPEC_STRIDE = 24` bytes each: `{name_ptr, kind, id}` — mirrors `flag_spec_register`'s 3-arg surface). `Parser::parse_argv_ex` reads the pair at the top of its walk; a null pointer OR zero count trips the "no dispatch" short-circuit, so a caller wanting to disable dispatch temporarily calls `register_subcommands(0, 0)` or never calls this. On subcommand match, the parser internally calls `flag_spec_reset` (wipes both top-level FlagSpec AND the sub table) and re-registers each of the sub's `flag_specs` before the main argv walk. See the `Parser` table below for the dispatch semantics. |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
 | `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `parse_argv` and `parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `flag_spec_reset()` restores 0. |
 
@@ -122,7 +141,7 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | Function | Purpose |
 | --- | --- |
 | `parse_argv_ex(argv: u64, argc: u64, parse_flags: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** The ENH-017 primary. Same walk as `parse_argv` plus opt-in behaviors gated on `parse_flags` bits. Bit 0 (`ARGV_COLLECT_ALL_ERRORS`): keep parsing after recoverable failures, accumulating up to `MAX_COLLECTED_ERRORS` (16) records in `ParsedArgs::error_ring_*`; also enables inline `Typed::parse_int_u64` validation of every FKIND_INT flag's value (records `ERR_BAD_INT` on decode failure). Bit unset ⇒ behaves byte-for-byte like `parse_argv`. Bits 1..63 reserved; must be zero. `ERR_FLAG_OVERFLOW` / `ERR_POS_OVERFLOW` still stop the parse under both modes (storage exhaustion). |
-| `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). Treats `argv[0]` as an ordinary argv slot — callers invoked from `_start` should either pre-skip the program-name slot themselves or call `parse_argv_skipping_zero` (see next row). **(`libpdx-argv.ENH-017`, Closes #27)** Now a thin wrapper over `parse_argv_ex(argv, argc, 0)`; the signature is preserved so every existing consumer links unchanged. |
+| `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). Treats `argv[0]` as an ordinary argv slot — callers invoked from `_start` should either pre-skip the program-name slot themselves or call `parse_argv_skipping_zero` (see next row). **(`libpdx-argv.ENH-017`, Closes #27)** Now a thin wrapper over `parse_argv_ex(argv, argc, 0)`; the signature is preserved so every existing consumer links unchanged. **(`libpdx-argv.ENH-020`, Closes #30)** When a subcommand table is installed via `FlagSpec::register_subcommands`, `parse_argv_ex` runs a pre-loop dispatch phase: it treats `argv[0]` as the program name (skipped), classifies `argv[1]` — if flag-shaped, empty, or absent it stays with the top-level FlagSpec table intact and starts the main loop at `argv[1]` (so `git --version` still triggers StdVocab's `--version` auto-emit); if a plausible sub-name candidate matches a `SubSpec.name`, it publishes `SubSpec.id` into `ParsedArgs::subcommand_id`, calls `flag_spec_reset`, re-registers each of the sub's `flag_specs` entries, and starts the main loop at `argv[2]`; a plausible non-flag candidate with no match fails `ERR_UNKNOWN_SUBCOMMAND` (19) via the hard-stop path. Callers that never `register_subcommands` see this phase short-circuit at the null-pointer check and observe byte-for-byte pre-ENH-020 behavior. |
 | `parse_argv_skipping_zero(argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-031`)** Thin wrapper: advances `argv` by one pointer slot and decrements `argc` by 1 before invoking `parse_argv`, so a consumer that received `(argv, argc)` at `_start` per the frozen `execve` ABI (`design/user/execve-abi.md`) can hand them through unmodified without the program name landing in `pos_ptrs[0]`. `argc == 0` short-circuits to `parse_argv(argv, 0)`, which returns `ERR_OK` immediately without dereferencing `argv`. Every satellite `_start` consumer (`pkg`, `ls`, `cp`, `mkdir`, `mv`, `rm`, `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) wants this shape; the bare `parse_argv` remains the lower-level primitive for callers that have already pre-skipped or synthesised argv themselves. |
 
 Grammar: long flags `--foo`, `--foo=bar`, `--foo:bar`, `--foo bar`; short

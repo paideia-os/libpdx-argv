@@ -1861,3 +1861,252 @@ regression fixtures.
   before.
 
 Klog tag: `pdxargv.string-enum`.
+
+## 19. Subcommand dispatch (ENH-020, Closes #30)
+
+Pre-ENH-020 every tool was a single flat command: `pkg install …`,
+`git commit …`, and the like all had to hand-roll their own
+"argv[1] switch" before calling `parse_argv`, and the library had
+no way to know that `--message` was a sub-scoped flag rather than
+a top-level one. ENH-020 lifts git-shape subcommand dispatch into
+`Parser::parse_argv_ex`: the caller registers a `SubSpec` table
+once at bootstrap, and the parser inline-dispatches to the matching
+sub's `flag_specs` array before the main argv walk starts.
+
+### 19.1 Public surface delta
+
+`FlagSpec` grows:
+
+  - `subcommand_table_ptr : u64` (.bss) and
+    `subcommand_table_count : u64` (.bss) — the caller-installed
+    (table_ptr, count) pair, published by
+    `register_subcommands`. Both slots are zeroed by
+    `flag_spec_reset` so a fixture that installed a table in one
+    case never leaks it into the next.
+  - `register_subcommands(table_ptr, count) -> ()` — leaf; the
+    single install path. `count == 0` OR `table_ptr == 0` is the
+    "disable dispatch" spelling.
+  - `SUBSPEC_OFF_NAME` / `SUBSPEC_OFF_ID` /
+    `SUBSPEC_OFF_FLAG_SPECS` / `SUBSPEC_OFF_FLAG_COUNT` /
+    `SUBSPEC_OFF_HELP` / `SUBSPEC_STRIDE` — symbolic byte
+    offsets for the 40-byte `SubSpec` entry (see §19.2).
+  - `SUBFLAGSPEC_OFF_NAME` / `SUBFLAGSPEC_OFF_KIND` /
+    `SUBFLAGSPEC_OFF_ID` / `SUBFLAGSPEC_STRIDE` — symbolic byte
+    offsets for the 24-byte `SubFlagSpec` entry.
+
+`ParsedArgs` grows:
+
+  - `subcommand_id : u64` (.bss) — the id of the dispatched sub, or
+    `0` if no dispatch happened (either no table installed OR
+    argv[1] was flag-shaped / empty / absent). Zeroed by
+    `parsed_args_reset`.
+  - `ERR_UNKNOWN_SUBCOMMAND : u64 = 19` — set by the parser when
+    a sub table is installed AND argv[1] is a plausible non-flag
+    non-empty candidate that matches no `SubSpec.name`. Routed
+    through the hard-fail path (not the ENH-017 recoverable
+    router — see §19.4).
+
+`Parser` grows:
+
+  - A pre-loop dispatch phase at the top of `parse_argv_ex` (see
+    §19.3). No new entry point; the phase is gated on
+    `subcommand_table_ptr != 0`, so callers that never register a
+    table see the pre-ENH-020 code path byte-for-byte.
+
+### 19.2 Byte layouts
+
+`SubSpec` — 40 bytes, aligned to 8:
+
+  | Offset | Size | Field |
+  | --- | --- | --- |
+  |  0 | 8 | `name_ptr` (NUL-terminated ASCII, subcommand name) |
+  |  8 | 8 | `id` (caller-chosen; 0 reserved for "no dispatch") |
+  | 16 | 8 | `flag_specs_ptr` (pointer to `SubFlagSpec` array) |
+  | 24 | 8 | `flag_count` (entry count of that array) |
+  | 32 | 8 | `help_ptr` (NUL-terminated ASCII; 0 = no help) |
+
+`SubFlagSpec` — 24 bytes, aligned to 8:
+
+  | Offset | Size | Field |
+  | --- | --- | --- |
+  |  0 | 8 | `name_ptr` (NUL-terminated ASCII, flag name) |
+  |  8 | 8 | `kind` (`FKIND_*` constant) |
+  | 16 | 8 | `id` (caller-chosen; 0 reserved for "unregistered") |
+
+Both strides are fixed and expose one qword load per field; no
+packing gymnastics, and the parser walks each with a shl+add
+address calculation (`shl r8, 5; shl r9, 3; add r8, r9` for
+`× 40`; `shl r8, 4; shl r9, 3; add r8, r9` for `× 24`) to stay
+inside the R49 encoder subset (no 2-op `imul`).
+
+The 3-tuple `SubFlagSpec` mirrors `flag_spec_register(name, kind,
+id)` exactly — the parser's install loop passes each entry's
+three fields directly into that call, so no adapter is needed and
+no wider variant is possible today. Wider per-sub registrations
+(`register_sep` / `register_int` / `register_string_enum` shapes)
+are a follow-on ENH; a sub that wants such a flag has to compose
+it after dispatch (call `register_int` from user code the parser
+never sees) or wait for the wider `SubFlagSpecSep` / etc. shapes.
+
+### 19.3 Dispatch phase state machine
+
+`parse_argv_ex` runs the dispatch phase after the prologue (6-push
++ `sub rsp, 8`) but BEFORE `parse_argv_loop_head`, so the phase
+does not participate in the ENH-017 collect-all accumulator (see
+§19.4).
+
+  1. Load `subcommand_table_ptr`. If `0` → `jmp
+     parse_argv_loop_head` with `r13 = 0` (byte-for-byte
+     pre-ENH-020 behaviour).
+  2. Table installed: default `r13 = 1` (skip argv[0] as program
+     name). Load `subcommand_table_count`; if `0` → jump to loop
+     head with `r13 = 1` (no argv[0] traffic in `pos_ptrs[0]`).
+  3. If `argc < 2` → jump to loop head with `r13 = 1`.
+  4. Load `argv[1]`. If byte 0 is `NUL` (empty) OR `'-'` (flag
+     shape) → jump to loop head with `r13 = 1`. The `'-'` branch
+     is the StdVocab-precedence rule (§19.5).
+  5. Walk the sub table byte-comparing `argv[1]` against each
+     `SubSpec.name` using the same inline `xor+mov_b+cmp` strcmp
+     shape `FlagSpec::lookup` uses. First match wins.
+  6. On match:
+     - Load `SubSpec.id` from `[entry + 8]` and store into
+       `ParsedArgs::subcommand_id`.
+     - Hoist `SubSpec.flag_specs_ptr` into callee-save `r14` and
+       `SubSpec.flag_count` into callee-save `r15`.
+     - Call `flag_spec_reset` (wipes both the top-level
+       FlagSpec table AND the sub table pointer/count — no
+       nested dispatch fires from the sub's own parse).
+     - Walk `r14`'s array `r15` times, calling
+       `flag_spec_register(entry.name, entry.kind, entry.id)`
+       per entry.
+     - Set `r13 = 2` and jump to loop head.
+  7. On no match: `rax = 19` (`ERR_UNKNOWN_SUBCOMMAND`), `r13 =
+     1`, `jmp parse_argv_fail`. No FlagSpec state is touched on
+     this path — the reject happens BEFORE the
+     `flag_spec_reset` in the match arm, so a caller inspecting
+     FlagSpec state after the fail sees the top-level table
+     intact.
+
+Register discipline: `r13`, `r14`, `r15` are SysV callee-save;
+`flag_spec_reset` and `flag_spec_register` only clobber
+`rax`/`rcx`/`r11`, so no stack spill of loop state is needed
+across the nested calls. The prologue's 6-push + `sub rsp, 8`
+keeps `rsp%16 = 0` at every nested-call site, matching the
+existing invariant every other `call` in this function relies on.
+
+### 19.4 Collect-all mode interaction
+
+`ERR_UNKNOWN_SUBCOMMAND` is routed through `parse_argv_fail`, not
+`parse_argv_maybe_collect`. Two reasons:
+
+  - No ParsedArgs storage was attempted at the fail site (the
+    sub-name candidate is neither a flag nor a positional — it
+    is a dispatch classifier). The "advance-past-argv-slot"
+    recovery ENH-017 uses for its recoverable fails has no
+    coherent meaning here: advancing past `argv[1]` and
+    continuing to parse would leave the parser in a state where
+    no flag_spec table is installed for `argv[2..]` — every
+    subsequent flag would fire `ERR_UNKNOWN_FLAG` under strict
+    mode or store as boolean under permissive mode, neither of
+    which is a useful diagnostic.
+  - The hard-fail seeds `error_ring[0]` and populates
+    `error_code`/`error_arg_index` per the ENH-017 first-error
+    preservation contract, so a consumer's ring walk still sees
+    the fail alongside any auto-emit success signals it might
+    fire afterwards (though in practice the epilogue reads
+    `ring[0]` back into `rax` so the return value is
+    `ERR_UNKNOWN_SUBCOMMAND` regardless).
+
+### 19.5 StdVocab precedence
+
+The flag-shape short-circuit at step 4 above ensures
+`git --version` still triggers the StdVocab `--version` auto-emit
+(ENH-032) with the top-level FlagSpec table intact — the sub
+dispatch never runs, so the top-level `register_all` registrations
+survive into the main argv walk. Symmetrically, `git --help`
+still fires the ENH-014 auto-table fallback if the tool opted
+into it.
+
+If a tool wants a sub-specific `--version` (e.g. `git commit
+--version` printing the commit-subsystem's version), it registers
+`--version` inside the commit sub's `flag_specs` with its own
+handler id; the dispatch fires because `argv[1]='commit'` is not
+flag-shaped, and the sub's `flag_specs` install replaces the
+top-level's including any StdVocab `--version` binding. This
+matches git's own precedence (`git --version` differs from `git
+commit --version`), and the design consequence is: a tool wanting
+`--version` handled uniformly at both levels registers it in
+BOTH the top-level FlagSpec AND every sub's flag_specs — the
+library does not double-register.
+
+### 19.6 Fingerprint (issue #30)
+
+With `register_subcommands(&sub_table, 2)` where
+`sub_table[0] = {name="commit", id=1, flag_specs=[{"message",
+FKIND_STR, 200}], flag_count=1, help="commit changes"}` and
+`sub_table[1] = {name="push", id=2, flag_specs=[{"force",
+FKIND_BOOL, 201}], flag_count=1, help="push branches"}`:
+
+  - `parse_argv(["git","commit","--message","hi"])` →
+    `subcommand_id=1`, `flag_count=1`, `--message` slot present
+    with value pointing at `"hi"`, `error_code=0`.
+  - `parse_argv(["git","push","--force"])` →
+    `subcommand_id=2`, `flag_count=1`, `--force` boolean present,
+    `error_code=0`.
+  - `parse_argv(["git","clone"])` → `rax=19
+    (ERR_UNKNOWN_SUBCOMMAND)`, `error_code=19`,
+    `error_arg_index=1`, `subcommand_id=0`.
+  - `parse_argv(["git","--version"])` (with StdVocab
+    `register_all`) → `rax=13 (ERR_VERSION_EMITTED)`,
+    `subcommand_id=0` — the auto-emit fires because argv[1] is
+    flag-shaped and dispatch short-circuits.
+
+Without any `register_subcommands` call: `parse_argv` is
+byte-for-byte pre-ENH-020 for every existing matrix case.
+
+Cases 1-6 in `tests/parse_subcommands.pdx` are the regression
+fixtures.
+
+### 19.7 What ENH-020 explicitly does not do
+
+- No nested subcommands. `flag_spec_reset` on match wipes the
+  sub table pointer, so the sub's own parse never re-enters the
+  dispatch phase. A `pkg install --dry-run …` tree where
+  `install` is itself a sub-sub is a follow-on ENH; the
+  semver-safe shape is a `SubSpec.sub_table_ptr` /
+  `sub_table_count` pair the parser reads between the
+  `flag_spec_reset` and the flag_spec_register loop.
+- No wider `SubFlagSpec` variants. The 3-tuple `{name, kind, id}`
+  mirrors `flag_spec_register` only; a sub wanting a
+  separator-required (`--foo=<x>` only) or range-bounded INT or
+  enum-STR flag composes it by hand after dispatch, or waits for
+  the follow-on `SubFlagSpecSep` / `SubFlagSpecInt` /
+  `SubFlagSpecEnum` shapes.
+- No first-non-flag scanning. The classifier looks at
+  `argv[1]` only; `["git","-C","/path","commit"]` finds argv[1]
+  = `-C` (flag-shaped) → no dispatch. The issue text mentions
+  "argv[1] or first non-flag before `--`" but this pass keeps
+  the simpler argv[1]-only rule; the fingerprint tests all fit
+  under it. A follow-on ENH would walk past a top-level flag
+  prefix; the walk needs to know each prefix flag's arity
+  (`-C /path` consumes two argv slots), which needs the
+  top-level FlagSpec table consulted BEFORE the dispatch, which
+  needs an ordering split we do not owe today.
+- No SchemaInvoke-path dispatch. The wire-form invocation path
+  (`SchemaInvoke::parse_from_schema_record`) has no argv[1] to
+  classify; a sender needing sub-scoped dispatch either encodes
+  the sub id directly in the record (a wire-form extension a
+  future ENH would spec) or dispatches on a top-level flag id
+  the sub receiver registered.
+- No caller-side rollback of subcommand state on parse failure.
+  The install (subcommand_id publish + flag_spec_reset + sub
+  install) happens BEFORE the main argv walk; if a later argv
+  slot fires `ERR_MISSING_VALUE` / `ERR_BAD_INT` / …, the
+  ParsedArgs::subcommand_id and the installed FlagSpec state
+  are preserved. A caller's error handler that wants to
+  distinguish "sub matched but flag failed" from "sub failed to
+  match" checks `subcommand_id != 0` (matched) vs `== 0` (no
+  dispatch attempted OR dispatch itself failed — the ERR_*
+  code disambiguates the latter two).
+
+Klog tag: `pdxargv.subcommand`.

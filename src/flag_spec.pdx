@@ -52,6 +52,59 @@ module FlagSpec = structure {
 
   pub let SPEC_MAX : u64 = 32
 
+  // -- Subcommand table byte layout (libpdx-argv.ENH-020, Closes #30) --
+  //
+  // A caller-owned `SubSpec` entry the sub table pointer (below) points
+  // into. Fixed 40-byte stride, aligned to 8; five u64-sized fields in
+  // this order:
+  //
+  //   Offset  Size  Field
+  //     0      8    name_ptr       (NUL-terminated ASCII, subcommand name)
+  //     8      8    id             (caller-chosen; 0 reserved for
+  //                                 "no dispatch" per ParsedArgs::
+  //                                 subcommand_id docstring)
+  //    16      8    flag_specs_ptr (pointer to an array of SubFlagSpec
+  //                                 entries — see the SUBFLAGSPEC_* set
+  //                                 below)
+  //    24      8    flag_count     (count of entries in flag_specs)
+  //    32      8    help_ptr       (NUL-terminated ASCII, subcommand
+  //                                 help text; 0 = no help — reserved
+  //                                 for a future `sub --help` walker,
+  //                                 not consulted by ENH-020's parser
+  //                                 dispatch)
+  //
+  // Total 40 bytes = 5 × 8; one qword load per field, no packing
+  // gymnastics. The stride matches SUBSPEC_STRIDE below; the
+  // per-entry field offsets are exposed as separate constants so a
+  // caller or a `doc` renderer that walks the table (once a follow-on
+  // ENH lands the `pkg <sub> --help` traversal) can dereference by
+  // symbolic name.
+  //
+  // The `flag_specs_ptr` array uses a `SubFlagSpec` entry — a 24-byte
+  // stride of {name_ptr, kind, id} that mirrors the 3-argument
+  // `flag_spec_register(name, kind, id)` surface. On dispatch the
+  // parser walks `flag_count` entries and calls `flag_spec_register`
+  // for each (see Parser::parse_argv_ex's ENH-020 phase for the shape
+  // and rationale). A sub that wants a separator-required flag
+  // (`--foo=<x>` only) or an int-range flag (register_int shape) or
+  // an enum-STR flag (register_string_enum shape) has to compose that
+  // at bootstrap by hand — the ENH-020 fixed 3-arg SubFlagSpec surface
+  // is the "MVP" 3-tuple; wider variants (SubFlagSpecSep,
+  // SubFlagSpecInt, SubFlagSpecEnum) are a follow-on ENH parallel to
+  // ENH-018's future register_int_sep and ENH-019's future
+  // register_string_enum_sep.
+  pub let SUBSPEC_OFF_NAME       : u64 = 0
+  pub let SUBSPEC_OFF_ID         : u64 = 8
+  pub let SUBSPEC_OFF_FLAG_SPECS : u64 = 16
+  pub let SUBSPEC_OFF_FLAG_COUNT : u64 = 24
+  pub let SUBSPEC_OFF_HELP       : u64 = 32
+  pub let SUBSPEC_STRIDE         : u64 = 40
+
+  pub let SUBFLAGSPEC_OFF_NAME  : u64 = 0
+  pub let SUBFLAGSPEC_OFF_KIND  : u64 = 8
+  pub let SUBFLAGSPEC_OFF_ID    : u64 = 16
+  pub let SUBFLAGSPEC_STRIDE    : u64 = 24
+
   // Singleton storage. Reset by flag_spec_reset(); registrations
   // accumulate via flag_spec_register(name, kind, id).
   pub let mut spec_names : [u64; 32] = uninit @align(8)  // NUL-term name ptr
@@ -173,6 +226,30 @@ module FlagSpec = structure {
   // storing the flag.
   pub let mut strict_mode : u64 = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-020 (Closes #30): the caller-installed
+  // subcommand table pointer + count. A caller enables git-shape
+  // subcommand dispatch by calling
+  // `register_subcommands(table_ptr, count)` after
+  // `flag_spec_reset()`; before that call — and after every
+  // `flag_spec_reset()` — both slots are 0 and `Parser::parse_argv_ex`
+  // takes the no-dispatch fast path (no argv[0] skip, no argv[1]
+  // classification, `subcommand_id` stays 0). The pointer is an
+  // interior pointer into caller-owned .rodata / .bss (typically an
+  // array of `SubSpec`-shaped 40-byte entries defined at bootstrap
+  // time); this library never dereferences it after a
+  // `flag_spec_reset()` clears the slot, so the caller's storage
+  // lifetime only needs to span from `register_subcommands` to the
+  // end of `parse_argv_ex`.
+  //
+  // `subcommand_table_count` is the entry count (not a byte length):
+  // the parser computes each entry's base as
+  // `table_ptr + i * SUBSPEC_STRIDE` where `i` runs in `0..count`.
+  // Callers wanting to disable dispatch temporarily call
+  // `register_subcommands(0, 0)` — either the null pointer OR a zero
+  // count trips the same "no dispatch" short-circuit in the parser.
+  pub let mut subcommand_table_ptr   : u64 = uninit @align(8)
+  pub let mut subcommand_table_count : u64 = uninit @align(8)
+
   // ============================================================
   // flag_spec_reset() — clear the registration table.
   // Signature: () -> () !{mem} @{}
@@ -190,12 +267,16 @@ module FlagSpec = structure {
   pub let flag_spec_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 + ENH-004 + ENH-030 flag_spec_reset — zero spec_count so the next flag_spec_register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant. ENH-030 renames the exported symbol from `reset` to `flag_spec_reset` to end the multi-module link collision — body byte-identical.",
+      justification: "libpdx-argv.M2-001 + ENH-004 + ENH-020 + ENH-030 flag_spec_reset — zero spec_count so the next flag_spec_register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. ENH-020 (Closes #30) also zeroes subcommand_table_ptr and subcommand_table_count so a fixture that installed a table in a previous case never leaks it into the next parse — the caller re-installs each parse via register_subcommands, matching the existing per-parse re-registration discipline for FlagSpec itself. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant. ENH-030 renames the exported symbol from `reset` to `flag_spec_reset` to end the multi-module link collision — body otherwise byte-identical.",
       block: {
         xor rax, rax;
         lea r11, [rip + spec_count];
         mov [r11], rax;
         lea r11, [rip + strict_mode];
+        mov [r11], rax;
+        lea r11, [rip + subcommand_table_ptr];
+        mov [r11], rax;
+        lea r11, [rip + subcommand_table_count];
         mov [r11], rax;
         ret;
       }
@@ -760,6 +841,56 @@ module FlagSpec = structure {
         mov [r11], rax;
 
       register_string_enum_full:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // register_subcommands(table_ptr, count) — libpdx-argv.ENH-020 (Closes #30)
+  // Signature: (u64, u64) -> () !{mem} @{}
+  //   rdi = table_ptr (pointer to a caller-owned array of SubSpec
+  //         entries, each SUBSPEC_STRIDE = 40 bytes; interior pointer
+  //         is fine, must stay live for the parse call)
+  //   rsi = count     (number of SubSpec entries; 0 = disable dispatch)
+  //
+  // Publishes the pair into the singleton subcommand_table_ptr /
+  // subcommand_table_count slots. Parser::parse_argv_ex reads both at
+  // the top of its walk; a null pointer OR a zero count trips the same
+  // "no dispatch" short-circuit, so a caller wanting to disable
+  // dispatch temporarily calls `register_subcommands(0, 0)` or leaves
+  // it unregistered.
+  //
+  // The install-vs-registration split is deliberate: `flag_spec_reset`
+  // zeroes both slots (so a test fixture that installed a table in one
+  // case never leaks it into the next), and every real caller calls
+  // this exactly once at bootstrap after the top-level FlagSpec
+  // registrations. On subcommand match the parser calls
+  // `flag_spec_reset` internally (see parse_argv_ex ENH-020 phase),
+  // which zeroes THESE slots too — no nested-sub dispatch is
+  // attempted from the sub's parse. Nested subcommands (`pkg install
+  // --dry-run` where `install` is itself a sub-sub) are out of scope
+  // for ENH-020 and would need a re-install between the outer and
+  // inner parse-walks.
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rdi (in)  = table_ptr → passed straight to the store
+  //   rsi (in)  = count     → passed straight to the store
+  //   r11       = lea scratch (cross-module .bss)
+  //
+  // paideia-as compliance: 2 params well under the 6-param cap for
+  // unsafe-bodied lambdas; r11 for every lea; no cmp — no zero-check
+  // needed (the parser reads both slots and short-circuits on either
+  // being 0, so this function just publishes without validation);
+  // no test mnemonic; no imm > 0x7FFFFFFF.
+  pub let register_subcommands : (u64, u64) -> () !{mem} @{} =
+    fn (table_ptr: u64) (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-020 (Closes #30) FlagSpec::register_subcommands — publishes the caller-supplied (table_ptr, count) pair into the subcommand_table_ptr / subcommand_table_count singleton slots that Parser::parse_argv_ex reads at the top of its walk to decide whether to enter the ENH-020 subcommand dispatch phase. Store-only; no validation — the parser's ENH-020 phase gates on `ptr != 0` AND `count != 0` internally, so passing (0, 0) is the legitimate disable spelling and passing an in-range (nonzero, nonzero) pair is a caller contract this function does not double-check. Leaf; r11 lea scratch; two straight-line stores. rdi/rsi pass through unchanged from the SysV entry to the stores. No effect on any other FlagSpec slot — a caller that has already registered top-level flags via `flag_spec_register` (typically `StdVocab::register_all`) sees those registrations preserved; the parser's own `flag_spec_reset` on match is what wipes them for the sub's flag_specs re-registration.",
+      block: {
+        lea r11, [rip + subcommand_table_ptr];
+        mov [r11], rdi;
+        lea r11, [rip + subcommand_table_count];
+        mov [r11], rsi;
         ret;
       }
     }
