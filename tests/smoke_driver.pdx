@@ -100,6 +100,16 @@ module SmokeDriver = structure {
         call ParseGrammarTests::run_case28;
         call ParseGrammarTests::run_case29;
         call ParseGrammarTests::run_case30;
+        // libpdx-argv.ENH-013 (Closes #23): clustered short-flag
+        // expansion for BOOL / COUNTED short flags. Case 6 above was
+        // already updated in place to reflect the new permissive-mode
+        // expansion semantics (was ERR_CLUSTERED_SHORT, now ERR_OK
+        // with flag_count=2); these four cases carry the four
+        // fingerprints from the issue text.
+        call ParseGrammarTests::run_case31;
+        call ParseGrammarTests::run_case32;
+        call ParseGrammarTests::run_case33;
+        call ParseGrammarTests::run_case34;
 
         // --- ParseTypedValuesTests (module id 2) --------------------
         call ParseTypedValuesTests::run_case1;

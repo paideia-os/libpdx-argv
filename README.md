@@ -55,7 +55,14 @@ success signal, not an error; see `VersionBackend` below),
 below; `libpdx-argv.ENH-018`),
 `ERR_HELP_EMITTED` 15 (library-owned `--help` auto-table fallback
 fired — success signal, not an error; see `HelpBackend` below;
-`libpdx-argv.ENH-014`).
+`libpdx-argv.ENH-014`),
+`ERR_CLUSTER_WITH_ARITY` 16 (`libpdx-argv.ENH-013`, Closes #23 — a
+short-flag cluster `-abc` contained at least one letter whose
+`FlagSpec::lookup` returned a value-consuming kind; no letter is
+dispatched, `flag_count` unchanged from cluster entry. Replaces the
+now-unreachable `ERR_CLUSTERED_SHORT` for the specific case that
+motivates the D3 one-per-hyphen rule. `-vv`/`-abc` clusters of
+BOOL/COUNTED short flags are now expanded instead of rejected).
 
 | Function | Purpose |
 | --- | --- |
@@ -89,9 +96,16 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `parse_argv_skipping_zero(argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-031`)** Thin wrapper: advances `argv` by one pointer slot and decrements `argc` by 1 before invoking `parse_argv`, so a consumer that received `(argv, argc)` at `_start` per the frozen `execve` ABI (`design/user/execve-abi.md`) can hand them through unmodified without the program name landing in `pos_ptrs[0]`. `argc == 0` short-circuits to `parse_argv(argv, 0)`, which returns `ERR_OK` immediately without dereferencing `argv`. Every satellite `_start` consumer (`pkg`, `ls`, `cp`, `mkdir`, `mv`, `rm`, `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) wants this shape; the bare `parse_argv` remains the lower-level primitive for callers that have already pre-skipped or synthesised argv themselves. |
 
 Grammar: long flags `--foo`, `--foo=bar`, `--foo:bar`, `--foo bar`; short
-flags one letter per hyphen (`-f`; clustered `-la` is rejected with
-`ERR_CLUSTERED_SHORT`); a bare `-` is positional; `--` is a sentinel after
-which every remaining argument is positional regardless of leading byte.
+flags one letter per hyphen (`-f`), with **BOOL/COUNTED clusters expanded**
+per `libpdx-argv.ENH-013` (Closes #23) — `-vv` and `-abc` where every
+letter's `FlagSpec::lookup` returns `FKIND_BOOL` (or, permissive-mode,
+`FKIND_UNKNOWN`) are dispatched as N independent short-flag stores; a
+cluster containing any value-consuming registration fails with
+`ERR_CLUSTER_WITH_ARITY` (16) BEFORE any letter is stored (no partial
+dispatch). Strict mode (ENH-004) still fails an unregistered letter
+with `ERR_UNKNOWN_FLAG` (12). A bare `-` is positional; `--` is a
+sentinel after which every remaining argument is positional regardless
+of leading byte.
 Arity comes from `FlagSpec::lookup`: `FKIND_BOOL` and `FKIND_UNKNOWN` never
 consume a lookahead; a typed flag registered via `flag_spec_register()` consumes one
 if it has no inline value (`ERR_MISSING_VALUE` if none remains); a typed

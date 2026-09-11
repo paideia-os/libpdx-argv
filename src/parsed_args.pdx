@@ -24,7 +24,15 @@ module ParsedArgs = structure {
   // that appear after the sentinel are always positional and never
   // reach the malformed classifier.
   pub let ERR_UNKNOWN_ARG_FORM  : u64 = 3   // malformed argv slot (ENH-026)
-  pub let ERR_CLUSTERED_SHORT   : u64 = 4   // set by M1-002 for -la et al
+  pub let ERR_CLUSTERED_SHORT   : u64 = 4   // M1-002 clustered-short reject;
+                                            // UNREACHABLE from Parser::parse_argv
+                                            // after libpdx-argv.ENH-013 (#23)
+                                            // relaxed the grammar. Constant
+                                            // retained for wire-form back-compat
+                                            // (a consumer's dispatch table may
+                                            // still switch on the number).
+                                            // See ERR_CLUSTER_WITH_ARITY (16)
+                                            // for the ENH-013 replacement code.
   pub let ERR_LONG_MISSING_NAME : u64 = 5   // "--" or "--=foo"
   // Added by M2-001 (typed flags):
   pub let ERR_MISSING_VALUE     : u64 = 6   // typed flag reached EOL without a value
@@ -117,6 +125,37 @@ module ParsedArgs = structure {
   // link calls `set_doc_unavailable(1)` at bootstrap and gets the
   // in-process fallback instead). New klog tag: `pdxargv.help-auto`.
   pub let ERR_HELP_EMITTED              : u64 = 15
+  // Added by libpdx-argv.ENH-013 (Closes #23): clustered short flag
+  // whose spelling contains at least one value-consuming registration.
+  // Set by `Parser::parse_argv` when a short-flag cluster `-abc` is
+  // observed AND FlagSpec::lookup on any letter returns a kind that
+  // consumes a value (FKIND_STR / FKIND_INT / FKIND_TIMESPAN /
+  // FKIND_SIZE / FKIND_ENUM). Every letter in an accepted cluster must
+  // be either FKIND_BOOL (0) or, under permissive mode, FKIND_UNKNOWN
+  // (0xFF; treated as boolean per M2-001). A single value-consuming
+  // kind in the cluster fails the whole cluster with this code before
+  // any letter is dispatched — no partial storage — so the caller sees
+  // flag_count unchanged from what it was at cluster entry. Strict
+  // mode's ENH-004 rule takes precedence: an unregistered letter under
+  // FlagSpec::set_strict(1) still fails with ERR_UNKNOWN_FLAG (12)
+  // rather than being coerced to BOOL, exactly as the single-letter
+  // short-flag path already does.
+  //
+  // Rationale for a distinct code (vs collapsing into
+  // ERR_CLUSTERED_SHORT=4): pre-ENH-013 every cluster was rejected as
+  // a category error (D3 one-per-hyphen contract). ENH-013 narrows
+  // that policy to the case that would silently swallow a value
+  // (`-nX` where `-n` is INT would bind 'X' as the value in GNU getopt
+  // and would need a value in libpdx-argv, both of which contradict
+  // the cluster expansion `-n -X`), preserving BOOL/COUNTED cluster
+  // acceptance as the mainstream idiom (`-vv` for verbosity,
+  // `-abc` for three switches). Consumers that want to distinguish
+  // "clustering rejected because of arity" from any surviving
+  // ERR_CLUSTERED_SHORT (currently unreachable — the classifier no
+  // longer emits it) get the split cleanly at the ERR_* level.
+  //
+  // New klog tag: `pdxargv.short-cluster`.
+  pub let ERR_CLUSTER_WITH_ARITY        : u64 = 16
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

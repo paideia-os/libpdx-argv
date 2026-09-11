@@ -58,6 +58,15 @@ The R49 grammar is fixed (see D3 in `design/tooling/plan.md`):
   --foo bar         long flag with lookahead value
   --foo=bar         long flag with inline value
   -x                single-letter short flag (one per hyphen)
+  -abc              clustered short flags (libpdx-argv.ENH-013,
+                     #23). Admitted IFF every letter's FlagSpec
+                     registration is FKIND_BOOL — or, under
+                     permissive mode, FKIND_UNKNOWN (unregistered,
+                     treated as boolean per M2-001). Expanded to
+                     N independent short-flag stores. A cluster
+                     containing any value-consuming registration
+                     fails with ERR_CLUSTER_WITH_ARITY (16). See
+                     BREAKS WITH POSIX below.
   --                sentinel; all remaining tokens are positional
   -                 bare hyphen; REJECTED with ERR_UNKNOWN_ARG_FORM
                      (`libpdx-argv.ENH-026`). Tools that want the
@@ -68,12 +77,30 @@ The R49 grammar is fixed (see D3 in `design/tooling/plan.md`):
                      (`libpdx-argv.ENH-026`).
 
 .section BREAKS WITH POSIX
-Clustered short flags (`-la`, `-abc`) are REJECTED with error
-code `ERR_CLUSTERED_SHORT`. Every short flag must have its own
-hyphen (`-l -a`). This is deliberate: the semantic pipe binds
-flags by id, and clustering collides with typed short flags that
-consume an argument (e.g. `-n 5` in `head`). See D3 for the full
-rationale.
+Clustered short flags are ADMITTED only when every letter is
+FKIND_BOOL (or, under permissive mode, FKIND_UNKNOWN treated as
+boolean per M2-001) — `libpdx-argv.ENH-013` (Closes #23). `-vv`
+raises a verbosity counter twice; `-abc` where a/b/c are all
+BOOL expands to three independent flag_count++ stores; the
+`count_flag_by_id` accessor reports the repeat count naturally.
+A cluster whose letters include ANY value-consuming
+registration (STR/INT/TIMESPAN/SIZE/ENUM) is REJECTED with
+`ERR_CLUSTER_WITH_ARITY` (16) BEFORE any letter is dispatched
+(no partial storage; flag_count stays at what it was before the
+cluster). Strict mode (`FlagSpec::set_strict(1)`) still rejects
+an unregistered letter with `ERR_UNKNOWN_FLAG` (12).
+
+The M1-002 D3 motivation survives: the specific hazard `-nX`
+where `-n` is INT is still refused — the semantic pipe binds
+flags by id and swallowing 'X' as the value would contradict
+the cluster expansion `-n -X`. What ENH-013 relaxes is only
+the mainstream `-vvv`/`-abc` idiom for BOOL/COUNTED short
+flags, which composes with the existing `count_flag_by_id`
+accessor without a new registration path.
+
+The legacy `ERR_CLUSTERED_SHORT` (4) is now UNREACHABLE from
+the parser but retained in `parsed_args.pdx` for wire-form
+back-compat with any consumer that pattern-matched on it.
 
 Long flags may accept a `=` separator OR a lookahead token, at
 the tool's choice per `flag_spec_register` kind. The `:` separator
@@ -273,7 +300,15 @@ whole-buffer header failure.
 
   ERR_FLAG_OVERFLOW (1)             more than 32 flags in one parse
   ERR_POS_OVERFLOW (2)              more than 32 positionals in one parse
-  ERR_CLUSTERED_SHORT (4)           `-la` etc. (D3 rejects clustering)
+  ERR_CLUSTERED_SHORT (4)           (LEGACY) M1-002 clustered-short
+                                     rejection. UNREACHABLE from
+                                     Parser::parse_argv after
+                                     libpdx-argv.ENH-013 (#23) relaxed
+                                     the grammar. Constant retained in
+                                     parsed_args.pdx for wire-form
+                                     back-compat; see
+                                     ERR_CLUSTER_WITH_ARITY (16) for
+                                     the current cluster-reject code.
   ERR_LONG_MISSING_NAME (5)         `--=foo`, `--:foo`
   ERR_MISSING_VALUE (6)             typed flag reached end of argv with
                                      no value to consume, OR (ENH-010)
@@ -323,6 +358,21 @@ whole-buffer header failure.
                                      dispatch (parse_argv stores --help
                                      as ordinary flag). Klog tag:
                                      pdxargv.help-auto.
+
+  ERR_CLUSTER_WITH_ARITY (16)       short-flag cluster `-abc` where at
+                                     least one letter's FlagSpec::lookup
+                                     returns a value-consuming kind
+                                     (STR/INT/TIMESPAN/SIZE/ENUM). Set
+                                     by libpdx-argv.ENH-013 (#23). No
+                                     letter is dispatched; flag_count is
+                                     unchanged from cluster entry (no
+                                     partial storage). Strict mode's
+                                     ENH-004 unregistered-name rule
+                                     takes precedence when applicable:
+                                     an unregistered letter under
+                                     set_strict(1) fires ERR_UNKNOWN_FLAG
+                                     (12) instead. Klog tag:
+                                     pdxargv.short-cluster.
 
   ERR_INT_RANGE (14)                INT-flag value fell outside the
                                      registered inclusive-unsigned

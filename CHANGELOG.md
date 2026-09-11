@@ -6,6 +6,106 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-013 — Clustered short flags for BOOL/COUNTED registrations (Closes #23)
+
+M1-002 (#2) locked a one-per-hyphen short-flag grammar: any cluster
+`-abc` was rejected wholesale with `ERR_CLUSTERED_SHORT` (4). ENH-013
+narrows the reject to the hazard that motivated D3 — a value-consuming
+short flag inside a cluster (`-nX` where `-n` is INT) that would
+swallow one of its neighbours or its value — and admits the mainstream
+BOOL/COUNTED cluster idiom (`-vv` for verbosity, `-abc` for three
+switches).
+
+`Parser::parse_argv` now handles the `-abc` classifier arm two-pass.
+Pass 1 walks the cluster once, calling `FlagSpec::lookup` on each
+letter (via a 2-byte `cluster_probe` scratch = letter + NUL), and
+fails fast:
+
+  - `FKIND_UNKNOWN` + `strict_mode != 0` → `ERR_UNKNOWN_FLAG` (12)
+    per ENH-004, unchanged from the single-letter short path.
+  - Any kind other than `FKIND_BOOL` (0) or (permissive)
+    `FKIND_UNKNOWN` → `ERR_CLUSTER_WITH_ARITY` (16), the new code.
+    No letter is dispatched — `flag_count` is unchanged from
+    cluster entry (no partial storage).
+
+Pass 2 walks the cluster again. For each letter it writes
+`letter, NUL` into `cluster_scratch_buf[flag_count * 2 ..
+flag_count * 2 + 2)` (64-byte parser-owned buffer = 2 bytes × MAX_FLAGS)
+and stores `(name_ptr, 0, id, kind)` into
+`flag_names/flag_values/flag_ids/flag_kinds[flag_count]` under the
+existing `MAX_FLAGS` overflow gate. The second lookup per letter is
+deliberate — a straight-line pair of walks reads better than a
+triple-buffer between passes and stays inside the parser's existing
+`FlagSpec::lookup` cost envelope (2N calls per cluster of length N,
+capped by 2 × 32 × 32 = 2048 comparisons per parse).
+
+Cluster stores deliberately skip the ENH-032 (`--version`) and
+ENH-014 (`--help`) auto-emit dispatches — a tool that registers
+`-h`/`-v` shorts with the standard ids gets the auto-emit only when
+the letter is typed without clustering, which matches the
+mainstream `-vvv` idiom (see §16.5 in `design/architecture.md`).
+
+Fingerprints (issue #23):
+
+  - `-v` alone works (baseline; single-letter short path
+    unchanged) — covered by `tests/parse_grammar.pdx` case 7.
+  - `-vv` on COUNTED flag `v` (FKIND_BOOL registered) increments
+    `count_flag_by_id(id) → 2` — new `case 31`.
+  - `-abc` where a/b/c all FKIND_BOOL → `flag_count == 3`; each
+    id resolvable via `find_flag_by_id` — new `case 32`.
+  - `-abc` where `b` is FKIND_STR → `ERR_CLUSTER_WITH_ARITY = 16`,
+    `flag_count == 0`, `error_arg_index == 0` — new `case 33`.
+  - `-abc` where `a` unregistered under `set_strict(1)` →
+    `ERR_UNKNOWN_FLAG = 12`, `flag_count == 0` — new `case 34`.
+
+Also updates `tests/parse_grammar.pdx` case 6 in place: `-la` under
+permissive mode with no registrations now returns `ERR_OK` with
+`flag_count = 2` (both letters expanded, ids 0, kinds
+`FKIND_UNKNOWN`) — the case documented the M1-002 → ENH-013
+semantics change as a regression witness. Pre-ENH-013 this fixture
+returned `ERR_CLUSTERED_SHORT (4)`. Consumers pattern-matching on
+that error code need updating: it is now unreachable from the
+parser (the constant is retained in `parsed_args.pdx` for wire-form
+back-compat).
+
+Files touched:
+
+  - `src/parsed_args.pdx` — adds `ERR_CLUSTER_WITH_ARITY = 16`
+    with the full ENH-013 docstring; annotates `ERR_CLUSTERED_SHORT`
+    as unreachable-post-ENH-013 (constant retained for wire-form
+    back-compat).
+  - `src/parser.pdx` — adds two `pub let mut` scratch buffers
+    (`cluster_probe : [u64; 1]` and `cluster_scratch_buf :
+    [u64; 8]`); replaces the `parse_argv_short_clustered` label's
+    unconditional-reject stub with the two-pass validation +
+    dispatch code (labels `parse_argv_cluster_val_*` and
+    `parse_argv_cluster_disp_*`) plus a new
+    `parse_argv_cluster_with_arity` fail label. Module preamble
+    gets a new ENH-013 section explaining the two-pass shape,
+    scratch sizing (64 bytes = 2 × MAX_FLAGS), and the auto-emit
+    skip; `parse_argv`'s own docstring appends the same summary.
+  - `tests/parse_grammar_tests.pdx` — updates case 6 in place to
+    the new expanded semantics; adds cases 31 / 32 / 33 / 34
+    matching the four issue fingerprints. Total ParseGrammarTests
+    case count is now 34.
+  - `tests/smoke_driver.pdx` — wires `run_case31` … `run_case34`
+    into the driver after `run_case30`.
+  - `design/architecture.md` — updates § 5 heading to point at
+    § 16 for the relaxation; adds § 16 (five subsections covering
+    admissibility, two-pass shape, scratch sizing,
+    dispatched-flag observables, and the "explicitly does not
+    do" list).
+  - `README.md` — appends `ERR_CLUSTER_WITH_ARITY` (16) to the
+    error-constant paragraph; rewrites the grammar summary to
+    describe the BOOL/COUNTED cluster expansion.
+  - `doc/libpdx-argv.pdxdoc` — expands FLAG GRAMMAR to include
+    the `-abc` clustered form; rewrites BREAKS WITH POSIX to
+    document the ENH-013 admissibility rule; adds the
+    `ERR_CLUSTER_WITH_ARITY (16)` row and the "LEGACY" note on
+    `ERR_CLUSTERED_SHORT (4)` in DIAGNOSTICS.
+
+Klog tag: `pdxargv.short-cluster`.
+
 ### ENH-016 — `PdxArgvParseErrorRecord@0.1` structured error emission (Closes #26)
 
 First OUTPUT wire schema this library declares. `SchemaEmit` gains

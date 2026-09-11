@@ -2,13 +2,17 @@
 //               + ENH-031 (argv[0]-skip wrapper)
 //               + ENH-032 (--version auto-emit dispatch, Closes #25)
 //               + ENH-014 (--help auto-table dispatch, Closes #24)
+//               + ENH-013 (clustered short-flag expansion for BOOL/
+//                          COUNTED, Closes #23)
 // Parser: entry points parse_argv(argv, argc) → error_code
 //         and parse_argv_skipping_zero(argv, argc) → error_code
 //         (thin wrapper that drops argv[0] before forwarding).
 //
-// M1 grammar (unchanged interpretation):
+// M1 grammar (unchanged interpretation, except ENH-013 for clusters):
 //   long flags  : --foo, --foo=bar, --foo bar
-//   short flags : one letter per hyphen (-f); -la rejected
+//   short flags : one letter per hyphen (-f); clustered forms admitted
+//                 IFF every letter's registration is FKIND_BOOL or (under
+//                 permissive mode) FKIND_UNKNOWN — see ENH-013 below
 //   positional  : any arg not classified as a flag
 //   sentinel    : --pdx-schema sets emit_schema=1 (libpdx-argv debug)
 //
@@ -51,6 +55,57 @@
 //   that registers it with a non-2 id) never triggers it. Consumers
 //   that want to render their own --version output opt out via
 //   VersionBackend::set_override(1) at bootstrap.
+//
+// libpdx-argv.ENH-013 (clustered short-flag expansion, Closes #23):
+//   M1-002 locked a one-per-hyphen short-flag grammar: any argv slot
+//   whose byte0='-' and had two-or-more non-NUL bytes after the '-'
+//   was rejected with ERR_CLUSTERED_SHORT (4). ENH-013 relaxes the
+//   grammar for the mainstream cluster idiom (`-vv` for verbosity,
+//   `-abc` for three switches) while preserving the D3 guarantee that
+//   a value-consuming short flag never silently swallows one of its
+//   cluster-mates: when EVERY letter in `-abc...` looks up as
+//   FKIND_BOOL (0), OR — under permissive mode — as FKIND_UNKNOWN
+//   (0xFF; the parser already treats these as boolean per M2-001),
+//   the cluster is expanded into N independent short-flag stores
+//   (flag_names[k] point at a per-letter NUL-terminated string in a
+//   parser-owned scratch buffer, flag_values[k] = 0, flag_ids[k] and
+//   flag_kinds[k] set from the lookup return). Any letter whose
+//   lookup returns a value-consuming kind (FKIND_STR / FKIND_INT /
+//   FKIND_TIMESPAN / FKIND_SIZE / FKIND_ENUM) fails the whole
+//   cluster with ERR_CLUSTER_WITH_ARITY (16) BEFORE any letter is
+//   dispatched — no partial stores. Strict mode (ENH-004) still
+//   dominates: an unregistered letter under FlagSpec::set_strict(1)
+//   fails with ERR_UNKNOWN_FLAG (12), same as the single-letter path.
+//
+//   Implementation shape: two-pass. Pass 1 walks the cluster once
+//   using a 2-byte probe scratch (cluster_probe) as the NUL-terminated
+//   1-char name string handed to FlagSpec::lookup, classifying each
+//   letter (fail-fast on the first offending kind). Pass 2 walks the
+//   cluster again, this time writing letter+NUL into a per-slot pair
+//   inside cluster_scratch_buf keyed off flag_count*2, calling
+//   FlagSpec::lookup again to recover (kind, id), and storing into
+//   flag_names/flag_values/flag_ids/flag_kinds via the same MAX_FLAGS
+//   overflow gate the long-flag / single-letter-short paths use. Two
+//   lookups per letter is O(2 * cluster_len * SPEC_MAX) which is
+//   still bounded above by 2 * 32 * 32 = 2048 comparisons per parse.
+//
+//   The cluster path deliberately does NOT fire the ENH-032
+//   (--version) or ENH-014 (--help) auto-emit dispatch: a tool that
+//   registers `-h`/`-v` short with those std ids AND embeds them in
+//   a cluster is outside the mainstream `-vvv` idiom, and the
+//   two-pass expansion loses the natural "first store, then check"
+//   auto-emit shape. The single-letter short-flag path is unchanged
+//   for that idiom; a tool that wants `-h` auto-help just types it
+//   without clustering.
+//
+//   Scratch buffer sizing: cluster_scratch_buf is 64 bytes = 2 bytes
+//   per letter × MAX_FLAGS (32). Since every cluster store increments
+//   flag_count, and the overflow gate at flag_count == 32 fires
+//   before any 33rd letter's scratch write, the 64-byte bound is
+//   exactly right. parsed_args_reset zeroes flag_count so the next
+//   parse starts writing at scratch[0]; the buffer's stale bytes
+//   never leak into the current parse because flag_names[k] pointers
+//   land inside the freshly-overwritten region.
 //
 // libpdx-argv.ENH-026 (malformed-argv-slot classification):
 //   The classifier now rejects two argv shapes that fit neither the
@@ -96,6 +151,30 @@
 
 module Parser = structure {
 
+  // -- ENH-013 cluster scratch buffers (Closes #23) -------------------
+  // Parser-owned .bss buffers backing the short-flag cluster expansion
+  // path. Both are written into during parse_argv and never read
+  // outside it. See the ENH-013 preamble note above for the sizing
+  // rationale (64-byte scratch = 2 bytes × MAX_FLAGS).
+  //
+  //   cluster_probe          — 2-byte NUL-terminated scratch string
+  //                            (letter + NUL) handed to FlagSpec::lookup
+  //                            during pass 1 (validation). Overwritten
+  //                            once per cluster letter; never read by
+  //                            consumers.
+  //   cluster_scratch_buf    — the storage for expanded letter names.
+  //                            Keyed by flag_count*2 during pass 2
+  //                            (dispatch): the k-th store writes
+  //                            scratch[flag_count*2] = letter and
+  //                            scratch[flag_count*2 + 1] = NUL, then
+  //                            publishes scratch+flag_count*2 into
+  //                            flag_names[flag_count]. Pointers into
+  //                            this buffer are live for the lifetime
+  //                            of the ParsedArgs record (i.e. until
+  //                            the next parsed_args_reset).
+  pub let mut cluster_probe       : [u64; 1] = uninit @align(8)
+  pub let mut cluster_scratch_buf : [u64; 8] = uninit @align(8)
+
   // parse_argv(argv, argc) → u64
   //   rdi = argv (u64* array of NUL-terminated arg pointers)
   //   rsi = argc (count of entries in argv)
@@ -129,7 +208,7 @@ module Parser = structure {
   pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2 + ENH-004 + ENH-026 + ENH-032 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default (writes the fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n` to fd 1 via seven raw sys_writes) and returns ERR_VERSION_EMITTED (13) via parse_argv_fail — the same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for the added nested call.",
+      justification: "libpdx-argv.M2 + ENH-004 + ENH-013 + ENH-026 + ENH-032 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default (writes the fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n` to fd 1 via seven raw sys_writes) and returns ERR_VERSION_EMITTED (13) via parse_argv_fail — the same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for the added nested call. ENH-013 (Closes #23): the parse_argv_short_clustered arm is no longer an unconditional ERR_CLUSTERED_SHORT reject — it two-passes the cluster (validation via cluster_probe, dispatch via cluster_scratch_buf indexed by flag_count*2) and either expands `-abc` into three flag_count++ stores or fails with ERR_CLUSTER_WITH_ARITY (16) at the first value-consuming kind. The same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for the added FlagSpec::lookup calls (2N per cluster of length N).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -501,7 +580,138 @@ module Parser = structure {
         jmp parse_argv_advance_loop;
 
       parse_argv_short_clustered:
-        mov rax, 4;                         // ERR_CLUSTERED_SHORT
+        // ENH-013 (Closes #23): try to expand the cluster instead of
+        // rejecting outright. rdx = arg ptr; rdx[0]='-'; rdx[1..N] are
+        // the cluster letters; rdx[N+1]=NUL with N >= 2. Two-pass:
+        // pass 1 validates every letter is admissible (BOOL, or
+        // permissive-mode UNKNOWN → treated as BOOL); pass 2 walks
+        // again and dispatches each letter as its own short-flag
+        // store. See the ENH-013 module-level preamble for the full
+        // rationale and scratch-buffer sizing.
+
+        // -- Pass 1: validation --
+        // rbp = validation cursor; starts at first letter (rdx + 1).
+        mov rbp, rdx;
+        add rbp, 1;
+
+      parse_argv_cluster_val_head:
+        xor rax, rax;
+        mov_b rax, [rbp];
+        cmp rax, 0;
+        je parse_argv_cluster_val_done;
+
+        // Build cluster_probe = <letter>\0 and hand to FlagSpec::lookup.
+        lea r11, [rip + cluster_probe];
+        mov_b [r11], rax;
+        xor rax, rax;
+        mov_b [r11 + 1], rax;
+
+        mov rdi, r11;
+        call lookup;                        // rax=kind, rdx=id
+
+        cmp rax, 0xFF;                      // FKIND_UNKNOWN?
+        jne parse_argv_cluster_val_check_kind;
+        // Unknown letter. Under ENH-004 strict mode this is a hard
+        // reject; permissive mode treats it as boolean (admissible).
+        lea r11, [rip + strict_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne parse_argv_unknown_flag;
+        jmp parse_argv_cluster_val_advance;
+
+      parse_argv_cluster_val_check_kind:
+        // Only FKIND_BOOL (0) is admissible in a cluster. Every other
+        // kind (STR/INT/TIMESPAN/SIZE/ENUM) would consume a value —
+        // fail the whole cluster with ERR_CLUSTER_WITH_ARITY before
+        // any letter is dispatched (no partial storage).
+        cmp rax, 0;                         // FKIND_BOOL
+        jne parse_argv_cluster_with_arity;
+
+      parse_argv_cluster_val_advance:
+        add rbp, 1;
+        jmp parse_argv_cluster_val_head;
+
+      parse_argv_cluster_val_done:
+        // -- Pass 2: dispatch --
+        // Reload rdx = argv[i] (clobbered across the pass-1 lookups).
+        // rbp resets to the first letter.
+        mov rdx, [rbx + r13*8];
+        mov rbp, rdx;
+        add rbp, 1;
+
+      parse_argv_cluster_disp_head:
+        xor rax, rax;
+        mov_b rax, [rbp];
+        cmp rax, 0;
+        je parse_argv_cluster_disp_done;
+
+        // -- MAX_FLAGS overflow gate (BEFORE any scratch write) ------
+        // Reuses the same parse_argv_flag_overflow fail path the long
+        // and single-short store paths use. Because flag_count is the
+        // scratch index too, the 64-byte cluster_scratch_buf can
+        // never be written past its last legal 2-byte pair: on the
+        // 33rd cluster letter (flag_count == 32) this gate fires
+        // first and no scratch write happens.
+        lea r11, [rip + flag_count];
+        mov rcx, [r11];
+        cmp rcx, 32;                        // MAX_FLAGS
+        jge parse_argv_flag_overflow;
+
+        // Compute &cluster_scratch_buf[rcx * 2]. Use `add r9, r9` for
+        // the *2 doubling — `shl r9, 1` also works but the add form
+        // keeps the code inside the exact instruction set every other
+        // parser path uses (no shifts in parse_argv currently).
+        mov r9, rcx;
+        add r9, r9;
+        lea r11, [rip + cluster_scratch_buf];
+        add r11, r9;
+
+        // Write letter+NUL at scratch[rcx*2 .. rcx*2 + 2).
+        mov_b [r11], rax;                   // letter (low byte of rax)
+        xor rax, rax;
+        mov_b [r11 + 1], rax;               // NUL terminator
+
+        // Preserve the name pointer in r14 (callee-save; survives the
+        // lookup call) so we can store it into flag_names[rcx] after
+        // the call returns. r14 is otherwise the value-ptr staging
+        // register — safe to repurpose here because cluster stores
+        // are BOOL-only (value = 0 always).
+        mov r14, r11;
+
+        mov rdi, r14;                       // rdi = name ptr
+        call lookup;                        // rax=kind, rdx=id
+        mov r15, rdx;                       // r15 = id
+
+        // Reload rcx = flag_count (unchanged across lookup — leaf,
+        // does not touch flag_count — but rcx itself was clobbered).
+        lea r11, [rip + flag_count];
+        mov rcx, [r11];
+
+        lea r11, [rip + flag_names];
+        mov [r11 + rcx*8], r14;
+        lea r11, [rip + flag_values];
+        xor r8, r8;
+        mov [r11 + rcx*8], r8;              // value = 0 (BOOL)
+        lea r11, [rip + flag_ids];
+        mov [r11 + rcx*8], r15;
+        lea r11, [rip + flag_kinds];
+        mov [r11 + rcx*8], rax;
+
+        add rcx, 1;
+        lea r11, [rip + flag_count];
+        mov [r11], rcx;
+
+        // Advance to next letter. Cluster stores intentionally skip
+        // the ENH-032 (--version) / ENH-014 (--help) auto-emit
+        // dispatches — see the ENH-013 preamble for why.
+        add rbp, 1;
+        jmp parse_argv_cluster_disp_head;
+
+      parse_argv_cluster_disp_done:
+        jmp parse_argv_advance_loop;
+
+      parse_argv_cluster_with_arity:
+        mov rax, 16;                        // ERR_CLUSTER_WITH_ARITY
         jmp parse_argv_fail;
 
       parse_argv_positional:

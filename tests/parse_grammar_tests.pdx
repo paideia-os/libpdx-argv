@@ -42,6 +42,20 @@
 //     same failure signature — regression witness that neither
 //     the fail path nor the count reset changes shape past the
 //     first refusal). MAX_FLAGS == MAX_POS == 32 per parsed_args.pdx.
+//   - libpdx-argv.ENH-013 clustered short-flag expansion
+//     (cases 31-34 plus updated case 6). Case 6 updates in place:
+//     `-la` under permissive mode with no registrations expanded
+//     into 2 flag_count++ stores (both flag_ids[k]=0, both
+//     flag_kinds[k]=FKIND_UNKNOWN) — pre-ENH-013 this fixture
+//     returned ERR_CLUSTERED_SHORT (4), now returns ERR_OK.
+//     Case 31: `-vv` on COUNTED (BOOL-registered) 'v' →
+//     flag_count=2 with count_flag_by_id(id)=2. Case 32: `-abc`
+//     with a/b/c all BOOL registered → flag_count=3 with each id
+//     resolvable. Case 33: `-abc` where b is STR →
+//     ERR_CLUSTER_WITH_ARITY (=16), flag_count=0 (no partial
+//     dispatch). Case 34: `-abc` where a is unregistered under
+//     set_strict(1) → ERR_UNKNOWN_FLAG (=12), flag_count=0
+//     (strict mode dominates the cluster-admissibility rule).
 //
 // Module id in TestHarness::last_fail_tag: 1
 //
@@ -383,10 +397,21 @@ module ParseGrammarTests = structure {
     }
 
   // ============================================================
-  // Case 6 — clustered short flag: `-la` MUST be rejected.
+  // Case 6 — libpdx-argv.ENH-013 (Closes #23) clustered short flag,
+  //   permissive-mode expansion. Under M1-002 this fixture returned
+  //   ERR_CLUSTERED_SHORT (4) unconditionally; ENH-013 relaxes the
+  //   grammar so a cluster whose every letter looks up as FKIND_BOOL
+  //   or (permissive) FKIND_UNKNOWN is expanded into N independent
+  //   short-flag stores. With no registrations in play `-la` sees
+  //   both letters land as FKIND_UNKNOWN and are treated as boolean.
   //   argv: "-la\0"
-  //   Expected: err=ERR_CLUSTERED_SHORT (=4), error_arg_index=0.
-  //   (D3 one-per-hyphen contract; break with GNU.)
+  //   Expected: err=ERR_OK (0), flag_count=2, both flag_ids[k]=0
+  //   (unregistered), both flag_values[k]=0, flag_kinds[k]=FKIND_UNKNOWN
+  //   (0xFF). Regression witness for the M1-002 → ENH-013 semantics
+  //   change — any consumer that pattern-matched on
+  //   ERR_CLUSTERED_SHORT (4) needs updating (that error code is now
+  //   unreachable from the parser; the constant is retained in
+  //   parsed_args.pdx for wire-form compatibility).
   // ============================================================
   pub let case6_clustered : [u8; 4] = "-la\0"
   pub let mut case6_argv  : [u64; 1] = uninit @align(8)
@@ -394,7 +419,7 @@ module ParseGrammarTests = structure {
   pub let run_case6 : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M4-001 case6 — clustered short flag REJECTED per D3. Fixture: -la. Parser must set error_code = ERR_CLUSTERED_SHORT (=4) and error_arg_index = 0 (offending arg). This test is the M1-002 D3 contract — GNU-style clustering (-la == -l -a) is deliberately not accepted.",
+      justification: "libpdx-argv.M4-001 + ENH-013 (Closes #23) case6 — clustered short flag `-la` is now EXPANDED under permissive mode (no registrations; strict_mode=0). Pass 1 (validation): both 'l' and 'a' look up as FKIND_UNKNOWN (0xFF), strict_mode is 0, so both are admissible as boolean. Pass 2 (dispatch): two short-flag stores. flag_count reaches 2, both flag_ids[k]=0 (unregistered), both flag_values[k]=0. Regression witness for the M1-002 → ENH-013 grammar relaxation: pre-ENH-013 this returned ERR_CLUSTERED_SHORT (4) unconditionally.",
       block: {
         push rbx;
 
@@ -407,16 +432,31 @@ module ParseGrammarTests = structure {
         lea rdi, [rip + case6_argv];
         mov rsi, 1;
         call parse_argv;
-        cmp rax, 4;                          // ERR_CLUSTERED_SHORT
+        cmp rax, 0;                          // ERR_OK
         jne case6_fail;
 
-        lea r11, [rip + error_code];
+        lea r11, [rip + flag_count];
         mov rax, [r11];
-        cmp rax, 4;
+        cmp rax, 2;
         jne case6_fail;
 
-        lea r11, [rip + error_arg_index];
-        mov rax, [r11];
+        // Both flag_ids must be 0 (unregistered).
+        lea r11, [rip + flag_ids];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne case6_fail;
+        lea r11, [rip + flag_ids];
+        mov rax, [r11 + 8];
+        cmp rax, 0;
+        jne case6_fail;
+
+        // Both flag_values must be 0 (boolean).
+        lea r11, [rip + flag_values];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne case6_fail;
+        lea r11, [rip + flag_values];
+        mov rax, [r11 + 8];
         cmp rax, 0;
         jne case6_fail;
 
@@ -1784,6 +1824,300 @@ module ParseGrammarTests = structure {
 
       case30_fail:
         mov rdi, 0x10000001E;                // (1<<32) | 30
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 31 — libpdx-argv.ENH-013 (Closes #23) `-vv` on COUNTED
+  //   flag `v` increments twice. `v` is registered as FKIND_BOOL
+  //   with a tool-specific id (100); the "COUNTED" idiom means the
+  //   consumer reads back the repeat count via
+  //   ParsedArgs::count_flag_by_id. Every occurrence of `-v` in the
+  //   cluster gets its own storage slot (no de-duplication), matching
+  //   the ENH-008 duplicate-flag policy exactly the way the
+  //   equivalent `-v -v` invocation does.
+  //   argv: "-vv\0"
+  //   Expected: err=ERR_OK, flag_count=2, count_flag_by_id(100)=2,
+  //             find_flag_by_id(100) != 32 (first-wins slot exists).
+  // ============================================================
+  pub let case31_v_short  : [u8; 2]  = "v\0"
+  pub let case31_arg      : [u8; 4]  = "-vv\0"
+  pub let mut case31_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case31 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-013 (Closes #23) case31 — `-vv` on COUNTED flag `v`. Register `v\\0` as FKIND_BOOL id=100 (the COUNTED idiom is BOOL + count_flag_by_id at the read side; no dedicated FKIND_COUNTED exists in libpdx-argv's kind space). Parser expands `-vv` into two independent stores, flag_count reaches 2, and count_flag_by_id(100) returns 2 — the same result `-v -v` would produce. Regression witness for the mainstream repeat-count idiom now working inside a cluster. Non-leaf: 1-push (rbx) aligns rsp%16 for the nested full_reset / flag_spec_register / parse_argv / count_flag_by_id / find_flag_by_id / record_* calls.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // Register `v\0` as FKIND_BOOL id=100.
+        lea rdi, [rip + case31_v_short];
+        mov rsi, 0;                          // FKIND_BOOL
+        mov rdx, 100;
+        call flag_spec_register;
+
+        lea r11, [rip + case31_arg];
+        lea rbx, [rip + case31_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case31_argv];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 0;                          // ERR_OK
+        jne case31_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne case31_fail;
+
+        // count_flag_by_id(100) must return 2.
+        mov rdi, 100;
+        call count_flag_by_id;
+        cmp rax, 2;
+        jne case31_fail;
+
+        // find_flag_by_id(100) must not be MAX_FLAGS.
+        mov rdi, 100;
+        call find_flag_by_id;
+        cmp rax, 32;
+        je case31_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case31_fail:
+        mov rdi, 0x10000001F;                // (1<<32) | 31
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 32 — libpdx-argv.ENH-013 (Closes #23) `-abc` where a/b/c
+  //   are all FKIND_BOOL. Three-letter cluster expands to three
+  //   independent short-flag stores. Every letter gets its own
+  //   (name, id, kind) triple in the ParsedArgs record; consumers
+  //   dispatching by id see each of a/b/c under its registered id.
+  //   argv: "-abc\0"
+  //   Registrations: a→(BOOL,100), b→(BOOL,101), c→(BOOL,102)
+  //   Expected: err=ERR_OK, flag_count=3, find_flag_by_id(100/101/102)
+  //             all resolve to non-32.
+  // ============================================================
+  pub let case32_a_short  : [u8; 2]  = "a\0"
+  pub let case32_b_short  : [u8; 2]  = "b\0"
+  pub let case32_c_short  : [u8; 2]  = "c\0"
+  pub let case32_arg      : [u8; 5]  = "-abc\0"
+  pub let mut case32_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case32 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-013 (Closes #23) case32 — `-abc` where a/b/c are all FKIND_BOOL. Register three distinct 1-char short flags with ids 100/101/102. Pass 1 (validation) accepts all three (BOOL admissible). Pass 2 (dispatch) issues three stores. flag_count reaches 3; find_flag_by_id succeeds for each id. Fingerprint from the ENH-013 issue: `-abc where a/b/c all BOOL → 3 flag events, flag_count==3`. Non-leaf: 1-push (rbx) aligns rsp%16 for the nested calls (full_reset + 3 flag_spec_register + parse_argv + 3 find_flag_by_id + record_*).",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // Register a/b/c as FKIND_BOOL with distinct tool-specific ids.
+        lea rdi, [rip + case32_a_short];
+        mov rsi, 0;
+        mov rdx, 100;
+        call flag_spec_register;
+        lea rdi, [rip + case32_b_short];
+        mov rsi, 0;
+        mov rdx, 101;
+        call flag_spec_register;
+        lea rdi, [rip + case32_c_short];
+        mov rsi, 0;
+        mov rdx, 102;
+        call flag_spec_register;
+
+        lea r11, [rip + case32_arg];
+        lea rbx, [rip + case32_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case32_argv];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 0;                          // ERR_OK
+        jne case32_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne case32_fail;
+
+        // Each id must resolve.
+        mov rdi, 100;
+        call find_flag_by_id;
+        cmp rax, 32;
+        je case32_fail;
+
+        mov rdi, 101;
+        call find_flag_by_id;
+        cmp rax, 32;
+        je case32_fail;
+
+        mov rdi, 102;
+        call find_flag_by_id;
+        cmp rax, 32;
+        je case32_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case32_fail:
+        mov rdi, 0x100000020;                // (1<<32) | 32
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 33 — libpdx-argv.ENH-013 (Closes #23) `-abc` where `b` is
+  //   FKIND_STR. Cluster contains a value-consuming registration;
+  //   parser rejects the WHOLE cluster with ERR_CLUSTER_WITH_ARITY
+  //   (=16) BEFORE any letter is dispatched. flag_count stays at 0
+  //   (no partial storage). Note: `a` is registered BOOL and would
+  //   succeed if dispatched alone, but pass 1 fails at the second
+  //   letter and pass 2 never runs.
+  //   argv: "-abc\0"
+  //   Registrations: a→(BOOL,100), b→(STR,101), c→(BOOL,102)
+  //   Expected: err=ERR_CLUSTER_WITH_ARITY (16), flag_count=0,
+  //             error_arg_index=0.
+  // ============================================================
+  pub let case33_a_short  : [u8; 2]  = "a\0"
+  pub let case33_b_short  : [u8; 2]  = "b\0"
+  pub let case33_c_short  : [u8; 2]  = "c\0"
+  pub let case33_arg      : [u8; 5]  = "-abc\0"
+  pub let mut case33_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case33 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-013 (Closes #23) case33 — `-abc` where `b` is FKIND_STR. Fingerprint from the ENH-013 issue: `-abc where b is STRING → ERR_CLUSTER_WITH_ARITY, flag_count==0`. Parser's pass-1 validation walks a→BOOL (OK), b→STR (kind=1, not BOOL, not UNKNOWN → fail with ERR_CLUSTER_WITH_ARITY=16). Pass 2 never runs. flag_count stays 0 — no partial dispatch of the leading `a` letter. error_arg_index is the argv slot the cluster sits at (0). Non-leaf: 1-push (rbx) aligns rsp%16 for the nested calls.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea rdi, [rip + case33_a_short];
+        mov rsi, 0;                          // FKIND_BOOL
+        mov rdx, 100;
+        call flag_spec_register;
+        lea rdi, [rip + case33_b_short];
+        mov rsi, 1;                          // FKIND_STR
+        mov rdx, 101;
+        call flag_spec_register;
+        lea rdi, [rip + case33_c_short];
+        mov rsi, 0;
+        mov rdx, 102;
+        call flag_spec_register;
+
+        lea r11, [rip + case33_arg];
+        lea rbx, [rip + case33_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case33_argv];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 16;                         // ERR_CLUSTER_WITH_ARITY
+        jne case33_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case33_fail;
+
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case33_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case33_fail:
+        mov rdi, 0x100000021;                // (1<<32) | 33
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // Case 34 — libpdx-argv.ENH-013 (Closes #23) `-abc` where `a` is
+  //   unregistered AND FlagSpec::set_strict(1) is in effect. Pass 1
+  //   validation encounters the UNKNOWN kind on the very first
+  //   letter, and strict mode's ENH-004 rule takes precedence over
+  //   the cluster-admissibility rule: fail with ERR_UNKNOWN_FLAG
+  //   (=12), NOT with ERR_CLUSTER_WITH_ARITY. Confirms the two error
+  //   codes remain distinct across the strict × cluster
+  //   intersection.
+  //   argv: "-abc\0"
+  //   Registrations: b→(BOOL,101), c→(BOOL,102) (a NOT registered),
+  //                  set_strict(1) after register.
+  //   Expected: err=ERR_UNKNOWN_FLAG (12), flag_count=0.
+  // ============================================================
+  pub let case34_b_short  : [u8; 2]  = "b\0"
+  pub let case34_c_short  : [u8; 2]  = "c\0"
+  pub let case34_arg      : [u8; 5]  = "-abc\0"
+  pub let mut case34_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case34 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-013 + ENH-004 (Closes #23) case34 — `-abc` where `a` is unregistered and set_strict(1) is in effect. Fingerprint from the ENH-013 issue: `-abc where a unregistered → ERR_UNKNOWN_FLAG (strict)`. Pass 1 validation: 'a' looks up FKIND_UNKNOWN, strict_mode != 0 → jump to parse_argv_unknown_flag, error_code=12. flag_count stays 0. Proves the ENH-004 strict-mode gate applies uniformly on the cluster path (same code path parse_argv_unknown_flag as the single-letter short and long paths). Non-leaf: 1-push (rbx) aligns rsp%16 for the nested calls.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // Register b + c only; leave a unregistered. Then set strict.
+        lea rdi, [rip + case34_b_short];
+        mov rsi, 0;
+        mov rdx, 101;
+        call flag_spec_register;
+        lea rdi, [rip + case34_c_short];
+        mov rsi, 0;
+        mov rdx, 102;
+        call flag_spec_register;
+        mov rdi, 1;
+        call set_strict;
+
+        lea r11, [rip + case34_arg];
+        lea rbx, [rip + case34_argv];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + case34_argv];
+        mov rsi, 1;
+        call parse_argv;
+        cmp rax, 12;                         // ERR_UNKNOWN_FLAG
+        jne case34_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case34_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case34_fail:
+        mov rdi, 0x100000022;                // (1<<32) | 34
         call record_fail;
         pop rbx;
         ret;

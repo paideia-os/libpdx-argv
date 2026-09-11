@@ -152,30 +152,35 @@ lower-level primitive that classifies exactly what it is handed. See
 `src/parser.pdx` `parse_argv_skipping_zero` for the two-instruction
 core (`add rdi, 8; sub rsi, 1`) and its 1-push alignment prologue.
 
-## 5. Short-flag rejection contract (M1-002)
+## 5. Short-flag rejection contract (M1-002 baseline; relaxed by ENH-013 §16)
 
 When byte1 is neither `'-'` nor NUL, the arg is a short flag. D3 in
-`design/tooling/plan.md` mandates one-flag-per-hyphen; `-la` is a
-category error, not a two-flag shorthand.
+`design/tooling/plan.md` mandates one-flag-per-hyphen; the M1-002
+baseline rejected every cluster (`-la`) as a category error. See §16
+for the ENH-013 relaxation that admits BOOL/COUNTED clusters while
+preserving the D3 guarantee for value-consuming registrations.
 
-**Accepted:** `-f` — a single letter followed by NUL. Stored as
-`flag_names[k] = "f\0"` (interior pointer just past the `-`),
-`flag_values[k] = 0`. If the next argv element does not start with `-` or
-NUL, it is consumed as the value (mirrors the long-flag lookahead rule
-above). Short flags do not participate in the `--pdx-schema` well-known
-compare — that flag is long-only.
+**Accepted (single-letter):** `-f` — a single letter followed by NUL.
+Stored as `flag_names[k] = "f\0"` (interior pointer just past the `-`),
+`flag_values[k] = 0`. If the next argv element does not start with `-`
+or NUL, it is consumed as the value (mirrors the long-flag lookahead
+rule above). Short flags do not participate in the `--pdx-schema`
+well-known compare — that flag is long-only.
 
-**Rejected:** `-la` — a two-or-more-character run after the `-`. Sets
-`ERR_CLUSTERED_SHORT`. The parser stops before this arg is stored, and
-the erroring `argv[i]` is discoverable via the
+**Rejected (post-ENH-013):** A cluster `-abc...` where any letter's
+`FlagSpec::lookup` returns a value-consuming kind (STR/INT/TIMESPAN/
+SIZE/ENUM). Sets `ERR_CLUSTER_WITH_ARITY` (16); no letter is
+dispatched (see §16). The erroring `argv[i]` is discoverable via the
 `ParsedArgs::error_arg_index` slot the parser writes alongside every
-error-code write (see `parse_argv_fail` in `src/parser.pdx`).
+error-code write (see `parse_argv_fail` in `src/parser.pdx`). The
+legacy `ERR_CLUSTERED_SHORT` (4) is now unreachable from the parser
+but retained in `ParsedArgs` for wire-form back-compat.
 
-D3 justification: the GNU behaviour of clustering (`ls -la` == `ls -l -a`)
-lets a typo like `-lat` silently activate a third flag `-t` the user did
-not intend. The paideia-os shell renders short-flag rejection with a
-one-line diagnostic that suggests the two-hyphen form and offers to
-retry.
+D3 justification survives the relaxation: a value-consuming short
+flag inside a cluster (`-nX` where `-n` is INT) is still refused, so
+the shell renders a one-line diagnostic per that code. The
+mainstream `-vv`/`-abc` cluster idiom for BOOL/COUNTED short flags
+now composes.
 
 ## 6. Compliance with paideia-as encoding constraints
 
@@ -1359,3 +1364,116 @@ the SchemaInvoke input path's own `header_size` gate at
   wire form remains "callers read `ParsedArgs` in-process".
   A future ENH may add a success-side output schema; ENH-016
   is deliberately failure-only.
+
+## 16. Clustered short-flag expansion (ENH-013, Closes #23)
+
+M1-002 (§5) locked a one-per-hyphen short-flag grammar: any cluster
+(`-la`, `-abc`) was rejected with `ERR_CLUSTERED_SHORT` (4). The D3
+motivation was correctness — a value-consuming short flag inside a
+cluster (`-nX` where `-n` is INT) would silently swallow one of its
+neighbours or its value depending on the getopt dialect, and the
+semantic-pipe dispatch by id couldn't disambiguate. ENH-013 narrows
+the reject to that specific hazard and admits the mainstream
+BOOL/COUNTED cluster idiom (`-vv` for verbosity, `-abc` for three
+switches).
+
+### 16.1 Admissibility rule
+
+For a cluster `-c1c2...cN` (N ≥ 2), every letter is looked up via
+`FlagSpec::lookup`. The cluster is admissible iff for every letter:
+
+- The lookup returns `FKIND_BOOL` (0), **or**
+- The lookup returns `FKIND_UNKNOWN` (0xFF) **and** `FlagSpec::strict_mode
+  == 0` (permissive) — treated as boolean per M2-001.
+
+Any letter whose lookup returns `FKIND_STR` / `FKIND_INT` /
+`FKIND_TIMESPAN` / `FKIND_SIZE` / `FKIND_ENUM` fails the whole
+cluster with `ERR_CLUSTER_WITH_ARITY` (16). Strict-mode's ENH-004
+rule takes precedence over both branches: an unregistered letter
+under `FlagSpec::set_strict(1)` fails with `ERR_UNKNOWN_FLAG` (12).
+No letter of a failed cluster is dispatched — `flag_count` is
+unchanged from cluster entry.
+
+### 16.2 Two-pass shape
+
+Pass 1 (validation) walks the cluster once, calling
+`FlagSpec::lookup` with a 2-byte `cluster_probe` (letter + NUL) as
+the name string. Fail-fast on the first offending kind.
+
+Pass 2 (dispatch) walks the cluster again. For each letter it writes
+`letter, NUL` into `cluster_scratch_buf[flag_count * 2 ..
+flag_count * 2 + 2)` and stores `(name_ptr, 0, id, kind)` into
+`flag_names / flag_values / flag_ids / flag_kinds[flag_count]`
+under the existing `MAX_FLAGS` overflow gate. The second lookup per
+letter is redundant (pass 1 already read the same values) but keeps
+the code straight-line — a triple-buffer between passes would trade
+lookup cost for scratch-write bookkeeping and read no better.
+
+### 16.3 Scratch buffer sizing
+
+`Parser::cluster_scratch_buf` is 64 bytes = 2 bytes × `MAX_FLAGS`
+(32). Because every cluster store increments `flag_count`, and the
+overflow gate at `flag_count == 32` fires *before* the 33rd letter's
+scratch write, the 64-byte bound is exactly right. `parsed_args_reset`
+zeroes `flag_count` so the next parse starts writing at
+`scratch[0]`; stale bytes never leak into the current parse because
+`flag_names[k]` pointers only reference the freshly-overwritten
+2-byte pairs.
+
+`Parser::cluster_probe` is 8 bytes (aligned qword; only its first 2
+bytes are used) and is overwritten once per pass-1 letter; it is
+never read outside `parse_argv`.
+
+### 16.4 Dispatched-flag observables
+
+An accepted cluster of N letters produces N independent
+`ParsedArgs` slots, byte-for-byte identical (up to the name pointer
+target) to what typing the N letters space-separated would produce:
+
+- `flag_names[k]` points into `cluster_scratch_buf` (a valid
+  NUL-terminated 1-char string); a consumer that reads back the
+  raw name gets a 1-byte string. Every plain-single-short
+  invocation (`-v -v -v`) puts pointers into argv memory instead;
+  the shape (1-char + NUL) is identical.
+- `flag_values[k] = 0` (BOOL semantics; cluster-admissible letters
+  never consume a value by construction).
+- `flag_ids[k]` and `flag_kinds[k]` are set from the lookup return
+  (id 0 / kind 0xFF for permissive-mode unregistered letters, per
+  M2-001).
+- `count_flag_by_id(id) == N` for a `-vvv…N`-length cluster over a
+  single BOOL flag — the repeat-count idiom composes with the
+  cluster idiom.
+
+### 16.5 What ENH-013 explicitly does not do
+
+- **No auto-emit dispatch from cluster stores.** The ENH-032
+  (`--version`) and ENH-014 (`--help`) auto-emit checks that fire
+  after every long-flag or single-letter short-flag store are
+  deliberately skipped on the cluster expansion path. A tool that
+  registers `-h`/`-v` as single-letter shorts with the standard ids
+  gets the auto-emit only when the user types them without
+  clustering (`-h` alone, not `-vh`). This is outside the
+  mainstream `-vvv` idiom and the two-pass expansion would need a
+  post-store short-circuit inside the dispatch loop to preserve
+  ordering — deferred to a follow-on ENH if any consumer needs it.
+- **No new `FKIND_COUNTED` kind.** libpdx-argv's kind space stays
+  at BOOL/STR/INT/TIMESPAN/SIZE/ENUM/UNKNOWN. The "COUNTED" idiom
+  in the ENH-013 issue is BOOL + `count_flag_by_id` at the read
+  side; the parser sees no distinction and needs none.
+- **No new registration path.** A cluster-friendly flag is
+  registered exactly as any BOOL flag (`flag_spec_register(name,
+  FKIND_BOOL, id)`). Existing consumers (StdVocab's `register_all`
+  in particular) get cluster support for their BOOL registrations
+  without a code change.
+- **No cluster-aware diagnostics.** The `ERR_CLUSTER_WITH_ARITY`
+  error carries the cluster's `error_arg_index` (the argv slot the
+  cluster sits at) but no per-letter offset — a consumer that
+  wants to say "letter `b` in `-abc` is the value-consuming one"
+  walks the cluster itself. Consistent with every other ERR_*
+  code: the parser records where, not why-at-byte-level.
+- **No relaxation for the `--=foo`/`--:foo` grammar or any long-
+  flag category.** ENH-013 is scoped to the short-flag classifier
+  branch only; every other classifier arm is byte-identical to
+  pre-ENH-013 behaviour.
+
+Klog tag: `pdxargv.short-cluster`.
