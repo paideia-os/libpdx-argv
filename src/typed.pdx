@@ -43,7 +43,11 @@
 //     compare style (e.g. libpdx-argv.ENH-002's unsigned wire
 //     compares) over flag-reuse tricks.
 //   - Leaf functions (no calls); parsers can be invoked from any
-//     stack alignment.
+//     stack alignment. EXCEPTION (libpdx-argv.ENH-018): the range-
+//     gate wrapper parse_int_u64_ranged is NON-leaf (it delegates
+//     decoding to parse_int_u64). It carries its own 3-push (rbx,
+//     rbp, r12) prologue to align rsp%16 for the nested call and to
+//     preserve the caller's (min, max) across it.
 
 module Typed = structure {
 
@@ -137,6 +141,122 @@ module Typed = structure {
       pi_fail:
         xor rax, rax;                     // rax = 0 (fail)
         xor rdx, rdx;                     // rdx = 0
+        ret;
+      }
+    }
+
+  // ============================================================
+  // parse_int_u64_ranged(str_ptr, min, max) -> (ok in rax, val in rdx)
+  //                              — libpdx-argv.ENH-018 (Closes #28)
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //
+  //   rdi (in)  = NUL-terminated decimal digit string
+  //   rsi (in)  = min (inclusive lower bound, unsigned)
+  //   rdx (in)  = max (inclusive upper bound, unsigned)
+  //   rax (out) = 1 on success, 0 on decode failure OR range violation
+  //   rdx (out) = decoded value (undefined on failure)
+  //
+  // Decoding is delegated verbatim to parse_int_u64 (grammar and
+  // ENH-009 overflow contract unchanged: `[0-9]+` terminated by NUL,
+  // no sign/whitespace/suffix, u64::MAX + 1 → ok=0 rather than wrap).
+  // If the decoder returns ok=0 the outer contract returns (0, 0) with
+  // ParsedArgs::error_code UNTOUCHED — the pre-ENH-018 Typed convention
+  // that a decode failure does not set an error_code is preserved so a
+  // consumer that only cares about the decode still sees the same
+  // behaviour whether it calls parse_int_u64 or parse_int_u64_ranged.
+  //
+  // If the decoder returns ok=1, the (min, max) pair drives the
+  // range gate:
+  //   - Sentinel: min == 0 AND max == 0 → no gate; return (1, val).
+  //     This matches what plain flag_spec_register writes for an
+  //     INT flag (spec_min/spec_max stored as 0/0), so a flag
+  //     registered via the plain path is transparent to the gate.
+  //   - Otherwise: reject iff val < min OR val > max (unsigned
+  //     compares, JB / JA); the interval is CLOSED on both sides.
+  //     On a rejection, write ParsedArgs::error_code = ERR_INT_RANGE
+  //     (14) and return (0, 0). error_arg_index is deliberately NOT
+  //     touched — the consumer knows which flag it was decoding
+  //     (typically via a k = find_flag_by_id() index) and setting
+  //     an argv index here would misalign with the parse_argv
+  //     contract that only the argv classifier writes that slot.
+  //
+  // Non-leaf (calls parse_int_u64). 3-push prologue (rbx, rbp, r12)
+  // brings rsp%16 to 0 for the nested call and preserves (min, max)
+  // + a val spill across it (rsi/rdx are caller-save and rdx doubles
+  // as parse_int_u64's val-return channel, so both original args are
+  // moved into callee-save rbp/r12 before the call and val is
+  // spilled from rdx into rbx immediately after so the return-path
+  // stores don't fight for rdx).
+  //
+  // Register plan (post-prologue):
+  //   rbp = min (callee-save; preserved across parse_int_u64)
+  //   r12 = max (callee-save; preserved across parse_int_u64)
+  //   rbx = val (spilled from rdx after the call)
+  //   rax = ok / return
+  //   rdx = val / return
+  //   r11 = lea scratch (for the ParsedArgs::error_code store on
+  //         the range-fail path)
+  // ============================================================
+  pub let parse_int_u64_ranged : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) (min: u64) (max: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-018 Typed::parse_int_u64_ranged (Closes #28) — wraps parse_int_u64 with an inclusive-unsigned [min, max] gate. Non-leaf: 3-push prologue (rbx, rbp, r12) brings rsp%16 to 0 for the nested parse_int_u64 call and preserves min/max across it (rsi/rdx are caller-save and rdx doubles as parse_int_u64's val-return channel, so both original args are moved into callee-save rbp/r12 before the call and val is spilled from rdx into rbx immediately after so the return-path stores don't fight for rdx). Range gate uses jb (val < min) and ja (val > max) — unsigned compares end-to-end so the full u64 range works, e.g. parse_int_u64_ranged('18446744073709551615', 1, 64) is rejected here (val > max) rather than by the decoder's own u64::MAX overflow gate. Sentinel (min == 0 AND max == 0) → skip gate: matches the (0, 0) pair every non-register_int registration path writes into spec_min/spec_max, so a flag registered via the plain flag_spec_register(name, FKIND_INT, id) path never trips the gate. On a range violation: writes ParsedArgs::error_code = ERR_INT_RANGE (14) and returns (0, 0); on a decode failure: returns (0, 0) with error_code untouched (pre-ENH-018 Typed contract preserved so a consumer that only inspects the ok return sees the same behaviour whether it called parse_int_u64 or parse_int_u64_ranged). No test mnemonic; every zero check via cmp reg, 0. r11 lea scratch for the error_code store. Encoder note: the immediate 14 fits imm32 trivially (no r11 staging needed like the ENH-009 u64::MAX thresholds).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbp, rsi;                     // rbp = min (callee-save)
+        mov r12, rdx;                     // r12 = max (callee-save)
+
+        // rdi = str_ptr, still valid across the entry.
+        call parse_int_u64;               // rax = ok, rdx = val
+
+        cmp rax, 0;
+        je piur_decode_fail;              // decode failed → (0, 0)
+
+        mov rbx, rdx;                     // rbx = val (spill for post-check moves)
+
+        // Sentinel: min == 0 AND max == 0 → skip gate.
+        cmp rbp, 0;
+        jne piur_gate_on;
+        cmp r12, 0;
+        jne piur_gate_on;
+        // Both zero: no gate. Return (1, val).
+        mov rax, 1;
+        mov rdx, rbx;
+        jmp piur_epilogue;
+
+      piur_gate_on:
+        // Reject iff val < min OR val > max (unsigned).
+        cmp rbx, rbp;
+        jb piur_range_fail;
+        cmp rbx, r12;
+        ja piur_range_fail;
+
+        // In-range: return (1, val).
+        mov rax, 1;
+        mov rdx, rbx;
+        jmp piur_epilogue;
+
+      piur_range_fail:
+        // Publish ERR_INT_RANGE (14) into ParsedArgs::error_code.
+        mov rax, 14;                      // ERR_INT_RANGE
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        xor rax, rax;                     // return ok = 0
+        xor rdx, rdx;                     // val undefined; return 0
+        jmp piur_epilogue;
+
+      piur_decode_fail:
+        xor rax, rax;
+        xor rdx, rdx;
+        // fallthrough
+
+      piur_epilogue:
+        pop r12;
+        pop rbp;
+        pop rbx;
         ret;
       }
     }

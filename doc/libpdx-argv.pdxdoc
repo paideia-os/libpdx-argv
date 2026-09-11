@@ -268,6 +268,30 @@ whole-buffer header failure.
                                      written to fd 1). Opt out via
                                      VersionBackend::set_override(1) to
                                      render your own --version text.
+  ERR_INT_RANGE (14)                INT-flag value fell outside the
+                                     registered inclusive-unsigned
+                                     [min, max] interval
+                                     (libpdx-argv.ENH-018, #28). Set by
+                                     Typed::parse_int_u64_ranged only —
+                                     Parser::parse_argv never writes
+                                     this code; it fires at the
+                                     dispatch-site decoder call.
+                                     Sentinel (min = 0 AND max = 0)
+                                     means "range OFF" and never trips
+                                     it; the plain
+                                     flag_spec_register(name,
+                                     FKIND_INT, id) path writes
+                                     exactly this, so every existing
+                                     INT registration is transparent
+                                     to the gate. A tool wanting an
+                                     interval registers via
+                                     FlagSpec::register_int(name, id,
+                                     min, max) and calls
+                                     Typed::parse_int_u64_ranged
+                                     (with its own bounds or
+                                     get_range_by_id-recovered ones)
+                                     at the dispatch site. Klog tag:
+                                     pdxargv.int-range.
 
 `ERR_UNKNOWN_ARG_FORM` (3) fires when an argv slot is neither
 flag-shaped (starts with `-` AND has at least one byte after) NOR a
@@ -299,6 +323,15 @@ exit-status split by "code group" as a contract this library defines.
 
 .section HISTORY
   1.0.0  2026-08-22   First signed release. Closes M1..M5.
+  Unreleased          libpdx-argv.ENH-018 (Closes #28) — INT flag
+                       range validation. Adds FlagSpec::register_int
+                       and get_range_by_id, Typed::parse_int_u64_ranged,
+                       and ParsedArgs::ERR_INT_RANGE (14). A tool
+                       registering `--jobs` with (1, 64) sees
+                       `--jobs 32` decode OK, `--jobs 0` / `--jobs 65`
+                       / `--jobs UINT64_MAX` all rejected with
+                       ERR_INT_RANGE. Plain register keeps the
+                       range OFF (0, 0 sentinel).
 
 .section AUTHORS
   paideia-os-team.  Repo: github.com/paideia-os/libpdx-argv.

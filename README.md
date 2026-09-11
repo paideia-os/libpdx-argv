@@ -48,7 +48,11 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 `ERR_SCHEMA_BAD_OFFSET` 10, `ERR_SCHEMA_UNTERMINATED` 11,
 `ERR_UNKNOWN_FLAG` 12 (opt-in strict mode only — see `FlagSpec::set_strict`),
 `ERR_VERSION_EMITTED` 13 (library-owned `--version` auto-emit fired —
-success signal, not an error; see `VersionBackend` below).
+success signal, not an error; see `VersionBackend` below),
+`ERR_INT_RANGE` 14 (INT-flag value fell outside the registered
+`[min, max]` interval; set by `Typed::parse_int_u64_ranged` — see
+`register_int` in `FlagSpec` and `parse_int_u64_ranged` in `Typed`
+below; `libpdx-argv.ENH-018`).
 
 | Function | Purpose |
 | --- | --- |
@@ -68,6 +72,8 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `flag_spec_reset() -> () !{mem} @{}` | Clear the registration table (zeroes `spec_count`). **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** |
 | `flag_spec_register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. The flag may take its value inline (`=`/`:`) or via lookahead (`argv[i+1]`). **(Renamed from `register` in `libpdx-argv.ENH-030`, v1.1.0.)** |
 | `register_sep(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-010`)** Same as `flag_spec_register`, but the flag's value MUST arrive inline — the parser never accepts a lookahead value for it, even if `argv[i+1]` looks like a plausible one. Use for a flag whose I3 spelling mandates a separator (`--color=`, `--no-cap:`). |
+| `register_int(name_ptr: u64, id: u64, min: u64, max: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Register an INT-kinded flag (kind fixed to `FKIND_INT`) with an inclusive unsigned `[min, max]` interval published into new `spec_min` / `spec_max` slots. `Typed::parse_int_u64_ranged` reads the pair (either forwarded by the consumer or recovered via `get_range_by_id`) and rejects a decoded value outside the interval with `ERR_INT_RANGE`. Sentinel: `(min = 0, max = 0)` means "range OFF" — the plain `flag_spec_register` path writes exactly this, so every existing INT registration is transparent to the gate. |
+| `get_range_by_id(id: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Multi-return `(min in rax, max in rdx)` — companion accessor for the range slots `register_int` publishes. Returns `(0, 0)` both for an unregistered id AND for a flag registered without a range — indistinguishable at this API, by design; callers that need to tell them apart call `lookup()` first. |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
 | `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `parse_argv` and `parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `flag_spec_reset()` restores 0. |
 
@@ -104,6 +110,7 @@ produces.
 | Function | Purpose |
 | --- | --- |
 | `parse_int_u64(str_ptr: u64) -> u64 !{mem} @{}` | `[0-9]+` terminated by NUL. At least one digit required; no sign, whitespace or suffix. |
+| `parse_int_u64_ranged(str_ptr: u64, min: u64, max: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** As `parse_int_u64`, plus a closed inclusive-unsigned `[min, max]` gate. Sentinel: `(min = 0, max = 0)` skips the gate entirely (behaves identically to `parse_int_u64`). On a range violation writes `ParsedArgs::error_code = ERR_INT_RANGE` (14) and returns `(0, 0)`; on a decode failure returns `(0, 0)` with `error_code` untouched. Uses unsigned compares end to end so the full u64 range works — `parse_int_u64_ranged("18446744073709551615", 1, 64)` is rejected here (upper cap) rather than by the decoder's overflow gate. |
 | `parse_size(str_ptr: u64) -> u64 !{mem} @{}` | `[0-9]+` plus optional `k`/`K`, `m`/`M`, `g`/`G` → `<<10`, `<<20`, `<<30`. Result in bytes; binary units only. |
 | `parse_timespan(str_ptr: u64) -> u64 !{mem} @{}` | `[0-9]+` plus optional `s`/`m`/`h`/`d` → ×1, ×60, ×3600, ×86400. Result in seconds; no suffix means seconds. |
 

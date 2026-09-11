@@ -126,6 +126,12 @@ module SmokeDriver = structure {
         call ParseTypedValuesTests::run_case22;
         call ParseTypedValuesTests::run_case23;
         call ParseTypedValuesTests::run_case24;
+        // libpdx-argv.ENH-018 (Closes #28): INT flag range validation.
+        call ParseTypedValuesTests::run_case25;
+        call ParseTypedValuesTests::run_case26;
+        call ParseTypedValuesTests::run_case27;
+        call ParseTypedValuesTests::run_case28;
+        call ParseTypedValuesTests::run_case29;
 
         // --- ParseTypedArgsTests (module id 3) ----------------------
         call ParseTypedArgsTests::run_case1;

@@ -981,3 +981,120 @@ tool version detection (post-R51), the legacy line can retire.
   `DOC_TOOL_NAME_UPPER` literal saves the tool-per-invocation
   conversion cost; if `DOC_TOOL_NAME` ever varies, add the
   conversion here rather than in every downstream tool.
+
+## 13. INT flag range validation (ENH-018, Closes #28)
+
+Pre-ENH-018 the INT decoder path was value-agnostic: `Typed::parse_int_u64`
+accepts any decimal string that fits in `u64` (post-ENH-009 the decoder
+rejects `u64::MAX + 1` cleanly instead of wrapping, but that gate is the
+only value-shaped one it applies). Every INT-flag consumer that needed
+"the number must be between 1 and 64" re-implemented the same clamp
+after the decode, five to ten lines of near-identical boilerplate per
+call site with no shared error code. ENH-018 lifts the interval check
+into the library.
+
+### 13.1 Module surface delta
+
+`FlagSpec` grows two `[u64; 32]` .bss arrays (`spec_min`, `spec_max`)
+and two exported functions:
+
+- `register_int(name_ptr, id, min, max)` — appends `(name, FKIND_INT,
+  id)` with `(min, max)` published into the new slots. Kind is
+  fixed to `FKIND_INT` (2) rather than taken from the caller:
+  `register_int` is the INT-specific superset of `flag_spec_register`,
+  and a caller registering something non-INT should call the plain
+  path (which now also clears the range slots to `(0, 0)` so a slot
+  recycled after a `register_int` never inherits stale bounds).
+- `get_range_by_id(id) -> (min in rax, max in rdx)` — linear scan of
+  `spec_ids`, returning `(spec_min[i], spec_max[i])` for the first
+  matching slot, or `(0, 0)` if no slot matches. Deliberately does
+  NOT skip `id==0` slots (unlike `ParsedArgs::find_flag_by_id`'s
+  ENH-024 skip): here the caller-supplied `id` would only be 0 if
+  they registered a flag with `id=0`, which is a caller-side
+  contract violation (0 is reserved for "unregistered" in the
+  `FlagSpec` id-space) and matching such a slot is either a
+  diagnostic accident the caller wants to see or a no-op tolerable
+  at `get_range_by_id`'s return contract.
+
+`Typed` grows one exported function:
+
+- `parse_int_u64_ranged(str_ptr, min, max) -> (ok in rax, val in rdx)`
+  — delegates decoding verbatim to `parse_int_u64`, then applies the
+  gate. NON-leaf; the module's compliance preamble carries an
+  explicit "EXCEPTION" line naming this function because every other
+  `Typed::*` is leaf.
+
+`ParsedArgs` grows one error-code constant:
+
+- `ERR_INT_RANGE : u64 = 14` — set by `parse_int_u64_ranged` on a
+  range violation.
+
+### 13.2 Sentinel contract: (0, 0) means "range OFF"
+
+The `(min = 0, max = 0)` pair is treated as "range OFF" and bypasses
+the gate entirely, so `parse_int_u64_ranged("x", 0, 0)` behaves
+identically to `parse_int_u64("x")` — the same `(ok, val)` return, the
+same `ParsedArgs::error_code` non-touch. This is deliberate: the plain
+`flag_spec_register(name, FKIND_INT, id)` path writes `(0, 0)` into
+`spec_min` / `spec_max`, so a flag registered via the plain path is
+transparent to the gate. A consumer that wants an interval legitimately
+starting at 0 (e.g. `[0, 100]`) sets `max = 100` with `min = 0`, which
+lifts the pair out of the sentinel because the sentinel requires BOTH
+slots to be 0.
+
+The alternative sentinel `max == 0` alone was rejected: it does not
+compose — a caller who legitimately writes `register_int(..., 5, 10)`
+and later reduces the upper cap to 0 by hand cannot then re-arm the
+gate without also touching `spec_min`. The (0, 0) pair is the only
+sentinel that survives every arithmetic manipulation.
+
+### 13.3 Gate discipline: unsigned end to end
+
+The gate uses `jb` (val < min) and `ja` (val > max) — unsigned compares
+end to end. This is the difference between accepting and rejecting
+`parse_int_u64_ranged("18446744073709551615", 1, 64)`: `u64::MAX` in
+two's-complement signed reads as -1, so a signed `jg` would erroneously
+report `-1 < 64` and pass the value through. The unsigned `ja` sees
+`u64::MAX > 64` and rejects. Case 28 in `parse_typed_values_tests.pdx`
+is the regression fixture that locks this in — pairing it with case 18
+(which proves the decoder accepts `u64::MAX` at ok=1) proves the
+rejection comes from the range gate, not from an intermediate overflow.
+
+### 13.4 Error-code discipline
+
+`parse_int_u64_ranged` writes `ParsedArgs::error_code = ERR_INT_RANGE`
+ONLY on a range violation. A decode failure (the underlying
+`parse_int_u64` returning `ok=0`) leaves `error_code` untouched — the
+pre-ENH-018 `Typed` convention that a decode failure does not set an
+error_code is preserved so a consumer that only inspects the `ok`
+return behaves the same whether it called `parse_int_u64` or
+`parse_int_u64_ranged`. `error_arg_index` is deliberately NOT touched
+by the range gate either: the consumer knows which flag it was
+decoding (typically via a `k = find_flag_by_id()` index, which is a
+flag index into ParsedArgs, not an argv index) and setting an argv
+index here would misalign with the `parse_argv` contract that only the
+argv classifier writes that slot.
+
+Klog tag for the range trip: `pdxargv.int-range`.
+
+### 13.5 What ENH-018 explicitly does not do
+
+- No `register_int_sep` variant. A tool that wants a bounded INT
+  flag whose spelling ALSO mandates a separator (`--foo=42` only,
+  never `--foo 42`) has to compose that via `register_sep()`
+  followed by a manual post-hoc `spec_min` / `spec_max` write.
+  Promoting the compose into a first-class variant is a follow-on
+  ENH; no consumer needs it today.
+- No range check inside the parser proper. `Parser::parse_argv`
+  still classifies-and-stores; the range check runs at the
+  dispatch-site `Typed::parse_int_u64_ranged` call. Reason: the
+  parser has no natural place to invoke the decoder (some INT
+  flags are optional, and the decoder is a mem-effect leaf whose
+  own overflow gate the parser has never been in the business of
+  triggering), and pushing the check into the parser would double
+  the number of state-machine transitions per parsed INT flag.
+- `get_range_by_id` does not distinguish "registered with no
+  range" from "not registered at all" — both return `(0, 0)`, by
+  design. Callers that need to tell them apart call `lookup()`
+  first (a `FKIND_UNKNOWN` return means "not registered", any
+  other return means "registered").

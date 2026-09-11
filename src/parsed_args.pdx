@@ -69,6 +69,24 @@ module ParsedArgs = structure {
   // to distinguish it from a real parse error compare `err ==
   // ERR_VERSION_EMITTED` against the others.
   pub let ERR_VERSION_EMITTED           : u64 = 13
+  // Added by libpdx-argv.ENH-018 (Closes #28): INT flag range violation.
+  // Set by Typed::parse_int_u64_ranged when the caller passes a
+  // (min, max) pair with at least one nonzero side (the (0, 0) pair
+  // is the "range OFF" sentinel and never trips this code) and the
+  // decoded value falls outside the closed unsigned interval
+  // [min, max]. On the trip, parse_int_u64_ranged writes this code to
+  // ParsedArgs::error_code and returns (ok = 0, val = 0) so a
+  // consumer's existing `if (ok == 0)` branch fires; the error_code
+  // slot then distinguishes an out-of-range value from a decode
+  // failure (which does not touch error_code, matching Typed's
+  // pre-ENH-018 contract).
+  //
+  // The gate uses unsigned compares end-to-end (JB / JA), so the full
+  // u64 range works — including `--jobs 18446744073709551615` against
+  // (min = 1, max = 64), which is rejected here (upper cap) rather
+  // than by the decoder's own overflow gate. New klog tag:
+  // `pdxargv.int-range`.
+  pub let ERR_INT_RANGE                 : u64 = 14
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

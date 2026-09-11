@@ -129,6 +129,11 @@ Per the M4 line in `design/tooling/r49-r50-plan.md` §5.12:
 | 22 | `parse_size("17179869183g")` | (1, (2^34-1)<<30) — ENH-009 shift boundary |
 | 23 | `parse_timespan("213503982334602d")` | (0, —) — ENH-009 multiplier overflow |
 | 24 | `parse_timespan("213503982334601d")` | (1, 18446744073709526400) — ENH-009 multiplier boundary |
+| 25 | `parse_int_u64_ranged("32", 1, 64)` | (1, 32) — `libpdx-argv.ENH-018` in-range; error_code stays 0 |
+| 26 | `parse_int_u64_ranged("0", 1, 64)` | (0, —) — ENH-018 below-min; error_code = ERR_INT_RANGE (14) |
+| 27 | `parse_int_u64_ranged("65", 1, 64)` | (0, —) — ENH-018 above-max; error_code = ERR_INT_RANGE |
+| 28 | `parse_int_u64_ranged("18446744073709551615", 1, 64)` | (0, —) — ENH-018 upper cap, not wrap; ERR_INT_RANGE |
+| 29 | `parse_int_u64_ranged("0", 0, 0)` | (1, 0) — ENH-018 sentinel: (min=0, max=0) → range OFF |
 
 ### Typed arg consumption + diagnostics (parse_typed_args.pdx)
 

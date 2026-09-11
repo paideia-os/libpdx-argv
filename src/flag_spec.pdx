@@ -71,6 +71,29 @@ module FlagSpec = structure {
   // `--no-cap:<name>`) never had a lookahead form to begin with.
   pub let mut spec_sep_required : [u64; 32] = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-018 (Closes #28): per-registration
+  // INT-flag range gate. Set only by register_int(); every other
+  // registration path (flag_spec_register, register_sep) explicitly
+  // writes (0, 0) into these slots so a slot index reused after a
+  // reset never inherits a stale range from an earlier register_int
+  // batch.
+  //
+  // Interpretation is (min, max) as an INCLUSIVE unsigned interval.
+  // The (0, 0) pair is the "range OFF" sentinel: Typed::parse_int_u64_ranged
+  // treats a (0, 0) pair as "no gate configured" and skips the range
+  // check entirely (behaves identically to Typed::parse_int_u64 on
+  // that value). A caller wanting an interval that legitimately
+  // starts at 0 (e.g. [0, 100]) sets max = 100 with min = 0 — max=100
+  // alone lifts the pair out of the sentinel because the sentinel
+  // requires BOTH slots to be 0. The interval is closed on both
+  // sides (min and max are themselves in-range values).
+  //
+  // Only meaningful for slots whose spec_kinds[i] is FKIND_INT; for
+  // any other kind the slots are still zeroed on registration
+  // (matching the sep_required convention) but no path reads them.
+  pub let mut spec_min : [u64; 32] = uninit @align(8)
+  pub let mut spec_max : [u64; 32] = uninit @align(8)
+
   // Companion "out parameter" for lookup() (libpdx-argv.ENH-010):
   // lookup's own return convention is fixed at (kind in rax, id in
   // rdx) — the full width of SysV's multi-return rax:rdx pair — so a
@@ -168,7 +191,7 @@ module FlagSpec = structure {
   pub let flag_spec_register : (u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 + ENH-010 + ENH-030 flag_spec_register — appends (name, kind, id) at spec_count and increments, explicitly zeroing spec_sep_required[slot] so a slot index reused after a reset never inherits a stale separator-required flag from an earlier registration batch. Leaf; r11 for lea; rax as spec_count/scratch. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). ENH-030 renames the exported symbol from `register` to `flag_spec_register` (and its overflow label to flag_spec_register_full) to end the multi-module link collision — body byte-identical.",
+      justification: "libpdx-argv.M2-001 + ENH-010 + ENH-018 + ENH-030 flag_spec_register — appends (name, kind, id) at spec_count and increments, explicitly zeroing spec_sep_required[slot] AND (ENH-018) spec_min[slot] / spec_max[slot] so a slot index reused after a reset never inherits a stale separator-required flag OR a stale INT range from an earlier registration batch (register_int() is the only path that writes non-zero min/max, so writing zero here matches the (0,0) 'range OFF' sentinel Typed::parse_int_u64_ranged consults). Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal reused across all three defensive stores. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). ENH-030 renames the exported symbol from `register` to `flag_spec_register` (and its overflow label to flag_spec_register_full) to end the multi-module link collision — body byte-identical modulo the ENH-018 min/max stores.",
       block: {
         lea r11, [rip + spec_count];
         mov rax, [r11];
@@ -181,8 +204,12 @@ module FlagSpec = structure {
         mov [r11 + rax*8], rsi;
         lea r11, [rip + spec_ids];
         mov [r11 + rax*8], rdx;
-        lea r11, [rip + spec_sep_required];
         mov r8, 0;
+        lea r11, [rip + spec_sep_required];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_min];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_max];
         mov [r11 + rax*8], r8;
 
         add rax, 1;
@@ -210,7 +237,7 @@ module FlagSpec = structure {
   pub let register_sep : (u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.ENH-010 FlagSpec::register_sep — same as flag_spec_register() but writes spec_sep_required[slot] = 1 instead of 0, marking the registration separator-required. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the literal 1.",
+      justification: "libpdx-argv.ENH-010 + ENH-018 FlagSpec::register_sep — same as flag_spec_register() but writes spec_sep_required[slot] = 1 instead of 0, marking the registration separator-required. ENH-018 mirror: also zeroes spec_min[slot] / spec_max[slot] with the same defensive-store pattern flag_spec_register uses, so a slot recycled after a register_int() into a register_sep() never inherits stale range bounds. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the literal 1 for sep_required, then reloads 0 for the min/max clears.",
       block: {
         lea r11, [rip + spec_count];
         mov rax, [r11];
@@ -225,6 +252,11 @@ module FlagSpec = structure {
         mov [r11 + rax*8], rdx;
         lea r11, [rip + spec_sep_required];
         mov r8, 1;
+        mov [r11 + rax*8], r8;
+        mov r8, 0;
+        lea r11, [rip + spec_min];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_max];
         mov [r11 + rax*8], r8;
 
         add rax, 1;
@@ -313,6 +345,154 @@ module FlagSpec = structure {
         lea r11, [rip + last_lookup_sep_required];
         xor r8, r8;
         mov [r11], r8;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // register_int(name_ptr, id, min, max) — libpdx-argv.ENH-018 (Closes #28)
+  // Signature: (u64, u64, u64, u64) -> () !{mem} @{}
+  //   rdi = name_ptr (NUL-terminated string)
+  //   rsi = id (caller-chosen; 0 reserved for "unregistered")
+  //   rdx = min (inclusive lower bound, unsigned; 0 = no lower cap)
+  //   rcx = max (inclusive upper bound, unsigned; 0 = no upper cap,
+  //         see sentinel rule)
+  //
+  // Registers `name_ptr` at kind=FKIND_INT (2) with the caller-chosen
+  // id AND publishes the pair (min, max) into spec_min[slot] /
+  // spec_max[slot]. Downstream, Typed::parse_int_u64_ranged reads the
+  // same pair (via the caller's own hand-off or via get_range_by_id)
+  // and gates the decoded value against the inclusive closed
+  // interval [min, max]; a value outside it sets
+  // ParsedArgs::error_code = ERR_INT_RANGE and returns (ok=0, val=0).
+  //
+  // Sentinel: BOTH min == 0 AND max == 0 mean "range OFF" — the plain
+  // flag_spec_register(name, FKIND_INT, id) path takes exactly this
+  // shape (that path also zeroes the slots), so a flag registered
+  // via the plain path never trips the gate even if the consumer
+  // hands its value through parse_int_u64_ranged. This makes
+  // register_int() a strict superset of the plain register for
+  // INT-kinded flags: existing INT registrations do not change
+  // behaviour, and a caller that later wants a bounded interval
+  // switches its own call site from plain → register_int() with no
+  // parser-side change.
+  //
+  // Sep-required posture: register_int() writes spec_sep_required[slot] = 0
+  // (lookahead allowed). A tool that wants a bounded INT flag whose
+  // spelling ALSO mandates a separator (--foo=42 only, never
+  // --foo 42) currently has to compose that via register_sep()
+  // followed by a manual post-hoc spec_min/spec_max write; a
+  // register_int_sep() variant is a follow-on ENH.
+  //
+  // Silently no-ops past SPEC_MAX (same policy as flag_spec_register,
+  // for the same single-return-shape reason).
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = spec_count / scratch
+  //   r8  = zero literal for spec_sep_required's slot
+  //   r11 = lea scratch for cross-module .bss bases
+  // ============================================================
+  pub let register_int : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (name_ptr: u64) (id: u64) (min: u64) (max: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-018 FlagSpec::register_int (Closes #28) — appends (name, FKIND_INT, id) at spec_count with the caller's (min, max) pair published into spec_min[slot] / spec_max[slot]. The kind is fixed to FKIND_INT (2) rather than taken from the caller: register_int is the INT-specific superset of flag_spec_register, and a caller registering something non-INT should call the plain path (which now also clears the range slots to (0, 0) so a slot recycled after this call never inherits a stale range). spec_sep_required[slot] is zeroed here (lookahead allowed) to match flag_spec_register's default arity posture — a bounded INT flag with a mandatory separator is a compose-your-own until a register_int_sep() variant lands. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal for the sep_required slot. Silently drops past SPEC_MAX (single-return API, mirrors flag_spec_register). MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). The caller-visible sentinel is (min == 0 AND max == 0) → 'range OFF'; a caller that legitimately wants an interval starting at 0 (e.g. [0, 100]) sets max=100 with min=0, which lifts the pair out of the sentinel because the sentinel requires BOTH slots to be 0. Unsigned semantics end-to-end: no jl/jg (signed) branches read these slots downstream — parse_int_u64_ranged uses jb/ja. New klog tag: pdxargv.int-range.",
+      block: {
+        lea r11, [rip + spec_count];
+        mov rax, [r11];
+        cmp rax, 32;                       // SPEC_MAX
+        jge register_int_full;
+
+        lea r11, [rip + spec_names];
+        mov [r11 + rax*8], rdi;
+        lea r11, [rip + spec_kinds];
+        mov r8, 2;                         // FKIND_INT
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_ids];
+        mov [r11 + rax*8], rsi;
+        lea r11, [rip + spec_sep_required];
+        mov r8, 0;
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_min];
+        mov [r11 + rax*8], rdx;
+        lea r11, [rip + spec_max];
+        mov [r11 + rax*8], rcx;
+
+        add rax, 1;
+        lea r11, [rip + spec_count];
+        mov [r11], rax;
+
+      register_int_full:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // get_range_by_id(id) -> (min in rax, max in rdx)
+  //                                — libpdx-argv.ENH-018 (Closes #28)
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   rdi (in)  = target id (caller-chosen; matches the id argument
+  //               the caller passed to register_int / flag_spec_register)
+  //   rax (out) = spec_min[i] for the first slot with spec_ids[i] == id,
+  //               else 0
+  //   rdx (out) = spec_max[i] for the same slot, else 0
+  //
+  // Companion lookup for the range slots register_int published.
+  // Purpose: a consumer that stored a flag's id (StdVocab / tool-
+  // specific) can round-trip back to the (min, max) it originally
+  // registered without having to remember the bounds locally, e.g.
+  // when the dispatch code that calls parse_int_u64_ranged is
+  // physically separated from the registration bootstrap.
+  //
+  // Sentinel behaviour: a flag registered via plain flag_spec_register
+  // (which writes 0 into both slots) or an id that was never
+  // registered both return (0, 0) — indistinguishable at this API,
+  // by design. Callers that need to distinguish "registered with no
+  // range" from "not registered at all" call lookup() first.
+  //
+  // Leaf. Iterates spec_count entries; O(SPEC_MAX) worst case (same
+  // shape as lookup(), scanning spec_ids instead of spec_names so no
+  // per-probe strcmp).
+  //
+  // Register plan (all caller-save; leaf):
+  //   rcx = loop index i
+  //   r10 = spec_count upper bound (hoisted once)
+  //   r8  = spec_ids base (hoisted once)
+  //   r9  = spec_ids[i]
+  //   rax = return (min)
+  //   rdx = return (max)
+  //   r11 = lea scratch (for the match-path spec_min/spec_max loads)
+  // ============================================================
+  pub let get_range_by_id : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-018 FlagSpec::get_range_by_id (Closes #28) — linear scan of spec_ids returning (spec_min[i], spec_max[i]) for the first matching slot, or (0, 0) if no slot matches. Multi-return via SysV's rax:rdx pair, same convention lookup() uses. Deliberately does NOT skip id==0 slots (unlike ParsedArgs::find_flag_by_id's ENH-024 skip): here the caller-supplied id would only be 0 if they registered a flag with id=0, which is a caller-side contract violation (0 is reserved for 'unregistered' in the FlagSpec id-space per StdVocab: standard vocabulary is 1..9, tool-specific ids start at 100), and matching such a slot is either a diagnostic accident the caller wants to see or a no-op tolerable at get_range_by_id's return contract (both slots are 0 either way). O(SPEC_MAX) worst case; every probe is a load+cmp with no nested call — cheap enough for a consumer to call inline before each parse_int_u64_ranged. Leaf; only caller-save regs used. r8 hoists spec_ids so the loop body issues one indexed load per probe.",
+      block: {
+        xor rcx, rcx;                     // rcx = i = 0
+        lea r11, [rip + spec_count];
+        mov r10, [r11];                   // r10 = spec_count
+        lea r8, [rip + spec_ids];         // r8  = &spec_ids[0]
+
+      grbi_loop_head:
+        cmp rcx, r10;
+        jge grbi_not_found;
+
+        mov r9, [r8 + rcx*8];             // r9 = spec_ids[i]
+        cmp r9, rdi;
+        je grbi_found;
+
+        add rcx, 1;
+        jmp grbi_loop_head;
+
+      grbi_found:
+        lea r11, [rip + spec_min];
+        mov rax, [r11 + rcx*8];
+        lea r11, [rip + spec_max];
+        mov rdx, [r11 + rcx*8];
+        ret;
+
+      grbi_not_found:
+        xor rax, rax;                     // min = 0
+        xor rdx, rdx;                     // max = 0
         ret;
       }
     }

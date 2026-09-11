@@ -6,6 +6,153 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-018 — INT flag range validation (min/max on ArgSpec) (Closes #28)
+
+`FlagSpec` gains two new per-slot arrays, `spec_min` and `spec_max`
+(both `[u64; 32]`), and a new registration variant
+`register_int(name_ptr, id, min, max)` that appends an INT-kinded flag
+with the caller-chosen inclusive unsigned interval `[min, max]`
+published into those slots. `Typed` gains a new decoder wrapper
+`parse_int_u64_ranged(str_ptr, min, max)` that delegates decoding to
+the unchanged `parse_int_u64` and then applies the range gate using
+unsigned compares end to end (`jb` / `ja`). On a range violation the
+wrapper writes the new `ParsedArgs::ERR_INT_RANGE` (= 14) into
+`error_code` and returns `(ok = 0, val = 0)`; on a decode failure it
+returns `(0, 0)` with `error_code` untouched (the pre-ENH-018 Typed
+convention that a decode failure does not set an error_code is
+preserved so a consumer that only inspects the `ok` return behaves
+the same whether it called `parse_int_u64` or the ranged variant).
+
+Sentinel semantics (the "no range check runs" half of the
+fingerprint): a `(min = 0, max = 0)` pair is treated as "range OFF"
+and skips the gate entirely — the ranged decoder then behaves
+identically to `parse_int_u64`. `flag_spec_register` (the plain
+registration path) and `register_sep` both write `(0, 0)` into the
+new slots defensively, so every existing INT registration is
+transparent to the gate and a slot recycled across registration
+batches never inherits stale bounds.
+
+A companion accessor `FlagSpec::get_range_by_id(id) -> (min in rax,
+max in rdx)` provides a round-trip: consumers that stored a flag's
+id (StdVocab or tool-specific) can recover the `(min, max)` pair
+they originally registered without having to remember the bounds
+locally, e.g. when the dispatch code that calls `parse_int_u64_ranged`
+is physically separated from the registration bootstrap. It returns
+`(0, 0)` both for an unregistered id AND for a flag registered
+without a range — indistinguishable at this API, by design; callers
+that need to tell them apart call `lookup()` first.
+
+Fingerprint (issue #28): with `register_int("--jobs", ID_JOBS, 1,
+64)`, `parse_int_u64_ranged("32", 1, 64)` returns `(1, 32)` with
+`error_code = ERR_OK`; `"0"` returns `(0, 0)` with `error_code =
+ERR_INT_RANGE`; `"65"` returns `(0, 0)` with `error_code =
+ERR_INT_RANGE`; `"18446744073709551615"` (u64::MAX exactly, which
+`parse_int_u64` accepts per ENH-009 case18) returns `(0, 0)` with
+`error_code = ERR_INT_RANGE` — the upper-cap trip is against the
+decoded value, not against a wrap. With the plain
+`flag_spec_register("--jobs", FKIND_INT, ID_JOBS)`,
+`parse_int_u64_ranged` called with `(min = 0, max = 0)` returns
+`(1, 0)` for `"0"` — the sentinel bypass. New klog tag:
+`pdxargv.int-range`.
+
+Files touched:
+
+  - src/parsed_args.pdx
+      +`ERR_INT_RANGE = 14` constant, with the docstring naming the
+       sentinel semantics and the unsigned-compare-end-to-end
+       requirement.
+
+  - src/flag_spec.pdx
+      +`spec_min : [u64; 32]` / `spec_max : [u64; 32]` .bss arrays,
+       with the "(0, 0) = range OFF" sentinel documented on the
+       slot declarations.
+      +`register_int(name_ptr, id, min, max)` — kind is fixed to
+       `FKIND_INT` (2); publishes `(min, max)` into the new slots
+       and zeroes `spec_sep_required[slot]` for parity with the
+       plain registration's default arity.
+      +`get_range_by_id(id) -> (min in rax, max in rdx)` — companion
+       lookup helper for round-trip retrieval of the registered
+       bounds.
+      *`flag_spec_register` and `register_sep` updated to
+       defensively zero `spec_min[slot]` / `spec_max[slot]` in
+       addition to `spec_sep_required[slot]`, so a slot recycled
+       across a `register_int()` → plain-register or → sep-register
+       call never inherits stale bounds.
+
+  - src/typed.pdx
+      +`parse_int_u64_ranged(str_ptr, min, max) -> (ok, val)` —
+       non-leaf wrapper around `parse_int_u64` with a 3-push
+       prologue that aligns rsp%16 for the nested call and
+       preserves `(min, max)` across it (rbp/r12) plus a `rbx` spill
+       for `val`. Sentinel-first, then closed-interval gate; on
+       range violation publishes `ERR_INT_RANGE` and returns
+       `(0, 0)`.
+      *Module compliance preamble carries a new "EXCEPTION" line
+       naming `parse_int_u64_ranged` as the sole non-leaf in the
+       module.
+
+  - tests/parse_typed_values_tests.pdx
+      +cases 25-29 (module id 2):
+         25: `parse_int_u64_ranged("32", 1, 64)` → `(1, 32)`;
+             `error_code` STILL 0 (contract: success does not touch
+             it).
+         26: `parse_int_u64_ranged("0", 1, 64)` → `(0, —)`;
+             `error_code = 14`. Below-min branch (`jb`).
+         27: `parse_int_u64_ranged("65", 1, 64)` → `(0, —)`;
+             `error_code = 14`. Above-max branch (`ja`).
+         28: `parse_int_u64_ranged("18446744073709551615", 1, 64)`
+             → `(0, —)`; `error_code = 14`. Upper-cap-not-wrap
+             witness: the decoded u64::MAX (case18 proves it
+             decodes) is rejected by the range gate, not by
+             overflow. Also proves the gate is unsigned end to
+             end — a signed `jg` would erroneously ACCEPT this.
+         29: `parse_int_u64_ranged("0", 0, 0)` → `(1, 0)`;
+             `error_code` STILL 0. Sentinel witness: the plain
+             `flag_spec_register` path writes `(0, 0)` into the
+             new slots, so a consumer forwarding those bounds
+             sees the gate bypass.
+      +`f_int_32` / `f_int_65` fixtures; reuses existing
+       `f_int_zero` and `f_int_u64_max` for the low-end and
+       upper-cap-not-wrap cases so no per-case literal duplication.
+
+  - tests/smoke_driver.pdx
+      +five `call ParseTypedValuesTests::run_case25..29` entries
+       under a comment naming ENH-018.
+
+  - design/architecture.md
+      +§13 "INT flag range validation (ENH-018, Closes #28)"
+       documenting the new FlagSpec slots, the register_int
+       signature and its (0, 0) sentinel, the parse_int_u64_ranged
+       wrapper's error_code discipline, the unsigned-compare-end-
+       to-end contract, and the two explicit non-goals (no
+       register_int_sep variant yet; get_range_by_id does not
+       distinguish "no range" from "unregistered").
+
+  - README.md
+      +`register_int` row in the flag_spec.pdx table.
+      +`parse_int_u64_ranged` row in the typed.pdx table with an
+       inline note on the sentinel.
+      +`ERR_INT_RANGE` (14) in the error-code constants list
+       naming ENH-018 / Closes #28.
+
+  - doc/libpdx-argv.pdxdoc
+      +`ERR_INT_RANGE` (14) entry in the DIAGNOSTICS section,
+       naming ENH-018 / #28 and the pdxargv.int-range klog tag.
+      +STANDARD FLAGS section preamble note that a tool-specific
+       INT flag can be registered with an inclusive `[min, max]`
+       via the new `register_int(name, id, min, max)` variant.
+
+Downstream migration: no existing consumer breaks. `parse_int_u64`
+is unchanged. `flag_spec_register` and `register_sep` grow two
+defensive writes into the new slots; existing callers see no
+behaviour change. A consumer that wants a bounded INT flag
+switches its own call site from `flag_spec_register(name,
+FKIND_INT, id)` to `register_int(name, id, min, max)` on the same
+commit that bumps its libpdx-argv pin, and calls
+`parse_int_u64_ranged` (with either its own remembered bounds or
+`get_range_by_id`-recovered ones) in place of `parse_int_u64` at
+the dispatch site.
+
 ### ENH-032 — Library-owned `--version` auto-emitter (Closes #25)
 
 `StdVocab::register_all` reserves `--version` (id `STD_ID_VERSION` =

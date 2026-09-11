@@ -56,6 +56,16 @@ module ParseTypedValuesTests = structure {
   pub let f_ts_d_over        : [u8; 17] = "213503982334602d\0" // floor(u64::MAX/86400) + 1
   pub let f_ts_d_boundary    : [u8; 17] = "213503982334601d\0" // floor(u64::MAX/86400) exactly
 
+  // -- libpdx-argv.ENH-018 INT range-validation fixtures --
+  // The (min=1, max=64) range in the issue's fingerprint is exercised
+  // by cases 25-28; f_int_32/f_int_65 pair boundary-in with
+  // boundary-out (32 is inside; 65 is one past the upper cap).
+  // f_int_zero/f_int_u64_max above are reused for the low-end and
+  // upper-cap-not-wrap cases so no per-case duplication of the same
+  // literal is introduced.
+  pub let f_int_32 : [u8; 3] = "32\0"
+  pub let f_int_65 : [u8; 3] = "65\0"
+
   // ============================================================
   // case 1  parse_int_u64("0") → (1, 0)
   // ============================================================
@@ -655,6 +665,190 @@ module ParseTypedValuesTests = structure {
         pop r15;
         pop rbx;
         ret;
+      }
+    }
+
+  // ============================================================
+  // case 25  parse_int_u64_ranged("32", 1, 64) → (1, 32)
+  //   libpdx-argv.ENH-018 (Closes #28): the in-range success case of
+  //   the issue's fingerprint. Also verifies ParsedArgs::error_code
+  //   is NOT touched on a successful range check (contract: only a
+  //   range violation writes error_code).
+  // ============================================================
+  pub let run_case25 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-018 case25 — parse_int_u64_ranged('32', 1, 64) is the primary happy-path of the ENH-018 fingerprint: value 32 is inside [1, 64] so ok=1 with val=32 (r14 spill because record_pass clobbers rdx). Preceded by full_reset so ParsedArgs::error_code is 0 on entry; asserts error_code is STILL 0 after the call to lock in the 'range check writes error_code ONLY on failure' half of the contract.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea rdi, [rip + f_int_32];
+        mov rsi, 1;
+        mov rdx, 64;
+        call parse_int_u64_ranged;
+        mov r14, rdx;
+        cmp rax, 1; jne case25_fail;
+        cmp r14, 32; jne case25_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case25_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case25_fail:
+        mov rdi, 0x200000019;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 26  parse_int_u64_ranged("0", 1, 64) → (0, —);
+  //          error_code = ERR_INT_RANGE (14)
+  //   libpdx-argv.ENH-018 (Closes #28): the below-min half of the
+  //   fingerprint. Value 0 < min=1 so the gate rejects and publishes
+  //   ERR_INT_RANGE into ParsedArgs::error_code.
+  // ============================================================
+  pub let run_case26 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-018 case26 — parse_int_u64_ranged('0', 1, 64) triggers the below-min branch (jb piur_range_fail): value 0 is a valid decode but 0 < 1 so the outer contract returns ok=0 and publishes ERR_INT_RANGE (14) into ParsedArgs::error_code. Preceded by full_reset so error_code is 0 on entry — the post-call assertion of 14 is meaningful only against a known-zero baseline.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea rdi, [rip + f_int_zero];
+        mov rsi, 1;
+        mov rdx, 64;
+        call parse_int_u64_ranged;
+        cmp rax, 0; jne case26_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 14; jne case26_fail;     // ERR_INT_RANGE
+
+        call record_pass;
+        pop rbx; ret;
+      case26_fail:
+        mov rdi, 0x20000001A;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 27  parse_int_u64_ranged("65", 1, 64) → (0, —);
+  //          error_code = ERR_INT_RANGE (14)
+  //   libpdx-argv.ENH-018 (Closes #28): the above-max half of the
+  //   fingerprint. Value 65 > max=64 so the gate rejects.
+  // ============================================================
+  pub let run_case27 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-018 case27 — parse_int_u64_ranged('65', 1, 64) triggers the above-max branch (ja piur_range_fail): value 65 decodes cleanly but 65 > 64 so the outer contract returns ok=0 and publishes ERR_INT_RANGE (14). Pairs symmetrically with case26 so the fingerprint's below-min and above-max exit paths are both witnessed.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea rdi, [rip + f_int_65];
+        mov rsi, 1;
+        mov rdx, 64;
+        call parse_int_u64_ranged;
+        cmp rax, 0; jne case27_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 14; jne case27_fail;     // ERR_INT_RANGE
+
+        call record_pass;
+        pop rbx; ret;
+      case27_fail:
+        mov rdi, 0x20000001B;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 28  parse_int_u64_ranged(u64::MAX, 1, 64) → (0, —);
+  //          error_code = ERR_INT_RANGE (14)
+  //   libpdx-argv.ENH-018 (Closes #28): the "upper cap, not wrap"
+  //   half of the fingerprint. u64::MAX (18446744073709551615) is
+  //   itself a valid decode (case18 witnesses this) but its value
+  //   is far above the upper cap 64, so the range gate must reject
+  //   it — proving the gate operates on the DECODED value not on
+  //   an intermediate overflow flag. Uses unsigned compares end
+  //   to end so the full u64 range is comparable.
+  // ============================================================
+  pub let run_case28 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-018 case28 — parse_int_u64_ranged('18446744073709551615', 1, 64) exercises the 'upper cap, not wrap' fingerprint fixture. u64::MAX is a valid decode (case18 already witnesses it survives the ENH-009 accumulator gate at ok=1 with val=u64::MAX), so any post-decode rejection must come from the range gate. Because parse_int_u64_ranged uses ja (unsigned above) rather than jg (signed greater), a u64::MAX value compares correctly against the 64 upper cap even though its two's-complement signed interpretation is negative. Asserts ok=0 and error_code=14 after the call; no r14 spill needed because we never read val.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea rdi, [rip + f_int_u64_max];
+        mov rsi, 1;
+        mov rdx, 64;
+        call parse_int_u64_ranged;
+        cmp rax, 0; jne case28_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 14; jne case28_fail;     // ERR_INT_RANGE
+
+        call record_pass;
+        pop rbx; ret;
+      case28_fail:
+        mov rdi, 0x20000001C;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 29  parse_int_u64_ranged("0", 0, 0) → (1, 0)
+  //   libpdx-argv.ENH-018 (Closes #28): the (min=0, max=0) sentinel
+  //   → range OFF. Value 0 is accepted; ParsedArgs::error_code stays
+  //   0. This is the "plain register() → no range check runs"
+  //   half of the fingerprint: a plain flag_spec_register writes
+  //   (0, 0) into spec_min/spec_max, so a consumer forwarding those
+  //   slots into parse_int_u64_ranged sees the gate bypass.
+  // ============================================================
+  pub let run_case29 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.M4-001 + ENH-018 case29 — parse_int_u64_ranged('0', 0, 0) hits the (min == 0 AND max == 0) sentinel branch (skips both jne piur_gate_on tests and returns ok=1 with val=0). This is the compat witness: a flag registered via the plain flag_spec_register(name, FKIND_INT, id) path — which writes 0 to spec_min AND spec_max — behaves identically to raw parse_int_u64 when its value is forwarded through parse_int_u64_ranged. Also asserts error_code stays 0, since the sentinel path must not touch it (only a range violation does).",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        lea rdi, [rip + f_int_zero];
+        xor rsi, rsi;
+        xor rdx, rdx;
+        call parse_int_u64_ranged;
+        mov r14, rdx;
+        cmp rax, 1; jne case29_fail;
+        cmp r14, 0; jne case29_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case29_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case29_fail:
+        mov rdi, 0x20000001D;
+        call record_fail;
+        pop rbx; ret;
       }
     }
 }
