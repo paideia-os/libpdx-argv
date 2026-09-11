@@ -1,6 +1,7 @@
 // src/parser.pdx — libpdx-argv.M1-001 + M1-002 + M2-001 + M2-002 + M2-003
 //               + ENH-031 (argv[0]-skip wrapper)
 //               + ENH-032 (--version auto-emit dispatch, Closes #25)
+//               + ENH-014 (--help auto-table dispatch, Closes #24)
 // Parser: entry points parse_argv(argv, argc) → error_code
 //         and parse_argv_skipping_zero(argv, argc) → error_code
 //         (thin wrapper that drops argv[0] before forwarding).
@@ -78,6 +79,8 @@
 //                    flag_ids, flag_kinds, ddash_seen, ddash_arg_index
 //   FlagSpec::       lookup (called via qualified name)
 //   VersionBackend:: override_enabled, emit_default (ENH-032, Closes #25)
+//   HelpBackend::    doc_backend_unavailable, emit_from_argspec
+//                    (ENH-014, Closes #24)
 //
 // paideia-as compliance
 // ---------------------
@@ -332,6 +335,32 @@ module Parser = structure {
         jmp parse_argv_fail;
       parse_argv_long_not_version:
 
+        // -- ENH-014: --help auto-emit dispatch (Closes #24) ------------
+        // If the just-stored flag is StdVocab's --help (id 1) and
+        // the tool has signalled `doc` back-end unavailability via
+        // HelpBackend::set_doc_unavailable(1), call the library-owned
+        // emitter and return ERR_HELP_EMITTED via parse_argv_fail.
+        // The gate is opt-IN (default doc_backend_unavailable == 0
+        // preserves the M3-002 dispatch: --help is stored as an
+        // ordinary flag for the tool's own doc-forwarding code), so a
+        // tool that has doc statically linked sees zero behavior
+        // change on --help. r15 still holds the id from the store
+        // above; r10/r11/rax are caller-save and safe to clobber. The
+        // nested call to emit_from_argspec is aligned by parse_argv's
+        // own 6-push + sub rsp,8 prologue (rsp%16 = 0 at every nested
+        // call site); control never returns to parse_argv_advance_loop
+        // on the auto-emit path — the tool exits after this return.
+        cmp r15, 1;                         // STD_ID_HELP
+        jne parse_argv_long_not_help;
+        lea r11, [rip + doc_backend_unavailable];
+        mov r10, [r11];
+        cmp r10, 0;
+        je parse_argv_long_not_help;
+        call emit_from_argspec;
+        mov rax, 15;                        // ERR_HELP_EMITTED
+        jmp parse_argv_fail;
+      parse_argv_long_not_help:
+
         // -- Well-known --pdx-schema inline compare (M1 back-compat) --
         // If name (rbp) equals "pdx-schema\0" byte-for-byte, set
         // emit_schema=1. Any mismatch falls through to advance.
@@ -448,6 +477,26 @@ module Parser = structure {
         mov rax, 13;                        // ERR_VERSION_EMITTED
         jmp parse_argv_fail;
       parse_argv_short_not_version:
+
+        // -- ENH-014: --help auto-emit dispatch (Closes #24) ------------
+        // Mirror of the long-flag check above. StdVocab does not
+        // register a short alias for --help — a `-h` would collide
+        // with head/hexdump conventions — so this path only fires
+        // for a tool that has explicitly registered a single-letter
+        // short flag with id == STD_ID_HELP (1). Consumers wanting
+        // a `-?` or `-h` alias for the library-owned auto-table get
+        // it by calling flag_spec_register(&NAME_H, FKIND_BOOL, 1)
+        // after register_all.
+        cmp r15, 1;                         // STD_ID_HELP
+        jne parse_argv_short_not_help;
+        lea r11, [rip + doc_backend_unavailable];
+        mov r10, [r11];
+        cmp r10, 0;
+        je parse_argv_short_not_help;
+        call emit_from_argspec;
+        mov rax, 15;                        // ERR_HELP_EMITTED
+        jmp parse_argv_fail;
+      parse_argv_short_not_help:
 
         jmp parse_argv_advance_loop;
 

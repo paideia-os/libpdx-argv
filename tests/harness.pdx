@@ -134,11 +134,17 @@ module Harness = structure {
   // the opt-out into the next case. The 1-push alignment covers
   // any number of nested calls (each callee is responsible for its
   // own return-address+callee-save frame).
+  //
+  // libpdx-argv.ENH-014 (Closes #24) adds a fifth nested reset:
+  // HelpBackend::pdxargv_help_reset zeroes doc_backend_unavailable
+  // so a case that opted INTO the --help auto-emit fallback (via
+  // set_doc_unavailable(1)) never leaks the opt-in into the next
+  // case. Same 1-push alignment covers the added call.
   // ============================================================
   pub let full_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M4-001 + ENH-030 + ENH-032 TestHarness::full_reset — sequences parsed_args_reset + flag_spec_reset + schema_emit_reset + pdxargv_version_reset so the next fixture starts from known-clean state. Pre-ENH-030 this issued bare `call reset;` instructions, which only worked because each object had its own `reset` symbol — link-time collision was the whole point of ENH-030. Post-rename the calls are explicit and every reset is reachable by name from any object on the link line. ENH-032 adds pdxargv_version_reset to zero the --version auto-emit opt-out (VersionBackend::override_enabled) so a case that flips it does not leak the flip into the case after. Non-leaf; 1-push (rbx) aligns rsp%16 to 0 for the four nested calls. The tally counters are intentionally not touched — reset_tally is a separate call so tests can advance the tally across multiple full_reset boundaries.",
+      justification: "libpdx-argv.M4-001 + ENH-030 + ENH-032 + ENH-014 TestHarness::full_reset — sequences parsed_args_reset + flag_spec_reset + schema_emit_reset + pdxargv_version_reset + pdxargv_help_reset so the next fixture starts from known-clean state. Pre-ENH-030 this issued bare `call reset;` instructions, which only worked because each object had its own `reset` symbol — link-time collision was the whole point of ENH-030. Post-rename the calls are explicit and every reset is reachable by name from any object on the link line. ENH-032 adds pdxargv_version_reset to zero the --version auto-emit opt-out (VersionBackend::override_enabled) so a case that flips it does not leak the flip into the case after; ENH-014 adds pdxargv_help_reset with the symmetric role for --help's opt-in (HelpBackend::doc_backend_unavailable). Non-leaf; 1-push (rbx) aligns rsp%16 to 0 for the five nested calls. The tally counters are intentionally not touched — reset_tally is a separate call so tests can advance the tally across multiple full_reset boundaries.",
       block: {
         push rbx;
 
@@ -146,6 +152,7 @@ module Harness = structure {
         call flag_spec_reset;
         call schema_emit_reset;
         call pdxargv_version_reset;
+        call pdxargv_help_reset;
 
         pop rbx;
         ret;

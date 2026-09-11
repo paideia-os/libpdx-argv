@@ -138,4 +138,95 @@ module HelpBackendTests = structure {
         pop r15; pop rbx; ret;
       }
     }
+
+  // ============================================================
+  // case4  libpdx-argv.ENH-014 (Closes #24) — lazy --help auto-table
+  //   Fingerprint: parse_argv on ["--help"] with 3 registered flags
+  //   (each with help set) AND HelpBackend::set_doc_unavailable(1)
+  //   in effect returns ERR_HELP_EMITTED (15) in rax AND writes the
+  //   same code into ParsedArgs::error_code (the shared
+  //   parse_argv_fail return path).
+  //
+  //   TestHarness::full_reset (ENH-014) zeros doc_backend_unavailable
+  //   via pdxargv_help_reset before this case runs, so the opt-in
+  //   here is scoped to this case only.
+  //
+  //   Byte-level fingerprint (three tab-separated lines to fd 1) is
+  //   verified by a downstream paideia-os shell fixture; this case
+  //   owns the RETURN-CODE assertion only, matching how the ENH-032
+  //   --version auto-emit case owns its return-code assertion and
+  //   leaves the byte-diff to a shell greps `VERSION OK` fixture.
+  // ============================================================
+
+  // Three tool-specific flag names + help strings for the fingerprint.
+  // Ids 100..102 sit outside StdVocab's 1..9 reserved range per the
+  // std_vocab.pdx convention.
+  pub let hb4_name_input   : [u8; 6] = "input\0"
+  pub let hb4_help_input   : [u8; 22] = "path to input file  \0"
+  pub let hb4_name_output  : [u8; 7] = "output\0"
+  pub let hb4_help_output  : [u8; 22] = "path to output file \0"
+  pub let hb4_name_force   : [u8; 6] = "force\0"
+  pub let hb4_help_force   : [u8; 21] = "overwrite if exists \0"
+
+  // --help name pointer for the argv slot.
+  pub let hb4_a_help : [u8; 7] = "--help\0"
+  pub let mut hb4_argv : [u64; 1] = uninit @align(8)
+
+  pub let run_case4 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-014 (Closes #24) case4 — lazy --help auto-table fingerprint. StdVocab::register_all registers --help with id=1; three tool-specific register_with_help calls populate the spec_help slots for ids 100..102. HelpBackend::set_doc_unavailable(1) trips the parser's --help auto-emit gate. parse_argv on ['--help'] must return ERR_HELP_EMITTED (15) in rax AND write the same code into ParsedArgs::error_code (both done by parse_argv_fail, the shared error-return path). The three sys_writes-per-row × three rows (five sys_writes per row: literal `--`, name, TAB, help, LF) land on fd 1 during the smoke run; verifying the byte sequence is the downstream shell fixture's job (parity with the ENH-032 --version auto-emit case, which owns the return-code assertion and leaves the byte-diff to a shell fixture greps `VERSION OK`). Case 4 in module id 7 → last_fail_tag = 0x700000004 on failure. 1-push (rbx) prologue → rsp%16: 8 → 0 for the nested call chain (full_reset, register_all, register_with_help, set_doc_unavailable, parse_argv, record_pass / record_fail — every non-leaf on that list self-aligns internally, so the 1-push here is both necessary and sufficient). rbx is used to hold the argv-scratch pointer across the parse_argv call (callee-save so it survives that non-leaf).",
+      block: {
+        push rbx;                            // align rsp (rsp%16: 8 → 0)
+
+        call full_reset;
+        call register_all;
+
+        // Register three tool-specific flags WITH help text via the
+        // new register_with_help path (ENH-014). Ids 100..102 are
+        // outside StdVocab's reserved 1..9 range.
+        lea rdi, [rip + hb4_name_input];  mov rsi, 1;  mov rdx, 100;
+        lea rcx, [rip + hb4_help_input];
+        call register_with_help;
+
+        lea rdi, [rip + hb4_name_output]; mov rsi, 1;  mov rdx, 101;
+        lea rcx, [rip + hb4_help_output];
+        call register_with_help;
+
+        lea rdi, [rip + hb4_name_force];  mov rsi, 0;  mov rdx, 102;
+        lea rcx, [rip + hb4_help_force];
+        call register_with_help;
+
+        // Opt IN to the auto-emit fallback (default is opt-OUT so
+        // existing consumers see zero behavior change on --help).
+        mov rdi, 1;
+        call set_doc_unavailable;
+
+        // Prepare argv = ["--help"] (length 1). rbx holds the argv
+        // base across the parse_argv call.
+        lea rbx, [rip + hb4_argv];
+        lea r11, [rip + hb4_a_help];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + hb4_argv];
+        mov rsi, 1;
+        call parse_argv;
+
+        // parse_argv must return ERR_HELP_EMITTED (15).
+        cmp rax, 15; jne hb4_fail;
+
+        // ParsedArgs::error_code must also record 15.
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 15; jne hb4_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      hb4_fail:
+        mov rdi, 0x700000004;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
 }

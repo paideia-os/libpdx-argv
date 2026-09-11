@@ -107,7 +107,13 @@ libpdx-argv does not force one policy on every flag.
 for every tool that calls it. IDs 1..9 are RESERVED for these
 flags; a tool's own flags start at id 100.
 
-  id 1  --help           back-end forwards to `doc <tool>`
+  id 1  --help           back-end forwards to `doc <tool>` when
+                          `doc` is statically linked (M3-002 default);
+                          libpdx-argv.ENH-014 (#24) adds an in-process
+                          fallback tools opt into via
+                          `HelpBackend::set_doc_unavailable(1)` — see
+                          the --HELP BACK-END and DIAGNOSTICS sections
+                          below
   id 2  --version        library-owned auto-emitter (ENH-032, #25):
                           writes `<tool> <ver>\n<TOOL> VERSION OK\n`
                           to fd 1 and returns ERR_VERSION_EMITTED (13).
@@ -185,6 +191,30 @@ libpdx-argv itself does not spawn `doc`; the consumer's own
 loader-supplied cap chain decides whether the doc invocation is
 permitted.
 
+Auto-table fallback (`libpdx-argv.ENH-014`, #24). A tool built
+WITHOUT `doc` statically linked has nowhere to route the M3-002
+help pipe. At bootstrap the tool calls
+`HelpBackend::set_doc_unavailable(1)` and populates each of its
+registrations via `FlagSpec::register_with_help(name, kind, id,
+help_ptr)` instead of the plain `flag_spec_register`; every
+subsequent observation of `--help` (or a short flag registered
+with id `STD_ID_HELP`) then triggers
+`HelpBackend::emit_from_argspec` — a walk over the registration
+table that writes one `--<name><TAB><help>\n` line to fd 1 per
+registration whose help slot is non-null. Registrations whose
+help slot is null are silently suppressed, so a tool that
+populates ONLY some help slots gets ONLY those lines. The parser
+returns `ERR_HELP_EMITTED` (15) via the same shared
+`parse_argv_fail` epilogue every other `ERR_*` code takes; the
+tool exits 0 in response.
+
+The gate is opt-IN — default `doc_backend_unavailable == 0`
+preserves the dispatch above (parse_argv stores `--help` as an
+ordinary flag; the tool's own dispatch calls `fill_doc_argv` and
+hands the pair to whichever `doc_dispatch` symbol it linked), so
+every existing consumer sees zero behavior change on `--help`
+without touching its bootstrap.
+
 .section --SCHEMA
 `schema_emit_register(schema_name_ptr)` at init lets a tool
 publish which schemas it emits on stdout under normal operation.
@@ -207,7 +237,19 @@ libpdx-argv itself requires none (see `caps.decl`). It reads
 only the caller's own argv memory, and for the `--foo=bar` form
 mutates that memory in place to null-terminate on `=`. It runs
 synchronously inside the caller's process and, aside from the
-`--version` auto-emitter documented below, issues no syscalls.
+`--version` auto-emitter and the `--help` auto-table fallback
+documented below, issues no syscalls.
+
+`HelpBackend::emit_from_argspec` (`libpdx-argv.ENH-014`, #24)
+issues five `sys_write` syscalls on fd 1 per non-null row when
+the parser observes `--help` and the tool has opted into the
+fallback via `HelpBackend::set_doc_unavailable(1)`. The syscalls
+inherit the caller's fd-1 cap; libpdx-argv holds no cap of its
+own to gate them. Same silent-write policy as `emit_default`
+above — a consumer that lacks a KIND_TTY / KIND_IPC_ENDPOINT cap
+on fd 1 sees the syscalls fail with EBADF and the emitter
+returns anyway; the tool exits after `parse_argv` returns
+`ERR_HELP_EMITTED` (15) regardless.
 
 `VersionBackend::emit_default` (`libpdx-argv.ENH-032`, #25) issues
 seven raw `sys_write` syscalls on fd 1 when the parser observes
@@ -268,6 +310,20 @@ whole-buffer header failure.
                                      written to fd 1). Opt out via
                                      VersionBackend::set_override(1) to
                                      render your own --version text.
+  ERR_HELP_EMITTED (15)             library-owned --help auto-table
+                                     fallback fired (libpdx-argv.ENH-014,
+                                     #24). Not an error — a success
+                                     signal the tool responds to with
+                                     exit(0) (the table has already
+                                     been written to fd 1). Fires only
+                                     when the tool has opted into the
+                                     fallback via
+                                     HelpBackend::set_doc_unavailable(1);
+                                     the default preserves the M3-002
+                                     dispatch (parse_argv stores --help
+                                     as ordinary flag). Klog tag:
+                                     pdxargv.help-auto.
+
   ERR_INT_RANGE (14)                INT-flag value fell outside the
                                      registered inclusive-unsigned
                                      [min, max] interval
@@ -323,6 +379,18 @@ exit-status split by "code group" as a contract this library defines.
 
 .section HISTORY
   1.0.0  2026-08-22   First signed release. Closes M1..M5.
+  Unreleased          libpdx-argv.ENH-014 (Closes #24) — auto --help
+                       table fallback. Adds
+                       FlagSpec::register_with_help + spec_help slot,
+                       HelpBackend::set_doc_unavailable /
+                       emit_from_argspec / pdxargv_help_reset, and
+                       ParsedArgs::ERR_HELP_EMITTED (15). A tool built
+                       without `doc` opts in via set_doc_unavailable(1)
+                       and populates help slots via register_with_help;
+                       parse_argv on --help then walks FlagSpec and
+                       prints --<name><TAB><help>\n per non-null row.
+                       Default preserves M3-002 dispatch — existing
+                       consumers see zero behavior change.
   Unreleased          libpdx-argv.ENH-018 (Closes #28) — INT flag
                        range validation. Adds FlagSpec::register_int
                        and get_range_by_id, Typed::parse_int_u64_ranged,

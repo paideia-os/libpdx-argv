@@ -45,11 +45,54 @@
 // (avoids the circular-dep + fn-pointer indirection at bootstrap).
 // Upstream: design/tooling/r49-r50-plan.md §5.12 M3-002 (paideia-os).
 //
+// libpdx-argv.ENH-014 (Closes #24) — auto --help table fallback
+// -----------------------------------------------------------------
+// When a tool is built WITHOUT `doc` statically linked, the M3-002
+// help pipe has nowhere to route to. ENH-014 adds an in-process
+// fallback: at bootstrap the tool calls `set_doc_unavailable(1)`,
+// and every subsequent `Parser::parse_argv` observation of `--help`
+// (or a single-letter short flag registered with id ==
+// StdVocab::STD_ID_HELP) triggers `emit_from_argspec` — a walk over
+// the `FlagSpec` table that prints one `flag<TAB>help-text\n` line
+// per registration whose `spec_help[i]` slot was populated via
+// `FlagSpec::register_with_help`. The parser returns
+// `ParsedArgs::ERR_HELP_EMITTED` (15) via the same shared
+// `parse_argv_fail` epilogue every other ERR_* code uses.
+//
+// The fallback is opt-in via `set_doc_unavailable(1)`: the default
+// (`doc_backend_unavailable == 0`, restored by `pdxargv_help_reset`
+// and by `TestHarness::full_reset`) preserves the M3-002 dispatch
+// where `--help` is stored as an ordinary flag for the consumer's
+// own doc-forwarding code. Existing consumers that call the plain
+// `FlagSpec::flag_spec_register` (whose ENH-014 wrapper writes 0
+// into `spec_help[slot]`) see zero behavior change on `--help`.
+//
+// Lazy generation: `spec_help` is READ only when the auto-emit
+// actually fires — registration itself never touches emit-path
+// code, so a tool that populates every help slot but never sees
+// `--help` at runtime pays zero cost beyond the qword store per
+// registration.
+//
 // paideia-as compliance
 // ---------------------
 //   - Module HelpBackend (PascalCase basename).
-//   - fill_doc_argv is a leaf; no push/pop, r11 scratch.
-//   - No test mnemonic; no cmp instructions in this module.
+//   - fill_doc_argv, set_doc_unavailable, pdxargv_help_reset,
+//     help_strlen are leaf; r11 lea scratch.
+//   - emit_from_argspec is non-leaf (calls help_strlen twice per
+//     non-null row). 3-push prologue (rbx / r12 / r13) → rsp%16: 8
+//     → 0 for the nested help_strlen calls; syscall itself has no
+//     alignment requirement, so the five interleaved sys_writes per
+//     row need no additional bookkeeping.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 32 for the SPEC_MAX
+//     bound check in emit_from_argspec's loop head — matches the
+//     upper cap FlagSpec::flag_spec_register enforces on writes).
+//   - Byte loads use xor rax,rax; mov_b rax,[ptr] per #1248.
+//   - No `and reg, imm64` on r8-r15; no 2-op `imul r, imm`; no
+//     `cmp reg, [mem]`; no `[reg + N*8]` non-unit scale.
+//   - Reserved-label discipline: every internal label prefixed
+//     `pdxh_` (`pdxh_emit_*`, `pdxh_strlen_*`) so reserved names
+//     like `loop`/`if` never appear.
 //   - DOC_TOOL_NAME is a public [u8; 4] .rodata symbol.
 
 module HelpBackend = structure {
@@ -57,6 +100,49 @@ module HelpBackend = structure {
   // The literal `doc` NUL-terminated string every tool's synthesized
   // --help argv shares. Byte-length 4 = strlen("doc") + 1 for NUL.
   pub let DOC_TOOL_NAME : [u8; 4] = "doc\0"
+
+  // ============================================================
+  // Public literals — bytes `emit_from_argspec` writes to fd 1.
+  // Each carries a trailing NUL per this repo's convention (the NUL
+  // is not written; the length shipped to sys_write excludes it).
+  // ============================================================
+
+  // Two ASCII hyphens `--`. Written verbatim before the flag name
+  // so the auto-table shows the same spelling the user typed
+  // (`--foo` rather than a bare `foo`). Byte-length 2 excludes NUL.
+  pub let LIT_DDASH : [u8; 3] = "--\0"
+
+  // Single ASCII tab (0x09) separating the flag column from the
+  // help-text column. Byte-length 1 excludes NUL. The `\t` escape
+  // is the same one `VersionBackend::LIT_NEWLINE` uses for `\n`, so
+  // the string-literal parser resolves both identically.
+  pub let LIT_TAB : [u8; 2] = "\t\0"
+
+  // Line-terminating newline after each row. Same LF the parser
+  // uses everywhere else stdout is written.
+  pub let LIT_LF : [u8; 2] = "\n\0"
+
+  // ============================================================
+  // Singleton .bss state.
+  //
+  // `doc_backend_unavailable`: 0 (default, restored by
+  // `pdxargv_help_reset`) means the doc back-end IS available in
+  // the tool's address space (the M3-002 shape); `--help` is stored
+  // as an ordinary flag and the tool's own dispatch code hands it
+  // to `doc <tool>` via `HelpBackend::fill_doc_argv`. Nonzero means
+  // the doc back-end is UNavailable (the tool is not linked against
+  // `doc`); the parser then calls `emit_from_argspec` and returns
+  // `ERR_HELP_EMITTED` (15) on any observation of `--help`.
+  //
+  // Opt-in inversion (compare with VersionBackend's opt-OUT default):
+  // the M3-002 dispatch is the STATUS QUO — every existing consumer
+  // already routes `--help` through `doc`, so preserving that as the
+  // default means existing tools see zero behavior change on
+  // `--help`. A tool that OMITS doc from its link line has to say so
+  // by calling `set_doc_unavailable(1)`; the fallback fires only
+  // after that positive signal.
+  // ============================================================
+  pub let mut doc_backend_unavailable : u64 = uninit @align(8)
 
   // ============================================================
   // fill_doc_argv(out_argv_slot_ptr, tool_name_ptr) -> ()
@@ -86,6 +172,215 @@ module HelpBackend = structure {
         lea r11, [rip + DOC_TOOL_NAME];
         mov [rdi + 0], r11;                 // argv_slots[0] = &DOC_TOOL_NAME
         mov [rdi + 8], rsi;                 // argv_slots[1] = tool_name_ptr
+        ret;
+      }
+    }
+
+  // ============================================================
+  // pdxargv_help_reset()              — libpdx-argv.ENH-014 (Closes #24)
+  // Signature: () -> () !{mem} @{}
+  //
+  // Leaf. Zero `doc_backend_unavailable` so the next parse defaults
+  // to the M3-002 dispatch (doc back-end available; `--help` stored
+  // as an ordinary flag for the tool's own doc-forwarding code).
+  // Called by `TestHarness::full_reset` so a case-scoped
+  // `set_doc_unavailable(1)` never leaks into the case after.
+  // Uninit .bss values are undefined, so a first parse without a
+  // prior reset is undefined behaviour — the reset is what makes
+  // the fallback deterministic on a fresh process. Consumers not
+  // using the test harness call this once at `_start` alongside
+  // `parsed_args_reset` / `flag_spec_reset` / `pdxargv_version_reset`.
+  // ============================================================
+  pub let pdxargv_help_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-014 HelpBackend::pdxargv_help_reset — zero doc_backend_unavailable so the next parse defaults to the M3-002 dispatch (parser stores --help as ordinary flag; tool dispatches to doc). Leaf; r11 lea scratch; xor rax,rax produces the zero constant. Mirror of pdxargv_version_reset in shape (both use the pdxargv_ prefix so a consumer that greps for library-owned reset entry points finds the pair alongside parsed_args_reset / flag_spec_reset / schema_emit_reset).",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + doc_backend_unavailable];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // set_doc_unavailable(on)           — libpdx-argv.ENH-014 (Closes #24)
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = 0 → doc back-end IS available (M3-002 dispatch; default)
+  //         nonzero → doc back-end is UNavailable (auto-emit fires)
+  //
+  // Leaf. Store the caller-supplied value directly into
+  // `doc_backend_unavailable`; the parser reads the same slot at
+  // its --help dispatch decision point. Idempotent — called twice
+  // with the same value has the same effect as called once. A tool
+  // whose build variant conditionally omits `doc` toggles this in
+  // its bootstrap immediately after `flag_spec_reset()` and its
+  // per-flag `register_with_help` calls; the parser then routes
+  // `--help` through the in-process fallback.
+  // ============================================================
+  pub let set_doc_unavailable : (u64) -> () !{mem} @{} =
+    fn (on: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-014 HelpBackend::set_doc_unavailable — store rdi (0 or nonzero) into doc_backend_unavailable. Leaf; r11 lea scratch. Any nonzero value trips the auto-emit path in Parser::parse_argv (gate is `cmp doc_backend_unavailable, 0; je skip-auto-emit`, so the caller need not pass exactly 1 — 1 is the convention documented in the module preamble). No sanitisation is performed; this is a tool-side opt-in signal and the tool that calls it holds the same fd-1 cap chain the fallback's sys_writes need.",
+      block: {
+        lea r11, [rip + doc_backend_unavailable];
+        mov [r11], rdi;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // help_strlen(s) -> len              — libpdx-argv.ENH-014 (Closes #24)
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   rdi = NUL-terminated string pointer
+  //   rax = byte length before the NUL
+  //
+  // Leaf. Byte-loop strlen, identical shape to
+  // `VersionBackend::version_strlen` (kept as a per-module copy
+  // rather than an inter-module call so help_backend.o has no link
+  // dependency on version_backend.o — the two modules ship
+  // independently despite their similar internal helpers).
+  // xor+mov_b loads *rdi into rcx (zero-extended per #1248);
+  // cmp rcx, 0; je done; else add rax,1; add rdi,1; loop.
+  // ============================================================
+  pub let help_strlen : (u64) -> u64 !{mem} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-014 HelpBackend::help_strlen — byte-loop strlen returning the count in rax. Pure leaf; rax/rcx/rdi are all SysV caller-save. Byte load uses xor rcx,rcx; mov_b rcx,[rdi] per #1248 (avoids the false partial-register dependency movzx/mov r64,[m8] pattern would introduce). No `add reg,[mem]`, no test mnemonic. Labels prefixed pdxh_strlen_ per the reserved-label discipline. Duplicated rather than shared with VersionBackend::version_strlen because libpdx-argv's modules ship independently and a cross-module strlen dependency would gratuitously widen the link fan-in for anyone using only one of them.",
+      block: {
+        xor rax, rax;
+
+      pdxh_strlen_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je pdxh_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp pdxh_strlen_loop;
+
+      pdxh_strlen_done:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // emit_from_argspec()                — libpdx-argv.ENH-014 (Closes #24)
+  // Signature: () -> () !{mem} @{}
+  //
+  // Non-leaf. Walks the FlagSpec registration table
+  // (spec_names / spec_help / spec_count) and writes ONE line per
+  // registration whose spec_help[i] slot is non-null:
+  //
+  //   --<name><TAB><help>\n
+  //
+  // Rows whose spec_help[i] is 0 are silently suppressed — the
+  // register_with_help contract explicitly lets a caller populate
+  // help text for SOME of its flags and leave others blank. The
+  // walk visits registrations in registration order (index 0 up),
+  // so the on-screen table matches the source order in the tool's
+  // bootstrap.
+  //
+  // Called by `Parser::parse_argv` immediately after it stores the
+  // --help flag (short or long) when the observed id equals
+  // StdVocab::STD_ID_HELP AND doc_backend_unavailable is nonzero.
+  // The parser then loads rax = ERR_HELP_EMITTED (15) and jumps to
+  // parse_argv_fail — the same shared error-return path every
+  // other ERR_* code takes, so error_code and error_arg_index are
+  // recorded uniformly.
+  //
+  // Cap posture: performs sys_write on fd 1 (5 writes per non-null
+  // row). caps.decl carves this out alongside VersionBackend's
+  // emitter as a deliberate, single-purpose exception to the
+  // library's "no syscalls of its own" language; consumers holding
+  // a KIND_TTY / KIND_IPC_ENDPOINT cap on fd 1 see the writes hit
+  // stdout, while consumers that do not hold that cap see the
+  // syscalls fail with EBADF and this function returns anyway —
+  // same silent-write policy VersionBackend::emit_default uses.
+  //
+  // Frame: 3-push (rbx / r12 / r13) → 24 bytes past the return
+  // address, rsp%16 = 0 at the nested help_strlen calls.
+  // syscall itself has no rsp-alignment requirement.
+  //
+  // Register plan inside the frame (all callee-save):
+  //   rbx = loop index i
+  //   r12 = spec_count upper bound (hoisted once)
+  //   r13 = current spec_help[i] pointer (survives the two nested
+  //         help_strlen calls per row that would otherwise clobber
+  //         a caller-save reg)
+  // ============================================================
+  pub let emit_from_argspec : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-014 HelpBackend::emit_from_argspec (Closes #24) — walks the FlagSpec table and writes `--<name><TAB><help>\\n` to fd 1 per registration whose spec_help[i] slot is non-null. Non-leaf: two nested calls to help_strlen per non-null row (one for the name length, one for the help length). 3-push prologue (rbx/r12/r13) → 24 bytes past the return address, rsp%16 = 0 at every nested call site (SysV requires 16-byte alignment for CALL only; syscall has no alignment requirement so the five interleaved sys_writes per row need no extra bookkeeping). rbx as loop index; r12 hoists spec_count once at loop head; r13 carries the current help_ptr across the strlen call that would otherwise put its return in rax. Row-suppression gate is `cmp r13, 0; je advance` — a null help slot skips ALL five writes for that row, so a tool that populates only 2 of 10 flags emits exactly 2 lines. The five sys_writes per row are literal `--` (2 bytes), name (strlen bytes), TAB (1 byte), help (strlen bytes), LF (1 byte); the TAB escape resolves to 0x09 the same way LIT_NEWLINE resolves to 0x0A. Silent-write policy: rax return from each syscall is discarded — a short-write or EBADF is unrecoverable in a --help fallback and the tool exits after this returns anyway. Called by Parser::parse_argv from a 6-push + sub rsp,8 frame that has already aligned rsp%16 to 0 at the call site, so the 3-push here brings the nested strlen sites back to alignment identically. Labels prefixed pdxh_emit_ per the reserved-label discipline. Does NOT clobber r14/r15/rbp — parse_argv relies on those for value_ptr/id/name_ptr across the return, and none of the caller-save regs this function uses (rax/rcx/rdx/rdi/rsi/r8/r9/r10/r11) overlap. New klog tag: pdxargv.help-auto.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        xor rbx, rbx;                       // rbx = i = 0
+        lea r11, [rip + spec_count];
+        mov r12, [r11];                     // r12 = spec_count
+
+      pdxh_emit_loop_head:
+        cmp rbx, r12;
+        jge pdxh_emit_done;
+
+        // Load spec_help[i] into r13; skip row if null.
+        lea r11, [rip + spec_help];
+        mov r13, [r11 + rbx*8];
+        cmp r13, 0;
+        je pdxh_emit_advance;
+
+        // -- Segment 1: sys_write(1, "--", 2) -----------------------
+        mov rax, 1;                         // SYS_write
+        mov rdi, 1;                         // fd = stdout
+        lea rsi, [rip + LIT_DDASH];
+        mov rdx, 2;
+        syscall;
+
+        // -- Segment 2: strlen(name); sys_write(1, name, len) ------
+        lea r11, [rip + spec_names];
+        mov rdi, [r11 + rbx*8];
+        call help_strlen;                   // rax = name length
+        mov rdx, rax;
+        mov rax, 1;
+        mov rdi, 1;
+        lea r11, [rip + spec_names];
+        mov rsi, [r11 + rbx*8];
+        syscall;
+
+        // -- Segment 3: sys_write(1, TAB, 1) ------------------------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + LIT_TAB];
+        mov rdx, 1;
+        syscall;
+
+        // -- Segment 4: strlen(help); sys_write(1, help, len) ------
+        mov rdi, r13;
+        call help_strlen;                   // rax = help length
+        mov rdx, rax;
+        mov rax, 1;
+        mov rdi, 1;
+        mov rsi, r13;
+        syscall;
+
+        // -- Segment 5: sys_write(1, LF, 1) -------------------------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + LIT_LF];
+        mov rdx, 1;
+        syscall;
+
+      pdxh_emit_advance:
+        add rbx, 1;
+        jmp pdxh_emit_loop_head;
+
+      pdxh_emit_done:
+        pop r13;
+        pop r12;
+        pop rbx;
         ret;
       }
     }

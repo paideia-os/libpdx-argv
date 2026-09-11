@@ -6,6 +6,159 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-014 — Auto `--help` table generated lazily from ArgSpec (Closes #24)
+
+`FlagSpec` gains a new per-slot array `spec_help : [u64; 32]` — a
+NUL-terminated help-text pointer, or `0` for "no help text on this
+row". A new registration variant
+`register_with_help(name_ptr, kind, id, help_ptr)` populates this
+slot; the existing 3-arg `flag_spec_register` becomes a thin wrapper
+that calls `register_with_help` with `help_ptr = 0` (behaviour
+preserved for every existing consumer). `register_sep` and
+`register_int` gain a defensive `spec_help[slot] = 0` store in the
+same shape they already zero `spec_sep_required` / `spec_min` /
+`spec_max`, so a slot recycled across a `register_with_help() →
+register_sep()` (or `→ register_int()`) sequence never inherits a
+stale help pointer.
+
+`HelpBackend` gains:
+
+  - `LIT_DDASH` / `LIT_TAB` / `LIT_LF` — the three `.rodata`
+     literals `emit_from_argspec` writes verbatim per row
+     (`--`, tab 0x09, and LF 0x0A). The tab is written as `"\t\0"`
+     the same way `VersionBackend::LIT_NEWLINE` writes `"\n\0"`.
+  - `doc_backend_unavailable : u64` (.bss) — 0 (default; restored
+     by `pdxargv_help_reset`) means the `doc` back-end IS available
+     in the tool's address space (the M3-002 dispatch: `--help` is
+     stored as an ordinary flag for the tool's own doc-forwarding
+     code); nonzero means the tool has explicitly signalled
+     unavailability and wants the in-process fallback.
+  - `pdxargv_help_reset() -> ()` — leaf; zeros
+     `doc_backend_unavailable`. Wired into
+     `TestHarness::full_reset` so a case that opts in never leaks
+     the opt-in into the case after.
+  - `set_doc_unavailable(on: u64) -> ()` — leaf; stores `rdi` into
+     `doc_backend_unavailable`. Any nonzero value trips the auto-
+     emit gate (`cmp doc_backend_unavailable, 0; je skip`); the `1`
+     convention is documented in the module preamble.
+  - `help_strlen(s: u64) -> u64` — leaf; byte-loop strlen, same
+     shape as `VersionBackend::version_strlen`. Duplicated across
+     the two modules so `help_backend.o` has no link dependency on
+     `version_backend.o`.
+  - `emit_from_argspec() -> ()` — non-leaf; 3-push prologue
+     (rbx / r12 / r13). Walks `spec_names` / `spec_help` /
+     `spec_count`, writing `--<name><TAB><help>\n` to fd 1 per
+     registration whose `spec_help[i]` slot is non-null. Five
+     `sys_write` calls per non-null row (literal `--` + name +
+     TAB + help + LF); rows whose help slot is 0 are silently
+     suppressed. Called by `Parser::parse_argv` immediately after
+     it stores a `--help` observation whose id equals
+     `StdVocab::STD_ID_HELP` (1) AND `doc_backend_unavailable != 0`.
+
+`Parser::parse_argv` dispatches on both the long-flag store path
+and the single-letter short-flag store path (StdVocab does not
+register a `-h` alias — a `-h` would collide with `head` / `hexdump`
+conventions — so the short path only fires for a tool that
+explicitly registered a single-letter short flag with id ==
+STD_ID_HELP). The gate is opt-IN: default
+`doc_backend_unavailable == 0` preserves M3-002 semantics, so a
+tool that has `doc` statically linked sees zero behavior change
+on `--help`. On the auto-emit path the parser returns
+`ParsedArgs::ERR_HELP_EMITTED` (15) via the shared
+`parse_argv_fail` epilogue every other `ERR_*` code takes — a
+consumer's existing `if err != ERR_OK { … }` branch fires
+uniformly; the tool exits 0 in response.
+
+Fingerprint (issue #24): with `StdVocab::register_all` and three
+tool-specific flags registered via `register_with_help` (each with
+help text set) AND `HelpBackend::set_doc_unavailable(1)` in effect,
+`parse_argv(["--help"], 1)` returns `ERR_HELP_EMITTED = 15` in rax,
+writes 15 into `ParsedArgs::error_code`, and issues exactly 3 ×
+5 = 15 `sys_write`s to fd 1 realising three `--<name><TAB><help>\n`
+lines. Rows whose help slot is null are suppressed — a tool that
+populates only 2 of 10 slots emits exactly 2 rows. Without the
+`set_doc_unavailable(1)` opt-in, `parse_argv(["--help"], 1)`
+returns `ERR_OK` and stores `--help` as an ordinary flag exactly
+as before.
+
+Files touched:
+
+  - src/parsed_args.pdx
+      +`ERR_HELP_EMITTED = 15` constant, docstring naming the
+       success-signal semantics (parity with `ERR_VERSION_EMITTED`).
+
+  - src/flag_spec.pdx
+      +`spec_help : [u64; 32]` .bss array, with the "0 → row
+       suppressed" lazy-generation contract documented on the slot
+       declaration.
+      +`register_with_help(name_ptr, kind, id, help_ptr)` — the
+       canonical full-shape registration path; leaf.
+      *`flag_spec_register` is now a thin wrapper that xors rcx to 0
+       and tail-calls `register_with_help` (1-push rbx for
+       alignment). Preserves the M2 3-arg registration surface.
+      *`register_sep` / `register_int` — defensive
+       `spec_help[slot] = 0` store added alongside the existing
+       `spec_sep_required` / `spec_min` / `spec_max` stores.
+
+  - src/help_backend.pdx
+      +`LIT_DDASH` (`"--\0"`), `LIT_TAB` (`"\t\0"`), `LIT_LF`
+       (`"\n\0"`) .rodata literals.
+      +`doc_backend_unavailable : u64` .bss slot (opt-in gate;
+       default 0 = doc available; nonzero = doc unavailable, auto-
+       emit fires).
+      +`pdxargv_help_reset()` — leaf; zeros the gate slot.
+      +`set_doc_unavailable(on)` — leaf; stores rdi.
+      +`help_strlen(s) -> len` — leaf; byte-loop strlen mirroring
+       `VersionBackend::version_strlen` in shape.
+      +`emit_from_argspec()` — non-leaf; 3-push prologue; walks
+       FlagSpec and writes one `--<name><TAB><help>\n` per non-null
+       row via 5 sys_writes.
+
+  - src/parser.pdx
+      *`parse_argv` — after every long-flag OR single-letter short-
+       flag store, checks `r15 == 1` (`STD_ID_HELP`) AND
+       `doc_backend_unavailable != 0`. On both hits, calls
+       `emit_from_argspec` and returns `ERR_HELP_EMITTED` via
+       `parse_argv_fail`. The 6-push + `sub rsp,8` prologue that
+       already aligned `rsp%16 = 0` for the nested `FlagSpec::lookup`
+       and `VersionBackend::emit_default` calls covers the new
+       `emit_from_argspec` call site without any bookkeeping change.
+
+  - tests/harness.pdx
+      *`TestHarness::full_reset` — fifth nested reset call:
+       `pdxargv_help_reset` (symmetric with the ENH-032
+       `pdxargv_version_reset` addition).
+
+  - tests/help_backend_tests.pdx
+      +`run_case4` — the lazy-emit fingerprint case; registers 3
+       tool-specific flags with help set, opts into the fallback
+       via `set_doc_unavailable(1)`, asserts
+       `parse_argv(["--help"], 1)` returns
+       `ERR_HELP_EMITTED = 15` and records 15 into
+       `ParsedArgs::error_code`.
+
+  - tests/smoke_driver.pdx
+      *Registers `HelpBackendTests::run_case4` in the smoke run.
+
+  - design/architecture.md, README.md, doc/libpdx-argv.pdxdoc
+      *Documented the new registration path, the opt-in gate, the
+       auto-emit fingerprint, and the interaction with M3-002's
+       `fill_doc_argv` dispatch.
+
+Caps.decl impact: `emit_from_argspec` issues `sys_write` on fd 1
+(5 syscalls per non-null row). The `caps.decl` narrowed language
+already carved out `VersionBackend::emit_default` as a deliberate
+single-purpose exception to the library's "no syscalls of its own"
+line; ENH-014 extends that carve-out to the second library-owned
+emitter. Consumers holding a `KIND_TTY` / `KIND_IPC_ENDPOINT` cap
+on fd 1 see the writes hit stdout; consumers that do not see the
+syscalls fail with `-EBADF` and this function returns anyway —
+same silent-write policy `emit_default` uses.
+
+New klog tag: `pdxargv.help-auto` (identifier a klog subscriber
+uses to correlate an auto-emit with the argv slot that triggered
+it once the kernel-side klog substrate lands, R51+).
+
 ### ENH-018 — INT flag range validation (min/max on ArgSpec) (Closes #28)
 
 `FlagSpec` gains two new per-slot arrays, `spec_min` and `spec_max`

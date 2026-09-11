@@ -30,7 +30,7 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | 4  | (reserved: parse_positional_ext) | — |
 | 5  | ParseStdVocabTests          | 2     |
 | 6  | ParseSchemaRecordTests      | 10    |
-| 7  | HelpBackendTests            | 3     |
+| 7  | HelpBackendTests            | 4     |
 | 8  | SchemaEmitTests             | 5     |
 | 9  | (reserved: parse_mixed_ext) | —     |
 

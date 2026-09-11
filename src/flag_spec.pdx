@@ -94,6 +94,24 @@ module FlagSpec = structure {
   pub let mut spec_min : [u64; 32] = uninit @align(8)
   pub let mut spec_max : [u64; 32] = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-014 (Closes #24): per-registration help
+  // text pointer. NUL-terminated string OR null (0). A null slot is
+  // silently suppressed from the `HelpBackend::emit_from_argspec`
+  // auto-table walk — a tool that populates ONLY some help slots
+  // gets ONLY those lines. Every plain registration path
+  // (`flag_spec_register`, `register_sep`, `register_int`) writes 0
+  // into this slot defensively so a slot recycled after a
+  // `register_with_help` call never inherits a stale help pointer;
+  // `register_with_help` is the ONLY path that writes non-zero here.
+  //
+  // Lazy-generation contract: this slot is READ only when
+  // `Parser::parse_argv` observes `--help` (or a single-letter short
+  // flag whose id == StdVocab::STD_ID_HELP) AND the tool has opted
+  // into the fallback via `HelpBackend::set_doc_unavailable(1)`.
+  // Registration itself never touches the emit path — the cost is
+  // paid only when the auto-table actually fires.
+  pub let mut spec_help : [u64; 32] = uninit @align(8)
+
   // Companion "out parameter" for lookup() (libpdx-argv.ENH-010):
   // lookup's own return convention is fixed at (kind in rax, id in
   // rdx) — the full width of SysV's multi-return rax:rdx pair — so a
@@ -191,12 +209,56 @@ module FlagSpec = structure {
   pub let flag_spec_register : (u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (kind: u64) (id: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 + ENH-010 + ENH-018 + ENH-030 flag_spec_register — appends (name, kind, id) at spec_count and increments, explicitly zeroing spec_sep_required[slot] AND (ENH-018) spec_min[slot] / spec_max[slot] so a slot index reused after a reset never inherits a stale separator-required flag OR a stale INT range from an earlier registration batch (register_int() is the only path that writes non-zero min/max, so writing zero here matches the (0,0) 'range OFF' sentinel Typed::parse_int_u64_ranged consults). Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal reused across all three defensive stores. Silently drops past SPEC_MAX to keep the M2 API single-return (registering N+1 flags is caller error, surfaced via spec_count == SPEC_MAX after the batch). The MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). ENH-030 renames the exported symbol from `register` to `flag_spec_register` (and its overflow label to flag_spec_register_full) to end the multi-module link collision — body byte-identical modulo the ENH-018 min/max stores.",
+      justification: "libpdx-argv.ENH-014 (Closes #24) flag_spec_register — thin wrapper over register_with_help that passes 0 for the help_ptr slot. Preserves the M2 3-arg registration surface every existing consumer already targets (StdVocab::register_all + every tool-side bootstrap) while routing the actual store into a single canonical implementation. Non-leaf: one nested call to register_with_help. 1-push (rbx unused; for rsp alignment) prologue → rsp%16: 8 → 0 for the nested call. rcx is caller-save so zeroing it here is safe (no caller relies on rcx across a register call — the M2 contract only names rdi/rsi/rdx as inputs); the wrapper contributes no additional register clobber beyond what register_with_help itself already documents (rax scratched as spec_count). Existing callers that align rsp%16 to 0 before calling flag_spec_register (StdVocab::register_all's own 1-push prologue does exactly this) see zero ABI change; a caller that did NOT pre-align was already violating the SysV invariant for a leaf that internally uses no stack, and the wrapper's own push_rbx/call/pop_rbx sequence is the first stack traffic the flag_spec_register call site introduces, matching every other non-leaf entry in this module.",
+      block: {
+        push rbx;                          // align rsp (rsp%16: 8 → 0)
+        xor rcx, rcx;                      // help_ptr = 0 (null → row suppressed)
+        call register_with_help;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // register_with_help(name_ptr, kind, id, help_ptr) — libpdx-argv.ENH-014 (Closes #24)
+  // Signature: (u64, u64, u64, u64) -> () !{mem} @{}
+  //   rdi = name_ptr (NUL-terminated string)
+  //   rsi = kind (FKIND_* constant, 0..5)
+  //   rdx = id (caller-chosen; 0 reserved for "unregistered")
+  //   rcx = help_ptr (NUL-terminated string OR 0 → row suppressed)
+  //
+  // Full-shape registration: appends (name, kind, id) at spec_count
+  // and increments, publishing help_ptr into spec_help[slot]. All
+  // other per-slot arrays (spec_sep_required / spec_min / spec_max)
+  // are defensively zeroed so a slot recycled across a register_sep()
+  // → register_with_help() sequence never inherits a stale
+  // separator-required flag or stale INT range.
+  //
+  // flag_spec_register is a thin wrapper that calls register_with_help
+  // with help_ptr = 0 — every plain registration path lands here via
+  // that wrapper; register_sep and register_int stay separate because
+  // they set non-default values into the sep_required / min / max
+  // slots respectively that would be clobbered by this function's
+  // defensive zeroing.
+  //
+  // Silently no-ops past SPEC_MAX (same policy as flag_spec_register
+  // and every other registration path — the M2 single-return API
+  // never grew a registration-failure code).
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = spec_count / scratch
+  //   r8  = zero literal for spec_sep_required / spec_min / spec_max
+  //   r11 = lea scratch for cross-module .bss bases
+  // ============================================================
+  pub let register_with_help : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (name_ptr: u64) (kind: u64) (id: u64) (help_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-014 FlagSpec::register_with_help (Closes #24) — the canonical full-shape registration path. Appends (name, kind, id) at spec_count and publishes help_ptr into spec_help[slot]; all sibling per-slot arrays (spec_sep_required / spec_min / spec_max) are defensively zeroed so a slot recycled across a register_sep() → register_with_help() batch never inherits stale bits. flag_spec_register is now a thin wrapper that xor rcx,rcx + call register_with_help — every plain 3-arg registration lands here with help_ptr = 0. register_sep and register_int stay inline (they'd fight the defensive zeroing this function performs on their own load-bearing slots). Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal reused across the three defensive stores. Silently drops past SPEC_MAX (matches the ENH-030 flag_spec_register policy). MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). The lazy-generation contract is honoured by having ZERO emit-path code here — this function only writes the slot; walking it is exclusively HelpBackend::emit_from_argspec's job, and that walk fires only when Parser::parse_argv observes --help under set_doc_unavailable(1).",
       block: {
         lea r11, [rip + spec_count];
         mov rax, [r11];
         cmp rax, 32;                       // SPEC_MAX
-        jge flag_spec_register_full;
+        jge register_with_help_full;
 
         lea r11, [rip + spec_names];
         mov [r11 + rax*8], rdi;
@@ -211,12 +273,14 @@ module FlagSpec = structure {
         mov [r11 + rax*8], r8;
         lea r11, [rip + spec_max];
         mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_help];
+        mov [r11 + rax*8], rcx;
 
         add rax, 1;
         lea r11, [rip + spec_count];
         mov [r11], rax;
 
-      flag_spec_register_full:
+      register_with_help_full:
         ret;
       }
     }
@@ -258,6 +322,8 @@ module FlagSpec = structure {
         mov [r11 + rax*8], r8;
         lea r11, [rip + spec_max];
         mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_help];
+        mov [r11 + rax*8], r8;             // ENH-014: defensive-zero help slot
 
         add rax, 1;
         lea r11, [rip + spec_count];
@@ -416,6 +482,8 @@ module FlagSpec = structure {
         mov [r11 + rax*8], rdx;
         lea r11, [rip + spec_max];
         mov [r11 + rax*8], rcx;
+        lea r11, [rip + spec_help];
+        mov [r11 + rax*8], r8;             // ENH-014: defensive-zero help slot
 
         add rax, 1;
         lea r11, [rip + spec_count];

@@ -162,6 +162,8 @@ module SmokeDriver = structure {
         call HelpBackendTests::run_case1;
         call HelpBackendTests::run_case2;
         call HelpBackendTests::run_case3;
+        // libpdx-argv.ENH-014 (Closes #24): --help auto-table fallback.
+        call HelpBackendTests::run_case4;
 
         // --- SchemaEmitTests (module id 8) --------------------------
         call SchemaEmitTests::run_case1;

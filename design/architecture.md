@@ -831,7 +831,7 @@ reshuffle case numbers.
 | 4  | *reserved* (parse_positional_ext)         | —  |
 | 5  | `ParseStdVocabTests` (parse_std_vocab.pdx) | 4  |
 | 6  | `ParseSchemaRecordTests` (parse_schema_record.pdx) | 10 |
-| 7  | `HelpBackendTests` (help_backend.pdx)     | 3  |
+| 7  | `HelpBackendTests` (help_backend.pdx)     | 4  |
 | 8  | `SchemaEmitTests` (schema_emit.pdx)       | 5  |
 | 9  | *reserved* (parse_mixed_ext)              | —  |
 
@@ -1098,3 +1098,133 @@ Klog tag for the range trip: `pdxargv.int-range`.
   design. Callers that need to tell them apart call `lookup()`
   first (a `FKIND_UNKNOWN` return means "not registered", any
   other return means "registered").
+
+## 14. Auto `--help` table fallback (ENH-014, Closes #24)
+
+`StdVocab::register_all` reserves `--help` (id 1). M3-002 wired
+the observation through `HelpBackend::fill_doc_argv` into whichever
+`doc_dispatch` symbol the consumer statically linked. That leaves
+a gap: a tool built WITHOUT `doc` linked has no fall-back — it
+either has to render `--help` by hand (defeating the M3-002 point)
+or it emits nothing at all. ENH-014 lands the in-process fallback:
+a walk over the registration table that writes one
+`--<name><TAB><help>\n` line to fd 1 per registration whose help
+slot is populated, followed by `ERR_HELP_EMITTED` (15) via the
+shared `parse_argv_fail` epilogue.
+
+### 14.1 Module surface delta
+
+New in `FlagSpec`:
+
+- `spec_help : [u64; 32]` .bss array — one help-text pointer per
+   registration slot; `0` means "no help text on this row".
+   Defensively zeroed by every plain registration path
+   (`flag_spec_register`, `register_sep`, `register_int`) so a
+   slot recycled across a `register_with_help() →
+   register_sep()` sequence never inherits stale bits.
+- `register_with_help(name_ptr, kind, id, help_ptr)` — the
+   canonical full-shape registration path. `flag_spec_register`
+   is now a thin wrapper that xors rcx to 0 and tail-calls
+   `register_with_help`, preserving the M2 3-arg surface every
+   existing consumer already targets.
+
+New in `HelpBackend`:
+
+- `LIT_DDASH` / `LIT_TAB` / `LIT_LF` — the three `.rodata`
+   literals `emit_from_argspec` writes verbatim per row
+   (`--`, `\t` = 0x09, `\n` = 0x0A).
+- `doc_backend_unavailable : u64` .bss slot — 0 (default) means
+   the M3-002 dispatch is in effect; nonzero means the tool has
+   opted into the fallback.
+- `pdxargv_help_reset()` — leaf; zeros the gate slot. Wired
+   into `TestHarness::full_reset`.
+- `set_doc_unavailable(on)` — leaf; stores rdi into the gate
+   slot.
+- `help_strlen(s)` — leaf; byte-loop strlen mirroring
+   `VersionBackend::version_strlen` in shape (per-module copy so
+   `help_backend.o` has no link dependency on
+   `version_backend.o`).
+- `emit_from_argspec()` — non-leaf; 3-push prologue
+   (rbx / r12 / r13). Walks `spec_names` / `spec_help` /
+   `spec_count`, issuing 5 `sys_write`s per non-null row (literal
+   `--`, name, TAB, help, LF); rows whose help slot is 0 are
+   silently suppressed. Called by `Parser::parse_argv` on the
+   auto-emit path.
+
+New in `ParsedArgs`:
+
+- `ERR_HELP_EMITTED : u64 = 15` — parity with
+   `ERR_VERSION_EMITTED` (a success signal, not an error). The
+   parser writes it into `error_code` and returns it in rax via
+   the shared `parse_argv_fail` epilogue.
+
+### 14.2 Opt-in gate rationale
+
+The gate is opt-IN so existing consumers see zero behavior change
+on `--help`. Every P0 tool today statically links `doc` and
+dispatches `--help` through its own code path; flipping the
+default to auto-emit would silently break that dispatch (the tool
+would exit before its `find_flag_by_id(STD_ID_HELP)` handler
+ever ran). A tool built without `doc` — the case ENH-014 exists
+for — is a positive signal the tool's author makes at bootstrap:
+`HelpBackend::set_doc_unavailable(1)`. Everything downstream is
+identical to the with-doc case up to that call.
+
+This is inverted from ENH-032's `--version` gate, where the
+default is auto-emit and the opt-out is `set_override(1)`. The
+inversion is deliberate: `--version` had no shared M-series
+dispatch (every consumer already hand-rolled the emit path), so
+consolidating into a library-owned default carried no behavior
+break. `--help` did have a shared dispatch (M3-002); preserving
+it as the default keeps consumers stable.
+
+### 14.3 Dispatch shape in `parse_argv`
+
+After every long-flag OR single-letter short-flag store, the
+parser checks whether the just-stored id equals
+`StdVocab::STD_ID_HELP` (1) AND `doc_backend_unavailable != 0`.
+On both hits it calls `emit_from_argspec`, loads rax with 15, and
+jumps to `parse_argv_fail`. The 6-push + `sub rsp,8` prologue
+that already aligned `rsp%16 = 0` for the nested
+`FlagSpec::lookup` and `VersionBackend::emit_default` calls
+covers this without any bookkeeping change.
+
+StdVocab does not register a `-h` alias (it would collide with
+`head` / `hexdump` conventions), so the short-flag path only
+fires for a tool that has explicitly registered a single-letter
+short flag with id `STD_ID_HELP`. Consumers wanting a `-?` or
+`-h` alias get it by calling `flag_spec_register(&NAME_H,
+FKIND_BOOL, 1)` after `register_all`.
+
+### 14.4 Row-suppression semantics
+
+`emit_from_argspec` skips any row whose `spec_help[i]` is 0. This
+lets a tool populate help text for only its most user-facing
+flags while leaving diagnostic-only or debug flags untabulated
+without having to move them to a separate `FlagSpec` table. The
+walk visits registrations in registration order so the on-screen
+table matches source order in the tool's bootstrap.
+
+### 14.5 What ENH-014 explicitly does not do
+
+- No pagination. `emit_from_argspec` writes every non-null row
+  in one pass. A tool with > 20 flags would benefit from
+  paginated output; deferred until a real consumer needs it.
+- No group headers or per-section formatting. The output is a
+  flat two-column table; consumers wanting `Usage:` / `Options:`
+  banner text render it themselves via their own sys_write
+  before/after the auto-emit path fires (the parser fires the
+  emit before returning, so a wrapping `--help` handler would
+  have to intercept the return code and render a header on
+  ERR_HELP_EMITTED before exiting).
+- No wire-form auto-emit. The schema-record invocation path
+  (`SchemaInvoke::parse_from_schema_record`) does not fire the
+  fallback; a peer tool feeding a `--help` observation through
+  the pipe does not want text on fd 1. The auto-emit is scoped
+  to the argv invocation path only.
+- No `-h` short alias registered by StdVocab. See §14.3.
+- No cap acquisition. `emit_from_argspec` writes to fd 1 with
+  whatever cap the caller already holds; libpdx-argv holds none
+  of its own. Consumers that lack a KIND_TTY / KIND_IPC_ENDPOINT
+  cap on fd 1 see the syscalls fail with EBADF and this function
+  returns anyway — same silent-write policy `emit_default` uses.

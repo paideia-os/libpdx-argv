@@ -87,6 +87,36 @@ module ParsedArgs = structure {
   // than by the decoder's own overflow gate. New klog tag:
   // `pdxargv.int-range`.
   pub let ERR_INT_RANGE                 : u64 = 14
+  // Added by libpdx-argv.ENH-014 (Closes #24): library-owned `--help`
+  // auto-table fallback. Set by `Parser::parse_argv` when it observes
+  // an argv slot equal to `--help` (or a single-letter short flag with
+  // id == StdVocab::STD_ID_HELP) AND the tool has opted into the
+  // fallback via `HelpBackend::set_doc_unavailable(1)`. Before
+  // returning this code the parser calls `HelpBackend::emit_from_argspec`
+  // which walks the `FlagSpec` table and prints a two-column
+  // `flag<TAB>help-text` line to fd 1 per registered flag whose
+  // `spec_help[i]` slot was populated (via `register_with_help`); a
+  // registration whose help slot is null (every plain `flag_spec_register`
+  // call sets it null) is silently suppressed from the emit — a tool
+  // that populates ONLY some help slots gets ONLY those lines.
+  //
+  // Like `ERR_VERSION_EMITTED` this is a success signal, not an error
+  // — the tool exits 0 in response. It occupies the ERR_* space
+  // (rather than a separate return-code family) so a consumer's
+  // existing `if err != ERR_OK { … }` branch still fires, keeping the
+  // dispatch shape uniform. Callers that need to distinguish it from
+  // a real parse error compare `err == ERR_HELP_EMITTED` against the
+  // others. Existing consumers that call the plain `flag_spec_register`
+  // (with no help text) AND do not call `set_doc_unavailable(1)` see
+  // zero behavior change: `--help` is stored as an ordinary flag and
+  // the tool dispatches to its own `doc <tool>` renderer as before.
+  //
+  // The auto-table only fires when the tool has explicitly signalled
+  // that the `doc` back-end is unavailable in its address space (a
+  // static link of `doc` is the P0 pattern; a tool built without that
+  // link calls `set_doc_unavailable(1)` at bootstrap and gets the
+  // in-process fallback instead). New klog tag: `pdxargv.help-auto`.
+  pub let ERR_HELP_EMITTED              : u64 = 15
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

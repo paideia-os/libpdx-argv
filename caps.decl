@@ -32,6 +32,20 @@
 # This is the same silent-write policy the schema-emit consumer
 # pattern uses.
 #
+# libpdx-argv.ENH-014 (Closes #24, 2026-09-10): the carve-out above
+# extends to a second library-owned emitter — HelpBackend::
+# emit_from_argspec. It issues five raw sys_write syscalls on fd 1
+# per registered flag whose spec_help[i] slot is non-null (literal
+# `--`, name, TAB, help, LF); rows whose help slot is null are
+# silently suppressed and cost zero syscalls. Fires only when the
+# parser observes --help (or a single-letter short flag with id ==
+# StdVocab::STD_ID_HELP) AND the tool has opted into the fallback
+# via HelpBackend::set_doc_unavailable(1). Same cap posture and
+# silent-write policy as emit_default: a consumer without a
+# KIND_TTY / KIND_IPC_ENDPOINT cap on fd 1 sees the syscalls fail
+# with EBADF and the emitter returns anyway; the tool exits after
+# parse_argv returns ERR_HELP_EMITTED (15) either way.
+#
 # Callers that use libpdx-argv must independently declare in their own
 # caps.decl any caps their tool needs (KIND_USER, KIND_TTY, KIND_PDXFS_*,
 # KIND_IPC_ENDPOINT, ...). This file exists so the R49 caps-manifest

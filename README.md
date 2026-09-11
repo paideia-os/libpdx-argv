@@ -52,7 +52,10 @@ success signal, not an error; see `VersionBackend` below),
 `ERR_INT_RANGE` 14 (INT-flag value fell outside the registered
 `[min, max]` interval; set by `Typed::parse_int_u64_ranged` — see
 `register_int` in `FlagSpec` and `parse_int_u64_ranged` in `Typed`
-below; `libpdx-argv.ENH-018`).
+below; `libpdx-argv.ENH-018`),
+`ERR_HELP_EMITTED` 15 (library-owned `--help` auto-table fallback
+fired — success signal, not an error; see `HelpBackend` below;
+`libpdx-argv.ENH-014`).
 
 | Function | Purpose |
 | --- | --- |
@@ -70,7 +73,8 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | Function | Purpose |
 | --- | --- |
 | `flag_spec_reset() -> () !{mem} @{}` | Clear the registration table (zeroes `spec_count`). **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** |
-| `flag_spec_register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. The flag may take its value inline (`=`/`:`) or via lookahead (`argv[i+1]`). **(Renamed from `register` in `libpdx-argv.ENH-030`, v1.1.0.)** |
+| `flag_spec_register(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | Append one `(name, kind, id)` triple. Silently no-ops past `SPEC_MAX`. The flag may take its value inline (`=`/`:`) or via lookahead (`argv[i+1]`). **(Renamed from `register` in `libpdx-argv.ENH-030`, v1.1.0.)** **(`libpdx-argv.ENH-014`, Closes #24)** Now a thin wrapper over `register_with_help` that passes `help_ptr = 0`; every call site sees zero ABI change but the registration lands in the same table as help-populated entries. |
+| `register_with_help(name_ptr: u64, kind: u64, id: u64, help_ptr: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-014`, Closes #24)** The full-shape registration path: same as `flag_spec_register` plus a NUL-terminated help-text pointer published into a new `spec_help[slot]` array. A `help_ptr = 0` slot is silently suppressed from the `HelpBackend::emit_from_argspec` auto-table walk — a tool that populates ONLY some help slots gets ONLY those lines. |
 | `register_sep(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-010`)** Same as `flag_spec_register`, but the flag's value MUST arrive inline — the parser never accepts a lookahead value for it, even if `argv[i+1]` looks like a plausible one. Use for a flag whose I3 spelling mandates a separator (`--color=`, `--no-cap:`). |
 | `register_int(name_ptr: u64, id: u64, min: u64, max: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Register an INT-kinded flag (kind fixed to `FKIND_INT`) with an inclusive unsigned `[min, max]` interval published into new `spec_min` / `spec_max` slots. `Typed::parse_int_u64_ranged` reads the pair (either forwarded by the consumer or recovered via `get_range_by_id`) and rejects a decoded value outside the interval with `ERR_INT_RANGE`. Sentinel: `(min = 0, max = 0)` means "range OFF" — the plain `flag_spec_register` path writes exactly this, so every existing INT registration is transparent to the gate. |
 | `get_range_by_id(id: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Multi-return `(min in rax, max in rdx)` — companion accessor for the range slots `register_int` publishes. Returns `(0, 0)` both for an unregistered id AND for a flag registered without a range — indistinguishable at this API, by design; callers that need to tell them apart call `lookup()` first. |
@@ -152,9 +156,28 @@ and it is now bounds-checked end to end.
 `DOC_TOOL_NAME : [u8; 4] = "doc\0"` — the canonical `argv[0]` every
 consumer's synthesized help invocation shares.
 
+**(`libpdx-argv.ENH-014`, Closes #24.)** Library-owned `--help`
+auto-table fallback. When `Parser::parse_argv` observes an argv
+slot equal to `--help` (or a single-letter short flag whose id ==
+`StdVocab::STD_ID_HELP`) AND the tool has opted into the fallback
+via `HelpBackend::set_doc_unavailable(1)`, the parser calls
+`HelpBackend::emit_from_argspec` and returns
+`ParsedArgs::ERR_HELP_EMITTED` (15). The emitter walks the
+`FlagSpec` table and writes one `--<name><TAB><help>\n` line to
+fd 1 per registration whose `spec_help[i]` slot was populated via
+`FlagSpec::register_with_help`; rows whose help slot is null are
+silently suppressed. The gate is opt-IN — default preserves the
+M3-002 dispatch where `--help` is stored as an ordinary flag for
+the tool's own doc-forwarding code — so a tool that has `doc`
+statically linked sees zero behavior change on `--help`.
+
 | Function | Purpose |
 | --- | --- |
 | `fill_doc_argv(out_argv_slot_ptr: u64, tool_name_ptr: u64) -> () !{mem} @{}` | Write `(&DOC_TOOL_NAME, tool_name_ptr)` into a caller-owned `[u64; 2]`, so `--help` can hand `("doc", "<tool>")` to the `doc` renderer. Only the argv-fill primitive is exposed — a static dependency on `doc` would be circular. |
+| `pdxargv_help_reset() -> () !{mem} @{}` | **(`libpdx-argv.ENH-014`)** Zero `doc_backend_unavailable` so the next parse defaults to the M3-002 dispatch. Called by `TestHarness::full_reset`. |
+| `set_doc_unavailable(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-014`)** `on != 0` opts the tool INTO the auto-table fallback; parse_argv then calls `emit_from_argspec` and returns `ERR_HELP_EMITTED` on every `--help` observation. |
+| `emit_from_argspec() -> () !{mem} @{}` | **(`libpdx-argv.ENH-014`)** Writes `--<name><TAB><help>\n` to fd 1 for every registration whose `spec_help[i]` is non-null. Non-leaf (calls `help_strlen` twice per row). The parser calls this on the auto-emit path; consumers typically do not call it directly. |
+| `help_strlen(s: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-014`)** Byte-loop strlen over a NUL-terminated string. Leaf. Duplicated across `HelpBackend` and `VersionBackend` so each module's object has no cross-module link dependency. |
 
 ### version_backend.pdx — `VersionBackend`
 
