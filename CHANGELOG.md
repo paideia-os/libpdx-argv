@@ -6,6 +6,114 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-016 — `PdxArgvParseErrorRecord@0.1` structured error emission (Closes #26)
+
+First OUTPUT wire schema this library declares. `SchemaEmit` gains
+one new entry point, `emit_parse_error(buf, buflen, argv_ptr)`,
+that serialises a single 32-byte-header record (plus verbatim
+token bytes, padded to 8) into a caller-supplied buffer whenever
+`ParsedArgs::error_code` is nonzero. New `.rodata`-only module
+`ParseErrorRecord` (`src/parse_error_record.pdx`) owns the wire
+constants: magic `"PDXAPERR"` (8 ASCII bytes, no NUL), version
+qword `1`, fixed header size `32`, token offset `32`, and the
+28-byte schema-name string `"PdxArgvParseErrorRecord@0.1\0"` a
+consumer publishes via `SchemaEmit::schema_emit_register` at
+bootstrap. `caps.decl` flips `declares_output_schemas:` from
+`(none)` to a one-line block naming the record.
+
+Wire layout (v1). All fields little-endian; header exact 32
+bytes; tail zero-padded to 8-byte alignment so a consumer
+streaming multiple records back-to-back never re-aligns.
+
+  | Offset | Size | Field       |
+  | --- | --- | --- |
+  |  0 | 8 | magic `"PDXAPERR"` |
+  |  8 | 8 | version = 1        |
+  | 16 | 4 | err_code (u32; `ParsedArgs::ERR_*` code) |
+  | 20 | 4 | argv_index (u32; `ParsedArgs::error_arg_index`) |
+  | 24 | 4 | token_len (u32) |
+  | 28 | 4 | token_off (u32; always 32 in v1) |
+  | 32 | token_len | token bytes (no NUL) |
+  | next | 0..7 | zero padding |
+
+Total = `((32 + token_len + 7)/8)*8` bytes.
+
+API decisions:
+
+  - **Three arguments, not two.** The naïve `(buf, buflen)`
+    shape would require a new `ParsedArgs::error_token_ptr` slot
+    with a stash pass inside `parse_argv_fail`. Passing
+    `argv_ptr` as the third argument lets `emit_parse_error`
+    derive the token via `argv[error_arg_index]` at emit time
+    with zero parser change, and lets a SchemaInvoke-path caller
+    (which has no argv) pass `argv_ptr = 0` to get a header-only
+    record with `token_len = 0`.
+  - **Atomic per invocation.** `buflen < padded` returns `0`
+    without writing any bytes. No partial writes; the caller
+    reserves a scratch buffer sized for its longest plausible
+    argv slot (128 bytes covers every I3 flag spelling with room
+    to grow — the longest today is `--no-cap:KIND_IPC_ENDPOINT`
+    at 25 bytes).
+  - **`token_off` is an explicit field, not an implicit constant.**
+    Always 32 in v1; emitted so a v2 header extension can grow
+    past 32 bytes without a wire re-cut. A v1 reader that finds
+    `token_off != 32` refuses the record.
+  - **No `flag_id` or `reserved` slots.** The issue draft
+    included both; both dropped. `flag_id` would be 0 in the
+    only ERR_* that would carry a meaningful one today
+    (`ERR_UNKNOWN_FLAG`, whose FKIND_UNKNOWN sentinel id IS 0);
+    consumers wanting it look it up themselves via
+    `FlagSpec::lookup(argv[error_arg_index])`. `reserved` is
+    what `token_off` guards against — a v2 with real content
+    for those bytes fits a purpose-built field better than
+    preallocated space.
+
+Fingerprint (issue #26, verified by `tests/schema_emit.pdx`
+run_case6): after
+`FlagSpec::set_strict(1); parse_argv(["tool","--zog"], 2)` sets
+`error_code = 12` (`ERR_UNKNOWN_FLAG` per parsed_args.pdx),
+`emit_parse_error(&buf, 128, &argv)` returns `40` and writes a
+record whose header carries magic `"PDXAPERR"` (bytes 0x50 0x44
+0x58 0x41 0x50 0x45 0x52 0x52 at buf[0..8]), version `1`,
+`err_code = 12`, `argv_index = 1`, `token_len = 5`,
+`token_off = 32`, and the five bytes of `"--zog"` at
+buf[32..37], with three zero-pad bytes at buf[37..40].
+
+Files touched:
+
+  - `src/parse_error_record.pdx` — NEW; `.rodata`-only module with
+     `PERR_MAGIC_BYTES` / `PERR_VERSION_V1` / `PERR_HEADER_SIZE` /
+     `PERR_TOKEN_OFFSET` / `PERR_SCHEMA_NAME_V01`.
+  - `src/schema_emit.pdx` — adds `emit_parse_error` (leaf; no
+     push/pop, no callee-save touched, inline strlen for the
+     token length). Module preamble extended with the ENH-016
+     compliance notes (mov_d for u32 stores, mov_b for the token
+     copy loop, `add 7; shr 3; shl 3` for align-up rather than
+     `and reg,imm64`).
+  - `tests/schema_emit_tests.pdx` — new `run_case6` verifying the
+     fingerprint byte-by-byte (magic, version qword, four u32
+     fields via mov_d, five token bytes, three pad bytes).
+  - `tests/smoke_driver.pdx` — dispatches `SchemaEmitTests::run_case6`
+     after case5.
+  - `doc/libpdx-argv.pdxdoc` — new `.section OUTPUT SCHEMAS`
+     ahead of `CROSS-REFERENCES` documenting the wire form,
+     semantics, bounds discipline, and consumer wiring.
+  - `caps.decl` — `declares_output_schemas:` flipped from
+     `(none)` to a one-line block naming
+     `PdxArgvParseErrorRecord@0.1`; preamble notes the same-
+     silent-write-policy carve-out that ENH-014/ENH-032 use.
+  - `design/architecture.md` — new §15 covering wire form,
+     module surface delta, the three-argument rationale,
+     `token_off` as an explicit field, and the "explicitly does
+     not do" list.
+  - `README.md` — SchemaEmit table gains the `emit_parse_error`
+     row; a new `parse_error_record.pdx` subsection documents
+     the constants; the "Wire schema" section is renamed to
+     "Wire schema (input only, plus one output record)" and
+     the output layout is spelled out.
+
+Klog tag: `pdxargv.err-emit`.
+
 ### ENH-014 — Auto `--help` table generated lazily from ArgSpec (Closes #24)
 
 `FlagSpec` gains a new per-slot array `spec_help : [u64; 32]` — a

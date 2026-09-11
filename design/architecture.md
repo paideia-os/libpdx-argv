@@ -1228,3 +1228,134 @@ table matches source order in the tool's bootstrap.
   of its own. Consumers that lack a KIND_TTY / KIND_IPC_ENDPOINT
   cap on fd 1 see the syscalls fail with EBADF and this function
   returns anyway — same silent-write policy `emit_default` uses.
+
+## 15. Structured error emission (ENH-016, Closes #26)
+
+Before this ENH, a parse failure surfaced only as the scalar
+`ParsedArgs::error_code` plus `error_arg_index`; the semantic-pipe
+path had nothing to hand back to an auditor or a peer tool that
+wanted machine-readable diagnostics. ENH-016 lands the first
+OUTPUT wire schema this library declares — `PdxArgvParseErrorRecord@0.1`
+— and a single new entry point (`SchemaEmit::emit_parse_error`)
+that writes one such record into a caller-supplied buffer.
+
+### 15.1 Wire form (v1)
+
+The record is intentionally tiny (32-byte header + token bytes,
+padded to 8 bytes) so a consumer can copy it into an audit
+frame or a KIND_IPC_ENDPOINT write without a scratch allocator.
+
+|  Offset | Size | Field       | Meaning                            |
+|---------|------|-------------|------------------------------------|
+|   0     | 8    | magic       | `"PDXAPERR"` ASCII (no NUL)        |
+|   8     | 8    | version     | u64 LE; must equal 1               |
+|  16     | 4    | err_code    | u32 LE; `ParsedArgs::ERR_*` code   |
+|  20     | 4    | argv_index  | u32 LE; `ParsedArgs::error_arg_index` |
+|  24     | 4    | token_len   | u32 LE; token bytes to follow      |
+|  28     | 4    | token_off   | u32 LE; always 32 in v1            |
+|  32     | token_len | token   | verbatim argv-slot bytes, no NUL   |
+| next    | 0..7 | padding     | zeros to the next 8-byte boundary  |
+
+Total record = `((32 + token_len + 7) / 8) * 8` bytes.
+
+The wire magic `"PDXAPERR"` sits alongside the sister magics in
+this project's wire ecosystem — `PDXARGV\0` (input schema on the
+SchemaInvoke path), `PDXAUDIT`, `PDXB` / `PDXL` / `PDXV` (volume
+schemas). Eight ASCII characters, no NUL: five body characters
+(`APERR` — argv-parse-error) after the mandatory `PDX` trigram.
+The magic is stored as a `[u8; 8]` .rodata literal
+(`ParseErrorRecord::PERR_MAGIC_BYTES`) and copied into the record
+with one `mov rax, [rip + PERR_MAGIC_BYTES]; mov [buf], rax`
+pair, mirroring how `HelpBackend::LIT_DDASH` and
+`VersionBackend::LIT_NEWLINE` are loaded cross-module.
+
+### 15.2 Module surface delta
+
+New file: `src/parse_error_record.pdx`. Module `ParseErrorRecord`
+holds only `.rodata`:
+
+  - `PERR_HEADER_SIZE   : u64      = 32`
+  - `PERR_VERSION_V1    : u64      = 1`
+  - `PERR_TOKEN_OFFSET  : u64      = 32`
+  - `PERR_MAGIC_BYTES   : [u8; 8]  = "PDXAPERR"`
+  - `PERR_SCHEMA_NAME_V01 : [u8; 28] = "PdxArgvParseErrorRecord@0.1\0"`
+
+New in `SchemaEmit`:
+
+  - `emit_parse_error(buf, buflen, argv_ptr) -> u64` — leaf,
+    all caller-save. Reads `error_code` + `error_arg_index` from
+    ParsedArgs; if `error_code == 0` or `buf == 0`, returns 0
+    without writing. If `argv_ptr != 0`, derives
+    `token_ptr = argv[error_arg_index]` and byte-loops for its
+    NUL-terminated length (inlined strlen rather than a
+    cross-module call so linking `schema_emit.o` alone still
+    resolves). Computes `padded = ((32 + token_len + 7)/8)*8`;
+    if `buflen < padded`, returns 0 (no partial write). On
+    success writes the 32-byte header (magic qword,
+    version qword, four u32 fields via `mov_d`), then copies
+    `token_len` bytes into the token region, then zero-fills the
+    trailing padding. Returns `padded` in `rax`.
+
+### 15.3 Why a third argument (`argv_ptr`)
+
+The naïve two-argument shape `(buf, buflen)` would require
+either a new `ParsedArgs` slot (`error_token_ptr` + a stash pass
+inside `parse_argv_fail`) or a global stash — both widen the
+parser's write surface for a single-caller value that argv
+already carries in the caller's own frame. Passing `argv_ptr`
+lets the emitter derive the token via
+`argv[error_arg_index]` at emit time with zero parser change,
+and it also lets a caller on the SchemaInvoke path (which has
+no argv) pass 0 to get a header-only record with
+`token_len = 0`. The read is bounded by `error_arg_index` which
+the parser already gated against the caller's `argc` — a
+consumer that emits from a stale ParsedArgs pointing at a freed
+argv gets the same UAF it would from any `flag_names[k]` read;
+this is the ambient contract for every pointer this library
+stores into ParsedArgs.
+
+### 15.4 token_off = 32 as an explicit field
+
+`token_off` at record offset 28 is always 32 in v1 — the
+existing header ends at that offset with no gaps. Emitting it
+as an explicit field rather than a magic constant lets a future
+v2 grow the header without a wire re-cut: a v2 reader that
+finds `token_off > 32` follows the field verbatim; a v1 reader
+that finds `token_off != 32` refuses the record. This mirrors
+the SchemaInvoke input path's own `header_size` gate at
+`ERR_SCHEMA_BAD_LAYOUT`.
+
+### 15.5 What ENH-016 explicitly does not do
+
+- No `flag_id` field in the record. The draft layout in the
+  issue text included one; it was dropped because the only
+  ERR_* that carries a meaningful flag id today is
+  `ERR_UNKNOWN_FLAG`, and in that case the id is 0 by
+  construction (FlagSpec::lookup returned FKIND_UNKNOWN, whose
+  id sentinel is 0). Consumers wanting the flag id look it up
+  themselves via `FlagSpec::lookup(argv[error_arg_index])`; a
+  v2 that stores the id inline can grow the header (see §15.4).
+- No `reserved` slot. Same rationale as `flag_id` — reserved
+  bytes are what `token_off` guards against, so preallocating
+  them here is speculative wire real estate that a v2 could
+  use better with a purpose-fit field.
+- No auto-emit. Unlike `--version` (ENH-032) or `--help`
+  (ENH-014) which fire inside `parse_argv` when a well-known
+  flag is seen, `emit_parse_error` is opt-in: the consumer's
+  own `if err != ERR_OK` branch chooses whether to invoke it.
+  Reason: emit_parse_error has no capability of its own to
+  write the record anywhere (libpdx-argv holds no fd cap), so
+  auto-emitting would produce bytes with nowhere to go.
+- No `sys_write` call inside the library. The emitter fills a
+  caller-owned buffer; the caller does the transport. Same
+  cap posture as `SchemaEmit::get_name` / `get_count`.
+- No support for repeated failures. The record captures one
+  parse call's outcome. A tool that wants to log every parse
+  it did across a long-running session invokes emit_parse_error
+  after each `parse_argv` and streams the records itself; the
+  library retains nothing across calls.
+- No wire-format `PdxArgvParsed@0.1` companion. ENH-003
+  withdrew that schema in 2026-08-25; the successful-parse
+  wire form remains "callers read `ParsedArgs` in-process".
+  A future ENH may add a success-side output schema; ENH-016
+  is deliberately failure-only.

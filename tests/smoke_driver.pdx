@@ -171,6 +171,8 @@ module SmokeDriver = structure {
         call SchemaEmitTests::run_case3;
         call SchemaEmitTests::run_case4;
         call SchemaEmitTests::run_case5;
+        // libpdx-argv.ENH-016 (Closes #26): emit_parse_error fingerprint.
+        call SchemaEmitTests::run_case6;
 
         // Pack tally: (pass << 16) | fail
         lea r11, [rip + pass_count];

@@ -1,0 +1,151 @@
+// src/parse_error_record.pdx — libpdx-argv.ENH-016 (Closes #26)
+// ParseErrorRecord: wire-form constants + magic / layout for the
+// PdxArgvParseErrorRecord@0.1 output schema.
+//
+// This module owns nothing but immutable .rodata: the 8-byte magic
+// tag, the version qword, the fixed header size, and the token-off
+// invariant. SchemaEmit::emit_parse_error (src/schema_emit.pdx)
+// reads these constants to produce a single record into a caller-
+// supplied buffer on any parse_argv failure. The record is the only
+// OUTPUT schema this library declares (see caps.decl); every other
+// wire form libpdx-argv touches is INPUT (PdxArgvRecord@0.1 on the
+// SchemaInvoke path).
+//
+// Wire form (v1). All fields little-endian; header is exactly 32
+// bytes; token bytes follow at offset 32 with no separator; the
+// caller's buffer is written padded to an 8-byte-aligned tail so a
+// consumer that streams multiple records back-to-back never has to
+// re-align. The two "reserved" u32 slots the ENH proposal draft
+// carried (flag_id, reserved) are NOT part of this schema: the
+// fingerprint case (`err_code=ERR_UNKNOWN_FLAG on ["tool","--zog"]`)
+// pins the header at 32 bytes and the token at offset 32, so those
+// two slots would push the token to offset 40 and break the pin.
+// Consumers wanting the offending flag's id look it up themselves
+// via `FlagSpec::lookup(argv[error_arg_index])` (the field is 0 in
+// the unknown-flag case anyway — that is the whole reason the
+// lookup returned FKIND_UNKNOWN).
+//
+//   offset  size  field       meaning
+//   ------  ----  ----------  ------------------------------------
+//   0       8     magic       "PDXAPERR" ASCII (bytes 'P','D','X',
+//                             'A','P','E','R','R' at offsets 0..7,
+//                             i.e. u64 LE = 0x5252455041584450 —
+//                             the constant is stored as [u8;8] so
+//                             a hex dump reads left-to-right)
+//   8       8     version     u64; must equal PERR_VERSION_V1 = 1
+//   16      4     err_code    u32; the ParsedArgs::ERR_* code (1..15)
+//                             — u32 truncation is safe because every
+//                             ERR_* value fits in a byte today (max 15)
+//                             and the reserved space up to u32 covers
+//                             any post-1.2 additions well beyond the
+//                             foreseeable code space
+//   20      4     argv_index  u32; ParsedArgs::error_arg_index — the
+//                             offending argv slot on the argv path,
+//                             or the flag/pos loop index on the
+//                             SchemaInvoke path (0 for header
+//                             failures on either path)
+//   24      4     token_len   u32; length of the token bytes that
+//                             follow, EXCLUDING any NUL terminator
+//                             the source argv slot carried
+//   28      4     token_off   u32; always 32 in v1 (offset of the
+//                             token region within the record). Made
+//                             an explicit field rather than an
+//                             implicit constant so v2 can grow the
+//                             header without a wire re-cut — the
+//                             field's presence tells a v1 reader
+//                             where the token starts even if v2
+//                             adds new pre-token slots
+//   32      -     token       token_len bytes of the offending argv
+//                             slot's text (no NUL terminator; the
+//                             record does not require the source
+//                             token to be NUL-terminated in argv,
+//                             but SchemaEmit's argv-slot strlen
+//                             pass does assume it — see
+//                             emit_parse_error's docstring)
+//   next    0..7  padding     zero bytes to bring the total record
+//                             size up to the next multiple of 8
+//                             (SchemaEmit writes these explicitly)
+//
+// Total record size = ((32 + token_len + 7) / 8) * 8 bytes.
+//
+// Magic encoding rationale. The 8 ASCII bytes "PDXAPERR" are stored
+// as a byte array (not as an imm64 constant) so:
+//   1. A hex dump of the buffer reads left-to-right as 50 44 58 41
+//      50 45 52 52 — the same visual grep a wire-inspecting operator
+//      already uses for the sister magic "PDXARGV\0" on the input
+//      schema and the volume magics PDXB / PDXL / PDXV.
+//   2. SchemaEmit copies the whole 8-byte magic with one `mov rax,
+//      [rip + PERR_MAGIC_BYTES]; mov [buf], rax` pair rather than
+//      staging an imm64 into a register via MOVABS. This mirrors
+//      how VersionBackend::LIT_NEWLINE and libpdx-audit's magic
+//      bytes are loaded.
+//   3. The paideia-as constraint on `and reg,imm64` targeting
+//      r8-r15 is irrelevant here (rax carries the magic) but the
+//      byte-array approach also side-steps any future encoder
+//      constraint on 64-bit immediates in similar mnemonics.
+//
+// Choice of "PDXAPERR" vs "PDXAERR\0". Sister magics in this
+// project's wire ecosystem all use a leading "PDX" trigram plus a
+// 4- or 5-letter body (PDXARGV, PDXB, PDXL, PDXV, PDXAUDIT). Eight
+// characters is the ceiling because the magic slot is exactly u64.
+// "PDXAPERR" fits eight without a NUL: five body characters
+// ("APERR" — argv-parse-error) after the trigram. Dropping the
+// leading 'A' to fit "PDXPERR\0" would break the audit convention
+// of a NUL-free magic (compare to "PDXARGV\0" which uses a NUL
+// only because "PDXARGV" is exactly 7). Adopting "PDXAPERR" keeps
+// this schema aligned with the NUL-free variants (PDXAUDIT, PDXB,
+// PDXL, PDXV) which is the majority.
+//
+// See design/architecture.md §15 for the OUTPUT-schema rationale
+// (why this library declares one at all after ENH-003 withdrew
+// PdxArgvParsed@0.1).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ParseErrorRecord (PascalCase basename).
+//   - No fn definitions: pure .rodata module. No push/pop, no
+//     register plan, no test-mnemonic surface.
+//   - PERR_MAGIC_BYTES is [u8;8] (byte-array literal) so no imm64
+//     handling ever comes into play.
+//   - PERR_SCHEMA_NAME_V01 is the NUL-terminated schema-name string
+//     the tool publishes via SchemaEmit::schema_emit_register (I3
+//     --schema surface). Length 28 = 27 chars + 1 NUL: 23 for
+//     "PdxArgvParseErrorRecord", 4 for "@0.1".
+
+module ParseErrorRecord = structure {
+
+  // ============================================================
+  // Wire-form constants — do NOT tune without a coordinated bump
+  // in the schema fingerprint on the consumer side.
+  // ============================================================
+
+  // Fixed 32-byte header size. Every conformant reader may assume
+  // token_off >= this value; a future v2 with a larger header
+  // publishes the new size in this field rather than baking 32 in
+  // as a magic constant on the wire.
+  pub let PERR_HEADER_SIZE   : u64 = 32
+
+  // Version qword the header carries at offset 8. A v2 reader
+  // that finds `1` here falls back to the v1 layout; a v1 reader
+  // that finds anything but `1` refuses the record (mirrors the
+  // SchemaInvoke::SCHEMA_VERSION_V1 policy on the input side).
+  pub let PERR_VERSION_V1    : u64 = 1
+
+  // Token region offset in v1. Emitted verbatim into the
+  // token_off header slot at offset 28; also used by SchemaEmit
+  // as the destination cursor for the token byte copy loop.
+  pub let PERR_TOKEN_OFFSET  : u64 = 32
+
+  // Magic bytes — 8 ASCII characters, no NUL. See module preamble
+  // for the encoding rationale. Copied into the buffer with one
+  // qword move by SchemaEmit::emit_parse_error.
+  pub let PERR_MAGIC_BYTES   : [u8; 8]  = "PDXAPERR"
+
+  // Schema name published on `--schema` output. The tool
+  // registers this pointer via SchemaEmit::schema_emit_register
+  // at bootstrap so `--schema` lists it alongside its other
+  // declared output schemas. Length is 28 bytes: 27 chars +
+  // trailing NUL for the byte-loop print convention every
+  // --schema consumer follows (see SchemaEmit module preamble).
+  pub let PERR_SCHEMA_NAME_V01 : [u8; 28] = "PdxArgvParseErrorRecord@0.1\0"
+}

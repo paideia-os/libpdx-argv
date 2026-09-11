@@ -231,18 +231,57 @@ stdout (no caps), so the actual printing is the consumer's job.
 | `schema_emit_register(schema_name_ptr: u64) -> () !{mem} @{}` | Append one NUL-terminated schema-name pointer; silently drops past `SCHEMA_MAX`. **(Renamed from `register` in `libpdx-argv.ENH-030`, v1.1.0.)** |
 | `get_count() -> u64 !{mem} @{}` | Number of registered names. |
 | `get_name(idx: u64) -> u64 !{mem} @{}` | Pointer to `schema_names[idx]`, or `0` if out of range. |
+| `emit_parse_error(buf: u64, buflen: u64, argv_ptr: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-016`, Closes #26)** Serialise one `PdxArgvParseErrorRecord@0.1` into a caller-supplied byte buffer on any parse failure. Reads `error_code` + `error_arg_index` from `ParsedArgs` and (given nonzero `argv_ptr`) `argv[error_arg_index]` as the offending token. Returns bytes written (the padded record size = `((32 + token_len + 7) / 8) * 8`), or `0` on `error_code == 0`, `buf == 0`, or `buflen < padded` (no partial writes — the record is atomic per invocation). |
 
-## Wire schema (input only)
+### parse_error_record.pdx — `ParseErrorRecord`
 
-`caps.decl` declares no output schema (`declares_output_schemas: (none)`).
-**`libpdx-argv.ENH-003` (2026-08-25):** the 1.0 release declared a second
-schema, `PdxArgvParsed@0.1` (a structured mirror of `ParsedArgs`,
+Wire-form constants for the `PdxArgvParseErrorRecord@0.1` output
+schema (see [Wire schema](#wire-schema-input-only-plus-one-output-record)
+below for the on-wire layout). Pure `.rodata` — no functions, no
+state.
+
+| Symbol | Type | Meaning |
+| --- | --- | --- |
+| `PERR_HEADER_SIZE` | `u64 = 32` | Fixed header size; every conformant reader may assume `token_off >= 32`. |
+| `PERR_VERSION_V1` | `u64 = 1` | Version qword the header carries at offset 8. |
+| `PERR_TOKEN_OFFSET` | `u64 = 32` | Token region offset within the record; also emitted verbatim into the `token_off` header slot. |
+| `PERR_MAGIC_BYTES` | `[u8; 8] = "PDXAPERR"` | 8 ASCII bytes, no NUL. Copied into the record with one qword move. |
+| `PERR_SCHEMA_NAME_V01` | `[u8; 28] = "PdxArgvParseErrorRecord@0.1\0"` | Schema name a consumer publishes via `SchemaEmit::schema_emit_register` at bootstrap. |
+
+## Wire schema (input only, plus one output record)
+
+`caps.decl` declares one output schema (`declares_output_schemas:
+- PdxArgvParseErrorRecord@0.1`, `libpdx-argv.ENH-016`, Closes #26).
+`SchemaEmit::emit_parse_error` writes one record into a caller-supplied
+buffer whenever `ParsedArgs::error_code` is nonzero. The record is
+best-effort: it does not spawn a syscall, does not acquire any
+capability, and produces zero bytes rather than a partial record on a
+too-small buffer.
+
+- **`PdxArgvParseErrorRecord@0.1`** — the ENH-016 output wire form
+  written by `SchemaEmit::emit_parse_error`. v1 layout:
+
+  | Offset | Size | Field |
+  | --- | --- | --- |
+  |  0 | 8 | magic `"PDXAPERR"` (no NUL) |
+  |  8 | 8 | version (u64 LE; must be 1) |
+  | 16 | 4 | `err_code`   (u32 LE; `ParsedArgs::ERR_*` code) |
+  | 20 | 4 | `argv_index` (u32 LE; `ParsedArgs::error_arg_index`) |
+  | 24 | 4 | `token_len`  (u32 LE; token bytes to follow, excluding NUL) |
+  | 28 | 4 | `token_off`  (u32 LE; always 32 in v1) |
+  | 32 | `token_len` | token bytes (verbatim argv-slot text, no NUL) |
+  | next | 0..7 | zero padding to the next 8-byte boundary |
+
+  Total = `((32 + token_len + 7) / 8) * 8` bytes.
+
+**`libpdx-argv.ENH-003` (2026-08-25):** the 1.0 release declared a
+second schema, `PdxArgvParsed@0.1` (a structured mirror of `ParsedArgs`,
 supposedly emitted when a consumer opts into `--pdx-schema`), that never
 had a producer anywhere in `src/` — `--pdx-schema` only ever set the
 `emit_schema` bit. Withdrawn rather than implemented; no known consumer
 depended on it. See `CHANGELOG.md`'s dated correction on the 1.0 entry.
 
-The one wire schema this library actually touches is an **input**, not
+The one wire schema this library actually READS is an **input**, not
 an output — read by `SchemaInvoke::parse_from_schema_record`, never
 produced by anything here:
 

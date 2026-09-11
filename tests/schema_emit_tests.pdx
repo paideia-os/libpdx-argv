@@ -1,21 +1,34 @@
-// tests/schema_emit.pdx — libpdx-argv.M4-001
-// SchemaEmit register/get/reset + SCHEMA_MAX cap.
+// tests/schema_emit.pdx — libpdx-argv.M4-001 + ENH-016
+// SchemaEmit register/get/reset + SCHEMA_MAX cap + emit_parse_error.
 //
 // M3-003 landed a 4-call storage-only table for `--schema` emission.
-// These tests exercise the table lifecycle:
+// ENH-016 (#26) added a fifth entry point that serialises one
+// PdxArgvParseErrorRecord@0.1 into a caller-supplied buffer on parse
+// failure. These tests exercise both surfaces:
 //   1. Empty after reset → count=0, get_name(0)=0.
 //   2. Register then read: count=2, get_name(0)=A, get_name(1)=B.
 //   3. Over-registration silently drops past SCHEMA_MAX=8.
 //   4. get_name out-of-range returns 0.
 //   5. reset() re-zeros count, forgets prior registrations.
+//   6. emit_parse_error (ENH-016 fingerprint): after a strict-mode
+//      `parse_argv(["tool","--zog"], 2)` sets ERR_UNKNOWN_FLAG,
+//      emit_parse_error(&buf, 128, &argv) writes a 40-byte record
+//      whose magic is "PDXAPERR", version 1, err_code=12
+//      (ERR_UNKNOWN_FLAG per parsed_args.pdx), argv_index=1,
+//      token_len=5, token_off=32, token bytes "--zog" at offset 32,
+//      3 zero-pad bytes at offsets 37..39.
 //
 // Module id in TestHarness::last_fail_tag: 8
 //
 // paideia-as compliance
 // ---------------------
 //   - Module SchemaEmitTests (PascalCase basename).
-//   - run_* fns non-leaf; 1-push (rbx) prologue.
+//   - run_* fns non-leaf; 1-push (rbx) prologue (case6 uses 2 pushes
+//     + sub rsp, 8 to align rsp%16 to 0 across five nested calls:
+//     full_reset, register_all, set_strict, parse_argv, emit_parse_error).
 //   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - u32 field checks in case6 use `mov_d rax, [addr]` for the
+//     zero-extended 32-bit load (mkfs.pdxfs.mkfs_refuse_check idiom).
 
 module SchemaEmitTests = structure {
 
@@ -220,6 +233,139 @@ module SchemaEmitTests = structure {
       se5_fail:
         mov rdi, 0x800000005;
         call record_fail;
+        pop r15; pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // ENH-016 (Closes #26) fingerprint fixtures.
+  //
+  // se6_arg_tool and se6_arg_zog are the two NUL-terminated argv
+  // slots ("tool", "--zog"); se6_argv is the [u64; 2] table that
+  // parse_argv reads (populated inline by run_case6 to keep
+  // fixtures self-contained rather than relying on link-time layout
+  // for the slot order). se6_buf is the 128-byte scratch that
+  // emit_parse_error writes into — sized generously past the 40-byte
+  // padded record so the "buflen too small" path stays untested
+  // here (that path is a follow-on case7 candidate rather than
+  // essential to the fingerprint).
+  // ============================================================
+  pub let se6_arg_tool : [u8; 5] = "tool\0"
+  pub let se6_arg_zog  : [u8; 6] = "--zog\0"
+  pub let mut se6_argv : [u64; 2] = uninit @align(8)
+  pub let mut se6_buf  : [u8; 128] = uninit @align(8)
+
+  // ============================================================
+  // case6  ENH-016 fingerprint: strict-mode unknown flag →
+  //   emit_parse_error writes a 40-byte record.
+  //
+  // Sequence (mirrors the ENH-016 issue text):
+  //   1. full_reset + register_all + set_strict(1)
+  //   2. argv = ["tool", "--zog"]  (2 slots)
+  //   3. parse_argv returns 12 (ERR_UNKNOWN_FLAG per parsed_args.pdx)
+  //   4. emit_parse_error(&buf, 128, &argv) returns 40 (padded size:
+  //      32-byte header + 5-byte token, rounded up to 8)
+  //   5. Byte-by-byte verify: magic "PDXAPERR" (8 bytes), version=1,
+  //      err_code=12, argv_index=1, token_len=5, token_off=32,
+  //      token bytes "--zog" at offset 32.
+  //
+  // Uses 2-push (rbx, r15) + sub rsp, 8 prologue = 3 stack slots
+  // after ret addr → rsp%16 = 0 across the five nested calls.
+  // ============================================================
+  pub let run_case6 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-016 (Closes #26) SchemaEmit case6 — end-to-end fingerprint: strict-mode parse_argv on ['tool','--zog'] sets ERR_UNKNOWN_FLAG (12) + error_arg_index=1; emit_parse_error then writes a 40-byte PdxArgvParseErrorRecord@0.1 (32-byte header + 5-byte '--zog' token, padded to 8-byte alignment). Verifies every header field individually: magic byte-by-byte (8 x mov_b compare against 'P','D','X','A','P','E','R','R'), version qword-load, and the four u32 fields via mov_d zero-extended loads (err_code=12, argv_index=1, token_len=5, token_off=32), then the five token bytes at buf[32..37] via mov_b compares against '-','-','z','o','g'. Uses 2 pushes (rbx=buf-base after lea, r15=unused-alignment-anchor) + sub rsp, 8 to keep rsp%16=0 across five nested calls (full_reset, register_all, set_strict, parse_argv, emit_parse_error). Every immediate compare fits ≤0x7FFFFFFF (max: 128 for buflen, 40 for the return value, 0x7A for 'z'). No test mnemonic; every zero-check is cmp reg,0. Reserved-label discipline: labels prefixed se6_.",
+      block: {
+        push rbx;
+        push r15;
+        sub rsp, 8;
+
+        call full_reset;
+        call register_all;
+
+        // Enable strict mode so an unregistered flag fails rather
+        // than storing as boolean.
+        mov rdi, 1;
+        call set_strict;
+
+        // Populate se6_argv with ("tool", "--zog"). Both slots are
+        // NUL-terminated .rodata literals in this module — parser
+        // stores their pointers verbatim into ParsedArgs on the
+        // permissive path; on the strict fail path, no store
+        // happens but error_arg_index still records the offending
+        // slot's index (1 = "--zog").
+        lea rbx, [rip + se6_argv];
+        lea r11, [rip + se6_arg_tool]; mov [rbx + 0], r11;
+        lea r11, [rip + se6_arg_zog];  mov [rbx + 8], r11;
+
+        // parse_argv(&se6_argv, 2)
+        lea rdi, [rip + se6_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 12; jne se6_fail;              // ERR_UNKNOWN_FLAG
+
+        // emit_parse_error(&se6_buf, 128, &se6_argv)
+        lea rdi, [rip + se6_buf];
+        mov rsi, 128;
+        lea rdx, [rip + se6_argv];
+        call emit_parse_error;
+        cmp rax, 40; jne se6_fail;              // 32 header + 5 token, padded to 8
+
+        // ---- Verify header + token layout --------------------------
+        // Base pointer to the record in rbx for the rest of the run.
+        lea rbx, [rip + se6_buf];
+
+        // magic "PDXAPERR" at buf[0..8]
+        xor rax, rax; mov_b rax, [rbx + 0]; cmp rax, 0x50; jne se6_fail;  // 'P'
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x44; jne se6_fail;  // 'D'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x58; jne se6_fail;  // 'X'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x41; jne se6_fail;  // 'A'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0x50; jne se6_fail;  // 'P'
+        xor rax, rax; mov_b rax, [rbx + 5]; cmp rax, 0x45; jne se6_fail;  // 'E'
+        xor rax, rax; mov_b rax, [rbx + 6]; cmp rax, 0x52; jne se6_fail;  // 'R'
+        xor rax, rax; mov_b rax, [rbx + 7]; cmp rax, 0x52; jne se6_fail;  // 'R'
+
+        // version (u64) at buf[8..16] == 1
+        mov rax, [rbx + 8];
+        cmp rax, 1; jne se6_fail;
+
+        // err_code (u32) at buf[16..20] == 12 (ERR_UNKNOWN_FLAG)
+        mov_d rax, [rbx + 16];
+        cmp rax, 12; jne se6_fail;
+
+        // argv_index (u32) at buf[20..24] == 1
+        mov_d rax, [rbx + 20];
+        cmp rax, 1; jne se6_fail;
+
+        // token_len (u32) at buf[24..28] == 5
+        mov_d rax, [rbx + 24];
+        cmp rax, 5; jne se6_fail;
+
+        // token_off (u32) at buf[28..32] == 32
+        mov_d rax, [rbx + 28];
+        cmp rax, 32; jne se6_fail;
+
+        // Token bytes "--zog" at buf[32..37]
+        xor rax, rax; mov_b rax, [rbx + 32]; cmp rax, 0x2D; jne se6_fail;  // '-'
+        xor rax, rax; mov_b rax, [rbx + 33]; cmp rax, 0x2D; jne se6_fail;  // '-'
+        xor rax, rax; mov_b rax, [rbx + 34]; cmp rax, 0x7A; jne se6_fail;  // 'z'
+        xor rax, rax; mov_b rax, [rbx + 35]; cmp rax, 0x6F; jne se6_fail;  // 'o'
+        xor rax, rax; mov_b rax, [rbx + 36]; cmp rax, 0x67; jne se6_fail;  // 'g'
+
+        // Zero-pad bytes at buf[37..40] (3 bytes tail).
+        xor rax, rax; mov_b rax, [rbx + 37]; cmp rax, 0; jne se6_fail;
+        xor rax, rax; mov_b rax, [rbx + 38]; cmp rax, 0; jne se6_fail;
+        xor rax, rax; mov_b rax, [rbx + 39]; cmp rax, 0; jne se6_fail;
+
+        call record_pass;
+        add rsp, 8;
+        pop r15; pop rbx; ret;
+
+      se6_fail:
+        mov rdi, 0x800000006;
+        call record_fail;
+        add rsp, 8;
         pop r15; pop rbx; ret;
       }
     }

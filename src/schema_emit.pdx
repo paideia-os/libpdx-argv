@@ -54,14 +54,32 @@
 // split rationale.
 // Upstream: design/tooling/r49-r50-plan.md §5.12 M3-003 (paideia-os).
 //
+// libpdx-argv.ENH-016 (Closes #26): SchemaEmit gains a fifth entry
+// point, emit_parse_error, that writes ONE PdxArgvParseErrorRecord@0.1
+// (see src/parse_error_record.pdx for the layout) into a caller-supplied
+// buffer whenever ParsedArgs::error_code is nonzero. The write reads
+// error_code + error_arg_index from the ParsedArgs singleton and, given
+// a nonzero argv pointer, reads argv[error_arg_index] as the offending
+// token (byte-loop strlen for the length). ENH-016 is the first OUTPUT
+// wire schema libpdx-argv declares (after ENH-003 withdrew the never-
+// implemented PdxArgvParsed@0.1); see doc/libpdx-argv.pdxdoc's OUTPUT
+// SCHEMAS section and caps.decl's declares_output_schemas: block.
+//
 // paideia-as compliance
 // ---------------------
 //   - Module SchemaEmit (PascalCase basename).
-//   - All entry points are leaf (no push/pop parity needed).
+//   - All entry points are leaf (no push/pop parity needed) — including
+//     emit_parse_error (byte-loop strlen inlined rather than a call to
+//     a shared strlen helper, avoiding a link dependency on
+//     version_backend / help_backend even though this module already
+//     links alongside them for every real consumer).
 //   - No test mnemonic; every zero-check via cmp reg, 0.
-//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 8 = SCHEMA_MAX).
-//   - r11 is scratch (used only for cross-module .bss lea).
-//   - Byte loads unused (this module stores/reads only pointer qwords).
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 32 = PERR_HEADER_SIZE /
+//     PERR_TOKEN_OFFSET; 8 = SCHEMA_MAX).
+//   - r11 is scratch (used only for cross-module .bss / .rodata lea).
+//   - Byte loads inside emit_parse_error use xor rax,rax; mov_b rax,
+//     [ptr] per #1248 (matches SchemaInvoke::scan_terminated,
+//     VersionBackend::version_strlen, HelpBackend::help_strlen).
 
 module SchemaEmit = structure {
 
@@ -185,6 +203,233 @@ module SchemaEmit = structure {
 
       schema_emit_get_name_oor:
         xor rax, rax;                       // 0 = out of range
+        ret;
+      }
+    }
+
+  // ============================================================
+  // emit_parse_error(buf, buflen, argv_ptr) -> u64        (ENH-016)
+  //
+  // Serialises one PdxArgvParseErrorRecord@0.1 (layout in
+  // src/parse_error_record.pdx) into the caller-supplied buffer.
+  // Reads ParsedArgs::error_code + error_arg_index from the
+  // singleton and, given a nonzero argv pointer, reads
+  // argv[error_arg_index] as the offending token (byte-loop
+  // strlen for the length).
+  //
+  //   rdi (in)  = buf       — caller-owned byte buffer (aligned to
+  //                            the caller's preference; the emit
+  //                            writes bytes exclusively, no aligned
+  //                            qword stores across arbitrary bases)
+  //   rsi (in)  = buflen    — bytes available at buf
+  //   rdx (in)  = argv_ptr  — caller's argv (typically the same
+  //                            pointer they passed to parse_argv).
+  //                            May be 0 — the record is still
+  //                            emitted with token_len = 0 in that
+  //                            case (useful for the SchemaInvoke
+  //                            path where there is no argv to point
+  //                            at; the record's argv_index still
+  //                            carries error_arg_index verbatim,
+  //                            which is a flag/pos loop index on
+  //                            that path)
+  //   rax (out) = bytes written (== padded record size = ((32 +
+  //                            token_len + 7) / 8) * 8), or 0 on
+  //                            any of:
+  //                              - ParsedArgs::error_code == 0 (no
+  //                                error to emit; caller can gate
+  //                                on `if err != ERR_OK { emit }`)
+  //                              - buf == 0
+  //                              - buflen < padded record size
+  //                                (no partial write — the record
+  //                                is atomic per invocation, so a
+  //                                caller that wants a best-effort
+  //                                shorter shape truncates its own
+  //                                buffer size later)
+  //
+  // Bounds discipline. The minimum record size is 32 bytes (header)
+  // + 0 token bytes = 32, and the header itself is always
+  // 8-byte-aligned by construction (four qwords + four u32s). Non-
+  // zero token bytes bring the record up to 32 + token_len bytes;
+  // the tail is zero-padded to the next multiple of 8 so a consumer
+  // streaming multiple records back-to-back never has to
+  // re-align. If buflen < padded, this function writes zero bytes
+  // and returns 0 — no partial writes, ever.
+  //
+  // token_off semantics. The `token_off` u32 field at record offset
+  // 28 is the token region's offset WITHIN THE RECORD (relative to
+  // buf, not argv). It is always 32 in v1 — the field is written
+  // as an explicit slot rather than a constant assumed by the
+  // reader so a v2 header extension can grow past 32 bytes without
+  // a wire re-cut (a v1 reader that finds token_off != 32 refuses
+  // the record; a v2 reader honours whatever offset the header
+  // publishes).
+  //
+  // Register plan (leaf, all caller-save):
+  //   rdi = buf (kept until phase 4 which advances it to
+  //         buf + 32 for the token+pad copy loops)
+  //   rsi = buflen (read once in the size-check compare)
+  //   rdx = argv_ptr (read once to derive token_ptr; then reused
+  //         as scratch for the version/token_off/magic writes)
+  //   rax = padded record size / return value / byte load scratch
+  //   rcx = token_len (result of the strlen loop; then loop bound
+  //         for the token copy loop)
+  //   r8  = error_code (u32) / then loop cursor for the token +
+  //         pad copy loops after phase 3 writes it out
+  //   r9  = error_arg_index (u32) / then padded-size holding reg
+  //         so rax can be clobbered by the byte load in phase 4
+  //   r10 = token_ptr
+  //   r11 = lea scratch for cross-module .bss/.rodata bases
+  // ============================================================
+  pub let emit_parse_error : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (buflen: u64) (argv_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-016 (Closes #26) SchemaEmit::emit_parse_error — writes one PdxArgvParseErrorRecord@0.1 into a caller-supplied buffer. Reads ParsedArgs::error_code + error_arg_index (u64 slots truncated to the u32 wire fields; every ERR_* constant fits in a byte today) and, given nonzero argv_ptr, reads argv[error_arg_index] as the offending token pointer, then byte-loops for its NUL-terminated length. Returns 0 on any of: error_code==0 (nothing to emit), buf==0 (defensive; caller's contract), or buflen < padded record size (no partial writes — the record is atomic per invocation). Padded size = ((32 + token_len + 7)/8)*8; the tail zero-fill is an explicit byte loop so the caller need not pre-zero the buffer. Magic bytes come from ParseErrorRecord::PERR_MAGIC_BYTES ([u8;8] .rodata) and are copied with one `mov rdx,[rip+MAGIC]; mov [rdi+0],rdx` pair rather than a MOVABS imm64 (mirrors HelpBackend::LIT_DDASH/VersionBackend::LIT_NEWLINE cross-module rodata loads). u32 stores use mov_d (paideia-as W32 sized store; see mkfs.pdxfs::mkfs_encrypt_apply_wrap for the same idiom on the encrypted-nonce trailer). Leaf: no CALL, no push/pop, no callee-save touched — the strlen loop is inlined rather than a call to a shared helper so linking emit_parse_error alone (no version_backend / help_backend object) still resolves. paideia-as constraints: no test mnemonic (every zero-check is `cmp reg, 0`); no `and reg,imm64` (align-up done via `add 7; shr 3; shl 3` sequence, not `and rax,-8`); no 2-op `imul r,imm` (no multiplies at all — the u64 index into argv uses the scale-8 addressing mode `[rdx + r9*8]`, which is the ambient scale for pointer arrays throughout this repo). Reserved-label discipline: labels prefixed pdxargv_emit_perr_. `mov_b [rdi + r8], 0` writes the tail-pad zeros directly (immediate-to-memory byte store, same shape as mount.pdxfs.passphrase_wire_wipe). Never faults on a buflen too small — the size gate at phase 2 aborts before any store.",
+      block: {
+        // ---- Phase 0: defensive null-buf guard --------------------
+        cmp rdi, 0;
+        je pdxargv_emit_perr_bufsmall;
+
+        // ---- Phase 1: read parse state ----------------------------
+        //   r8 = error_code  (u64; truncated to u32 wire slot)
+        //   r9 = error_arg_index
+        lea r11, [rip + error_code];
+        mov r8, [r11];
+        cmp r8, 0;                            // ERR_OK — nothing to emit
+        je pdxargv_emit_perr_bufsmall;        // shares the 0-return arm
+
+        lea r11, [rip + error_arg_index];
+        mov r9, [r11];
+
+        // ---- Phase 2a: derive token_ptr from argv[error_arg_index] --
+        //   r10 = token_ptr (0 if argv or slot is 0)
+        //   rcx = token_len  (0 if r10 is 0)
+        xor r10, r10;
+        xor rcx, rcx;
+
+        cmp rdx, 0;
+        je pdxargv_emit_perr_size_check;
+
+        mov r10, [rdx + r9*8];                // argv[argv_index]
+        cmp r10, 0;
+        je pdxargv_emit_perr_size_check;
+
+        // ---- Phase 2b: inline byte-loop strlen(r10) -> rcx --------
+        // Standard xor+mov_b byte load per #1248. Loop bound is the
+        // NUL terminator every argv slot carries; there is no upper
+        // cap here — argv slots are caller-owned and trusted, mirroring
+        // FlagSpec::lookup's byte-by-byte scan of the same pointers.
+      pdxargv_emit_perr_strlen_loop:
+        xor rax, rax; mov_b rax, [r10 + rcx];
+        cmp rax, 0;
+        je pdxargv_emit_perr_strlen_done;
+        add rcx, 1;
+        jmp pdxargv_emit_perr_strlen_loop;
+
+      pdxargv_emit_perr_strlen_done:
+        // rcx = token_len; fall through to size check
+
+      pdxargv_emit_perr_size_check:
+        // padded = ((32 + token_len + 7) / 8) * 8
+        //   rax = 32 + rcx + 7
+        //   shr rax, 3; shl rax, 3   ← clears low 3 bits without
+        //   `and rax, imm64` (which the paideia-as encoder rejects
+        //    on r8..r15 and which we avoid on rax too for uniformity)
+        mov rax, rcx;
+        add rax, 32;
+        add rax, 7;
+        shr rax, 3;
+        shl rax, 3;
+
+        cmp rsi, rax;                         // rsi = buflen (unsigned)
+        jb pdxargv_emit_perr_bufsmall;
+
+        // Preserve padded across phase-4 byte loads (which clobber rax).
+        mov r9, rax;                          // r9 = padded (return value)
+
+        // ---- Phase 3: write header (32 bytes, byte offsets 0..31) --
+        // Every store routes its source through rax so mov_d [dest], rax
+        // is the only sized-store shape used (matches the mkfs.pdxfs
+        // encrypt_apply_wrap / libpdx-volume pdxb_crypto precedent —
+        // every mov_d store site in the wider repo uses rax as the
+        // source, giving the paideia-as encoder its narrowest tested
+        // path). rax is dead here (padded already moved to r9 above).
+
+        // magic (8 bytes) via cross-module .rodata qword load
+        lea r11, [rip + PERR_MAGIC_BYTES];
+        mov rax, [r11];
+        mov [rdi + 0], rax;
+
+        // version (u64) = 1
+        mov rax, 1;
+        mov [rdi + 8], rax;
+
+        // err_code (u32) — stage r8 (error_code) into rax first
+        mov rax, r8;
+        mov_d [rdi + 16], rax;
+
+        // argv_index (u32) — reload from ParsedArgs (r9 was
+        // repurposed to hold `padded` above, so the pre-phase-1 copy
+        // of error_arg_index is gone; the reload is cheaper than a
+        // second callee-save spill would be here).
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        mov_d [rdi + 20], rax;
+
+        // token_len (u32) — rcx still holds the strlen result
+        mov rax, rcx;
+        mov_d [rdi + 24], rax;
+
+        // token_off (u32) = 32
+        mov rax, 32;
+        mov_d [rdi + 28], rax;
+
+        // ---- Phase 4: advance rdi to token region, copy token bytes --
+        // After `add rdi, 32`, rdi points at buf + 32 (the token
+        // region's start per PERR_TOKEN_OFFSET). We use r8 as the
+        // byte cursor from here on (was error_code — already written
+        // out at offset 16 in phase 3, safe to reuse).
+        add rdi, 32;
+        xor r8, r8;                           // r8 = i = 0
+
+      pdxargv_emit_perr_token_loop:
+        cmp r8, rcx;                          // i < token_len ?
+        jae pdxargv_emit_perr_token_done;
+
+        // Copy one byte: [rdi + i] = [r10 + i]
+        // r10 may be 0 iff token_len is 0 (guarded above), so we
+        // never load through a null pointer here.
+        xor rax, rax; mov_b rax, [r10 + r8];
+        mov_b [rdi + r8], rax;
+
+        add r8, 1;
+        jmp pdxargv_emit_perr_token_loop;
+
+      pdxargv_emit_perr_token_done:
+        // ---- Phase 5: zero-pad from (32 + token_len) to padded ----
+        // r8 currently == token_len. Pad bound is (padded - 32);
+        // reuse rax as a scratch limit register (r9 still holds
+        // padded — the return value — so keep it untouched).
+        mov rax, r9;
+        sub rax, 32;                          // rax = bytes to fill in token region
+
+      pdxargv_emit_perr_pad_loop:
+        cmp r8, rax;
+        jae pdxargv_emit_perr_done;
+
+        // Immediate-to-memory byte store — mount.pdxfs.passphrase_wire_wipe
+        // idiom. Never bytes read here, only a plain 0 write.
+        mov_b [rdi + r8], 0;
+        add r8, 1;
+        jmp pdxargv_emit_perr_pad_loop;
+
+      pdxargv_emit_perr_done:
+        // Return padded size held in r9.
+        mov rax, r9;
+        ret;
+
+      pdxargv_emit_perr_bufsmall:
+        // Any of: buf==0, error_code==0, buflen<padded.
+        xor rax, rax;
         ret;
       }
     }

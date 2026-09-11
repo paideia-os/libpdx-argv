@@ -368,6 +368,88 @@ stderr) is entirely the consumer's own I4 exit-code-discipline
 obligation (`design/tooling/plan.md` T-INV-I4). Do not treat any
 exit-status split by "code group" as a contract this library defines.
 
+.section OUTPUT SCHEMAS
+libpdx-argv declares one output wire schema
+(libpdx-argv.ENH-016, Closes #26):
+
+  PdxArgvParseErrorRecord@0.1  emitted by SchemaEmit::emit_parse_error
+                                on any parse failure. See src/parse_error_record.pdx
+                                for the canonical layout definition.
+
+Wire form (v1). Total record = ((32 + token_len + 7) / 8) * 8
+bytes; header is fixed at 32 bytes; tail is zero-padded to the
+next 8-byte boundary so a consumer streaming multiple records
+back-to-back never has to re-align.
+
+  | Offset | Size | Field       |
+  | --- | --- | --- |
+  |  0 | 8 | magic `"PDXAPERR"` ASCII (bytes 0x50 0x44 0x58 0x41 0x50 0x45 0x52 0x52) |
+  |  8 | 8 | version (u64 LE; must equal 1)                                          |
+  | 16 | 4 | err_code   (u32 LE; the `ParsedArgs::ERR_*` code)                      |
+  | 20 | 4 | argv_index (u32 LE; `ParsedArgs::error_arg_index`)                     |
+  | 24 | 4 | token_len  (u32 LE; token byte count, excluding any NUL)               |
+  | 28 | 4 | token_off  (u32 LE; always 32 in v1)                                   |
+  | 32 | token_len | token bytes (verbatim copy of the offending argv slot; no NUL) |
+  | next | 0..7 | zero padding to the next 8-byte boundary                          |
+
+Semantics.
+
+  - err_code carries the same non-zero ERR_* code parse_argv or
+    parse_from_schema_record returned in rax and stored in
+    ParsedArgs::error_code — never zero (emit_parse_error returns
+    0 without writing on error_code == 0). u32 truncation of the
+    u64 slot is safe: every ERR_* value fits in a byte today
+    (max 15) and the reserved u32 space covers every plausible
+    post-1.2 addition.
+  - argv_index is ParsedArgs::error_arg_index verbatim — the
+    offending argv slot on the argv path, or the flag/pos loop
+    index on the SchemaInvoke path (0 for whole-header failures
+    on either path).
+  - token_off is the offset of the token region WITHIN THE
+    RECORD (relative to buf, not argv). It is always 32 in v1;
+    an explicit field rather than an implicit constant so a v2
+    header extension can grow past 32 bytes without a wire re-cut.
+  - token_len bytes of the offending argv slot's text follow at
+    offset 32, verbatim from the caller's argv, WITHOUT a NUL
+    terminator. The source argv slot IS NUL-terminated (every
+    argv slot is), but the record does not store the NUL — a
+    downstream reader that needs a C-string derefs token_off,
+    reads token_len bytes, and appends its own NUL.
+
+Bounds discipline. `emit_parse_error(buf, buflen, argv_ptr)`
+computes the padded record size and refuses to write anything
+when `buflen < padded` (the record is atomic per invocation —
+no partial writes). Callers reserving a scratch buffer for the
+emit should size it against the tool's longest plausible argv
+slot; 128 bytes covers every I3 flag spelling plus a room-to-
+grow margin (the longest today is `--no-cap:KIND_IPC_ENDPOINT` at
+25 bytes). A caller that supplies a nonzero `argv_ptr` gets the
+token bytes populated; passing `argv_ptr == 0` (typical on the
+SchemaInvoke path, where there is no argv to point at) still
+emits the record with `token_len = 0` and the header carries
+`error_arg_index` intact.
+
+The consumer wiring pattern:
+
+    parsed_args_reset()
+    let err = parse_argv(argv, argc)
+    if err != ERR_OK {
+        let mut errbuf : [u8; 128] = uninit @align(8)
+        let n = SchemaEmit::emit_parse_error(&errbuf, 128, argv)
+        // n == padded record size, or 0 on buflen too small
+        // ...consumer forwards n bytes to its audit/pipe consumer...
+    }
+
+--schema surface. The schema name is published to
+`SchemaEmit::schema_emit_register` from the consumer's bootstrap
+(the tool owns which of libpdx-argv's declared schemas it
+exposes on `--schema`):
+
+    SchemaEmit::schema_emit_register(&ParseErrorRecord::PERR_SCHEMA_NAME_V01)
+
+The 28-byte `PERR_SCHEMA_NAME_V01` is `"PdxArgvParseErrorRecord@0.1\0"`
+in .rodata (27 chars + NUL).
+
 .section CROSS-REFERENCES
   doc doc                        the .pdxdoc reader (renders this file)
   doc libpdx-semantic-pipe       envelope framing for PdxArgvRecord@0.1

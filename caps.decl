@@ -80,4 +80,21 @@ requires: (none)
 # before the record's end before SchemaInvoke::parse_from_schema_record
 # dereferences it — see ERR_SCHEMA_BAD_OFFSET / ERR_SCHEMA_UNTERMINATED
 # in src/parsed_args.pdx (libpdx-argv.ENH-001).
-declares_output_schemas: (none)
+#
+# libpdx-argv.ENH-016 (Closes #26, 2026-09-10): the block below is
+# no longer `(none)`. `SchemaEmit::emit_parse_error` writes one
+# `PdxArgvParseErrorRecord@0.1` (see src/parse_error_record.pdx for the
+# canonical layout and doc/libpdx-argv.pdxdoc's OUTPUT SCHEMAS section
+# for the wire form) into a caller-supplied buffer whenever
+# `ParsedArgs::error_code` is nonzero — the first OUTPUT wire schema
+# this library declares. The write is best-effort: it does not spawn
+# a syscall, does not acquire any capability, and produces zero bytes
+# rather than a partial record on a too-small buffer. Consumers that
+# want the record forwarded to an audit or semantic-pipe endpoint
+# copy it there themselves under their own KIND_IPC_ENDPOINT /
+# KIND_TTY cap — same silent-write policy the earlier
+# `VersionBackend::emit_default` and `HelpBackend::emit_from_argspec`
+# carve-outs use. Cap posture for libpdx-argv itself unchanged
+# (requires: (none) above).
+declares_output_schemas:
+  - PdxArgvParseErrorRecord@0.1
