@@ -156,6 +156,82 @@ module ParsedArgs = structure {
   //
   // New klog tag: `pdxargv.short-cluster`.
   pub let ERR_CLUSTER_WITH_ARITY        : u64 = 16
+  // Added by libpdx-argv.ENH-017 (Closes #27): INT-flag value that
+  // failed decimal decoding. Set by `Parser::parse_argv_ex` when the
+  // caller passes `ARGV_COLLECT_ALL_ERRORS` in `parse_flags` AND the
+  // parser just consumed argv[i+1] as the value of an FKIND_INT flag
+  // AND `Typed::parse_int_u64(value)` returned `ok == 0`. The inline
+  // validation only fires under collect-all mode — a plain
+  // `parse_argv(argv, argc)` (i.e. `parse_argv_ex(argv, argc, 0)`)
+  // continues to store the flag with its raw string value and lets
+  // the consumer's own dispatch-site decoder catch the bad value
+  // (pre-ENH-017 contract preserved).
+  //
+  // The record is appended to `error_ring_codes[error_ring_count]`
+  // with `argv_index = r13` (the argv slot the failing value sits at,
+  // i.e. the last consumed slot after the parser advanced past the
+  // flag), and — if this is the FIRST error observed by the parse —
+  // ALSO written to `ParsedArgs::error_code` and `error_arg_index` so
+  // a consumer that never opts into the ring API still sees the first
+  // failure via the pre-existing slots. The stored flag itself is
+  // NOT rolled back — `flag_names[k] / flag_values[k] / flag_ids[k] /
+  // flag_kinds[k]` all reflect the (name, raw-string-value, id, INT)
+  // triple the parser observed. Consumers that walk ParsedArgs post-
+  // parse in collect-all mode should treat any FKIND_INT slot whose
+  // value fails `parse_int_u64` as a diagnostic-only entry.
+  //
+  // Not emitted on the schema-record invocation path (SchemaInvoke
+  // has no `argv_index` to attach and the record's typed values are
+  // already decoded upstream).
+  //
+  // New klog tag: `pdxargv.collect-errors`.
+  pub let ERR_BAD_INT                   : u64 = 17
+
+  // --- ENH-017 collect-all-errors mode (Closes #27) -------------------
+  // `Parser::parse_argv_ex(argv, argc, parse_flags)` opts into
+  // multi-error accumulation via bit 0 of `parse_flags`. When the bit
+  // is set, every recoverable parse failure (ERR_UNKNOWN_FLAG /
+  // ERR_MISSING_VALUE / ERR_UNKNOWN_ARG_FORM / ERR_LONG_MISSING_NAME /
+  // ERR_CLUSTER_WITH_ARITY / ERR_BAD_INT) is recorded into
+  // `error_ring_codes` + `error_ring_indices` and the parser advances
+  // past the offending argv slot instead of returning. Storage-
+  // exhaustion errors (ERR_FLAG_OVERFLOW / ERR_POS_OVERFLOW) still
+  // stop the parse — the storage arrays are full and continuing would
+  // hit the same overflow gate on every subsequent slot — but the
+  // ring itself is populated with the hard-fail code before the parser
+  // returns, so a consumer's post-parse ring walk sees the terminal
+  // reason alongside every prior recoverable error.
+  //
+  // The bit is inert when unset: `parse_argv(argv, argc)` (the pre-
+  // ENH-017 entry point) is a thin wrapper that calls
+  // `parse_argv_ex(argv, argc, 0)`, and the parser's flow through
+  // every ERR_* path is byte-identical to today's behavior — the
+  // ring still records the first error but the parser returns
+  // immediately after that record, so `error_count() == 1` and the
+  // return value matches the pre-ENH-017 fail contract.
+  //
+  // Bit assignments (bit N clear = pre-ENH-017 default):
+  //   bit 0 : ARGV_COLLECT_ALL_ERRORS — keep parsing after recoverable
+  //           errors; accumulate up to MAX_COLLECTED_ERRORS records.
+  //   bits 1..63 : reserved, must be zero (currently ignored; a
+  //                future ENH may repurpose them).
+  pub let ARGV_COLLECT_ALL_ERRORS       : u64 = 1
+
+  // Ring capacity — the number of error records a single parse may
+  // accumulate before subsequent errors are silently dropped from
+  // the ring. Overflow behaviour is intentional and quiet: the
+  // dropped errors still fire their normal advance-past-argv-slot
+  // recovery (so parse-side state stays coherent), but the ring
+  // itself never grows past this bound. A consumer that suspects it
+  // is dropping errors sizes its argv defensively or opts out of
+  // collect-all mode.
+  //
+  // 16 is the smallest cap that covers every I3 tool's worst-case
+  // argv (12 flags + 4 positionals for `pkg install --dry-run
+  // --json ...`) while staying inside 256B of .bss (16 slots × 16B
+  // per record). Larger caps trade .bss for the rare case of a
+  // very long fuzz-test argv where every slot is malformed.
+  pub let MAX_COLLECTED_ERRORS          : u64 = 16
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32
@@ -186,6 +262,27 @@ module ParsedArgs = structure {
   pub let mut ddash_seen        : u64       = uninit @align(8)
   pub let mut ddash_arg_index   : u64       = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-017 (Closes #27): parallel arrays that
+  // together hold the accumulated (err_code, argv_index) pairs from
+  // the current parse. `error_ring_count` is the live entry count
+  // (0..MAX_COLLECTED_ERRORS); entries at indices ≥ error_ring_count
+  // are dead and must not be read via error_at(). Populated by
+  // Parser::parse_argv_ex on every recoverable ERR_* fail (see
+  // ARGV_COLLECT_ALL_ERRORS above); the pre-existing scalar
+  // error_code / error_arg_index slots hold the FIRST error observed
+  // (position 0 in the ring). Both arrays are consumed by index up
+  // to error_ring_count, so parsed_args_reset zeroes only the
+  // counter — stale trailing entries are unreachable.
+  //
+  // Storage cost: 16 slots × 8 bytes × 2 arrays = 256 bytes .bss.
+  // The parallel-array shape (versus a struct-of-16-byte-slots
+  // packing) is deliberate: it keeps every write inside the paideia-
+  // as `mov [reg + rcx*8], reg` addressing mode without any scaled
+  // (rcx*16) or two-store sequences.
+  pub let mut error_ring_codes    : [u64; 16] = uninit @align(8)
+  pub let mut error_ring_indices  : [u64; 16] = uninit @align(8)
+  pub let mut error_ring_count    : u64       = uninit @align(8)
+
   // parsed_args_reset() — clear the M1 + M2 bookkeeping slots.
   // The flag_names / flag_values / flag_ids / flag_kinds / pos_ptrs
   // arrays are consumed by index up to flag_count / pos_count, so
@@ -200,16 +297,17 @@ module ParsedArgs = structure {
   pub let parsed_args_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M1-001 + M2 additions + ENH-030 rename: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count. ENH-030 renames the exported symbol from `reset` to `parsed_args_reset` to end the multi-module link collision — body byte-identical.",
+      justification: "libpdx-argv.M1-001 + M2 additions + ENH-017 + ENH-030 rename: zero the ParsedArgs bookkeeping slots so parse_argv starts from a known-empty state. Only counter/flag slots need explicit zero; the fixed-size arrays are consumed by index. r11 is scratch (paideia-as conformance). xor rax,rax produces the zero value written into each slot; it is one byte cheaper than mov rax,0 and produces the same result. M2 adds ddash_seen + ddash_arg_index; flag_ids/flag_kinds do NOT need zeroing here because they are consumed by index up to flag_count. ENH-017 adds error_ring_count — the error_ring_codes / error_ring_indices arrays are consumed by index up to error_ring_count, so trailing entries stay stale and error_at() gates reads on the count. ENH-030 renames the exported symbol from `reset` to `parsed_args_reset` to end the multi-module link collision — body otherwise byte-identical to the M1 shape.",
       block: {
         xor rax, rax;                            // rax = 0
-        lea r11, [rip + flag_count];      mov [r11], rax;
-        lea r11, [rip + pos_count];       mov [r11], rax;
-        lea r11, [rip + error_code];      mov [r11], rax;
-        lea r11, [rip + error_arg_index]; mov [r11], rax;
-        lea r11, [rip + emit_schema];     mov [r11], rax;
-        lea r11, [rip + ddash_seen];      mov [r11], rax;
-        lea r11, [rip + ddash_arg_index]; mov [r11], rax;
+        lea r11, [rip + flag_count];        mov [r11], rax;
+        lea r11, [rip + pos_count];         mov [r11], rax;
+        lea r11, [rip + error_code];        mov [r11], rax;
+        lea r11, [rip + error_arg_index];   mov [r11], rax;
+        lea r11, [rip + emit_schema];       mov [r11], rax;
+        lea r11, [rip + ddash_seen];        mov [r11], rax;
+        lea r11, [rip + ddash_arg_index];   mov [r11], rax;
+        lea r11, [rip + error_ring_count];  mov [r11], rax;
         ret;
       }
     }
@@ -395,6 +493,111 @@ module ParsedArgs = structure {
         jmp cfbi_loop;
 
       cfbi_done:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // error_count() -> u64    [libpdx-argv.ENH-017 (Closes #27)]
+  //
+  // Returns the number of error records the current parse has
+  // accumulated into `error_ring_codes` / `error_ring_indices`
+  // (0..MAX_COLLECTED_ERRORS, capped at the ring capacity). A parse
+  // in non-collect mode that failed at the first ERR_* reports 1;
+  // a parse in collect-all mode that observed N ≤ MAX_COLLECTED_ERRORS
+  // recoverable failures reports N; a parse that overflowed the ring
+  // reports MAX_COLLECTED_ERRORS (subsequent errors are silently
+  // dropped from the ring but still trigger their normal advance-
+  // past-argv-slot recovery). A successful parse reports 0.
+  //
+  // Consumer usage:
+  //   let n = ParsedArgs::error_count()
+  //   for i in 0..n {
+  //     let (err_code, argv_index) = ParsedArgs::error_at(i)
+  //     ...render one diagnostic line per (err_code, argv[argv_index])...
+  //   }
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = return value (error_ring_count)
+  //   r11 = lea scratch (cross-module .bss)
+  //
+  // paideia-as compliance: no test mnemonic, no imm > 0x7FFFFFFF,
+  // r11 for lea, single-load-and-return shape.
+  // ============================================================
+  pub let error_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-017 (Closes #27) ParsedArgs::error_count — returns the current error_ring_count. Leaf; r11 lea scratch; single load into rax. Value is bounded above by MAX_COLLECTED_ERRORS (16) which fits imm32 trivially — no encoder concerns. The ring itself is populated by Parser::parse_argv_ex on every recoverable fail; error_count() is the pure read side of the ring API and never mutates state.",
+      block: {
+        lea r11, [rip + error_ring_count];
+        mov rax, [r11];
+        ret;
+      }
+    }
+
+  // ============================================================
+  // error_at(idx) -> (err_code in rax, argv_index in rdx)
+  //                              [libpdx-argv.ENH-017 (Closes #27)]
+  //
+  // Returns the (err_code, argv_index) pair stored at ring slot
+  // `idx`, using the SysV `rax:rdx` multi-return convention (same
+  // shape FlagSpec::lookup and FlagSpec::get_range_by_id use).
+  //
+  //   rdi (in)  = ring index (0..MAX_COLLECTED_ERRORS - 1)
+  //   rax (out) = error_ring_codes[idx]   (u64; a ParsedArgs::ERR_* code)
+  //   rdx (out) = error_ring_indices[idx] (u64; the offending argv slot;
+  //               semantics match `error_arg_index` for the corresponding
+  //               fail path — argv index on the argv path, flag/pos loop
+  //               index on the SchemaInvoke path)
+  //
+  // Out-of-range access (`idx >= error_ring_count` OR `idx >=
+  // MAX_COLLECTED_ERRORS`) returns `(0, 0)` — the `0` err_code is
+  // distinguishable from any real ERR_* because ERR_OK (0) is never
+  // recorded in the ring (the ring is only appended to on failure).
+  // Callers already gate their iteration on `error_count()`; the OOB
+  // return path is a defensive no-op, not a contract callers rely on.
+  //
+  // Callers must treat rdx as clobbered across this call (as with
+  // every multi-return function in this library).
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rdi = idx (input)
+  //   rax = err_code / return
+  //   rdx = argv_index / return
+  //   rcx = bound check scratch (error_ring_count, then compared)
+  //   r11 = lea scratch (cross-module .bss)
+  //
+  // paideia-as compliance: no test mnemonic, no imm > 0x7FFFFFFF
+  // (MAX_COLLECTED_ERRORS = 16 fits imm8), r11 for lea, indexed
+  // load via `[reg + rdi*8]` — no scaled `[reg + N*8]` with
+  // immediate stride, addressing mode uses register-scaled index
+  // which is inside the R49 encoder subset.
+  // ============================================================
+  pub let error_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-017 (Closes #27) ParsedArgs::error_at — multi-return (rax=err_code, rdx=argv_index) via the SysV rax:rdx pair, same convention lookup() and get_range_by_id() already use. Bounds gate rejects idx >= error_ring_count AND idx >= MAX_COLLECTED_ERRORS (belt-and-braces: the former is the API contract, the latter guards against a caller that ignored error_count() and passed a fixed loop bound that outgrew the ring's physical size), returning (0, 0) in both cases — 0 is not a valid ERR_* code so the OOB sentinel is unambiguous. Leaf; only caller-save regs used. r11 for lea; indexed load via `[r11 + rdi*8]` stays inside the R49 encoder subset. MAX_COLLECTED_ERRORS immediate (16) fits imm8 trivially.",
+      block: {
+        // Bound: idx < error_ring_count?
+        lea r11, [rip + error_ring_count];
+        mov rcx, [r11];
+        cmp rdi, rcx;
+        jae error_at_oob;
+        // Bound: idx < MAX_COLLECTED_ERRORS? Defensive against a
+        // caller that ignored error_count and passed a stale index.
+        cmp rdi, 16;                          // MAX_COLLECTED_ERRORS
+        jae error_at_oob;
+
+        // In-range: load both parallel slots.
+        lea r11, [rip + error_ring_codes];
+        mov rax, [r11 + rdi*8];
+        lea r11, [rip + error_ring_indices];
+        mov rdx, [r11 + rdi*8];
+        ret;
+
+      error_at_oob:
+        xor rax, rax;                         // OOB → (0, 0)
+        xor rdx, rdx;
         ret;
       }
     }

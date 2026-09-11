@@ -4,9 +4,16 @@
 //               + ENH-014 (--help auto-table dispatch, Closes #24)
 //               + ENH-013 (clustered short-flag expansion for BOOL/
 //                          COUNTED, Closes #23)
-// Parser: entry points parse_argv(argv, argc) → error_code
-//         and parse_argv_skipping_zero(argv, argc) → error_code
-//         (thin wrapper that drops argv[0] before forwarding).
+//               + ENH-017 (collect-all-errors via parse_argv_ex +
+//                          ARGV_COLLECT_ALL_ERRORS parse_flags bit,
+//                          Closes #27)
+// Parser: entry points parse_argv_ex(argv, argc, parse_flags) →
+//         error_code (the ENH-017 primary), parse_argv(argv, argc) →
+//         error_code (thin wrapper passing parse_flags = 0 — the
+//         pre-ENH-017 signature preserved for every existing consumer,
+//         see ENH-017 note below), and parse_argv_skipping_zero(argv,
+//         argc) → error_code (thin wrapper that drops argv[0] before
+//         forwarding to parse_argv).
 //
 // M1 grammar (unchanged interpretation, except ENH-013 for clusters):
 //   long flags  : --foo, --foo=bar, --foo bar
@@ -107,6 +114,55 @@
 //   never leak into the current parse because flag_names[k] pointers
 //   land inside the freshly-overwritten region.
 //
+// libpdx-argv.ENH-017 (collect-all-errors, Closes #27):
+//   `parse_argv_ex(argv, argc, parse_flags)` is the ENH-017 primary
+//   entry point; `parse_argv(argv, argc)` becomes a thin wrapper
+//   that forwards `parse_flags = 0` (byte-for-byte identical
+//   behaviour to the pre-ENH-017 shape). Bit 0 of `parse_flags`
+//   (`ARGV_COLLECT_ALL_ERRORS`) toggles multi-error accumulation:
+//
+//     - The FIRST error still lands in ParsedArgs::error_code /
+//       error_arg_index and in error_ring[0], regardless of the bit.
+//     - With the bit UNSET (default; every existing caller), the
+//       parser returns after that first error exactly as before.
+//     - With the bit SET, the parser records the error into
+//       error_ring[error_ring_count++] and advances past the
+//       offending argv slot instead of returning. Up to
+//       MAX_COLLECTED_ERRORS (16) records accumulate before
+//       subsequent errors are silently dropped from the ring;
+//       ERR_FLAG_OVERFLOW / ERR_POS_OVERFLOW still stop the parse
+//       (the storage arrays are full; continuing would trip the
+//       same gate on every subsequent slot). The parser returns
+//       the FIRST-error code on any exit path where the ring has
+//       content — consumers observe the same "first error wins"
+//       return-value semantics whether they read via the pre-
+//       existing scalar slots or the new ring API.
+//
+//   The bit also enables inline INT-value validation: after every
+//   store whose kind == FKIND_INT and value != null, the parser
+//   calls Typed::parse_int_u64(value) and records ERR_BAD_INT (17)
+//   into the ring on a decode failure. This validation is opt-in
+//   with the bit: `parse_argv(argv, argc)` never calls the decoder
+//   at parse time (pre-ENH-017 contract preserved — the consumer's
+//   dispatch-site decoder still catches bad values), so no existing
+//   caller sees a behavior change.
+//
+//   Implementation shape: parse_flags is spilled to the alignment
+//   slot at `[rsp]` (the 8-byte pad the 6-push prologue already
+//   reserves for stack alignment) and reloaded whenever a fail
+//   site needs to gate on the bit. The alignment slot was
+//   previously unused padding; ENH-017 repurposes it without
+//   changing the prologue shape or the nested-call alignment
+//   invariant. Every recoverable-fail label (parse_argv_unknown_flag,
+//   parse_argv_missing_value, parse_argv_unknown_arg_form,
+//   parse_argv_long_missing_name, parse_argv_cluster_with_arity,
+//   parse_argv_bad_int) jumps to parse_argv_maybe_collect instead
+//   of the direct fail path. The two overflow labels
+//   (parse_argv_flag_overflow, parse_argv_pos_overflow) still fall
+//   through to parse_argv_fail directly.
+//
+//   New klog tag: `pdxargv.collect-errors`.
+//
 // libpdx-argv.ENH-026 (malformed-argv-slot classification):
 //   The classifier now rejects two argv shapes that fit neither the
 //   flag nor the positional grammar with
@@ -175,15 +231,23 @@ module Parser = structure {
   pub let mut cluster_probe       : [u64; 1] = uninit @align(8)
   pub let mut cluster_scratch_buf : [u64; 8] = uninit @align(8)
 
-  // parse_argv(argv, argc) → u64
+  // parse_argv_ex(argv, argc, parse_flags) → u64
   //   rdi = argv (u64* array of NUL-terminated arg pointers)
   //   rsi = argc (count of entries in argv)
+  //   rdx = parse_flags (bit 0 = ARGV_COLLECT_ALL_ERRORS; other bits
+  //         reserved, must be 0 — currently ignored)
   //   rax = 0 (ERR_OK) on success, else one of the ERR_* codes in
   //         ParsedArgs. On error the offending arg index is also
   //         recorded to ParsedArgs::error_arg_index for the
-  //         diagnostic renderer.
+  //         diagnostic renderer. In collect-all mode, if the parser
+  //         reaches the end of argv after N > 0 recoverable errors,
+  //         it returns the FIRST error's code — the same value the
+  //         pre-ENH-017 shape would have returned had it stopped
+  //         parsing at the first error.
   //
-  // Non-leaf (calls FlagSpec::lookup once per flag).
+  // Non-leaf (calls FlagSpec::lookup once per flag; also calls
+  // Typed::parse_int_u64 in collect-all mode for every FKIND_INT
+  // flag with a value).
   //
   // Register plan (callee-save preserved via 6-push + 8-byte pad):
   //   rbx = argv base pointer
@@ -197,18 +261,27 @@ module Parser = structure {
   //   r15 = id from FlagSpec::lookup for the flag currently being
   //         stored (0 = unregistered)
   //
+  // Stack local (ENH-017):
+  //   [rsp + 0]  = parse_flags (u64; spilled to the alignment-pad
+  //                slot the 6-push prologue reserves. The slot was
+  //                previously unused padding; ENH-017 stores
+  //                parse_flags there and reloads on each fail-path
+  //                gate so a nested-call clobber never loses it.
+  //                The prologue shape is unchanged so the rsp%16
+  //                invariant for nested calls is preserved.)
+  //
   // Scratch (caller-save; may be trashed across call lookup):
   //   rax = byte load / lookup return kind / return value
-  //   rcx = walk cursor / storage slot index
+  //   rcx = walk cursor / storage slot index / parse_flags reload
   //   rdx = argv[i] pointer (reloaded from [rbx + r13*8] as needed)
   //   rdi = arg to FlagSpec::lookup
   //   rsi = unused
   //   r8, r9, r10 = ephemeral compute
   //   r11 = lea scratch for cross-module .bss bases
-  pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
-    fn (argv: u64) (argc: u64) -> unsafe {
+  pub let parse_argv_ex : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argc: u64) (parse_flags: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2 + ENH-004 + ENH-013 + ENH-026 + ENH-032 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default (writes the fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n` to fd 1 via seven raw sys_writes) and returns ERR_VERSION_EMITTED (13) via parse_argv_fail — the same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for the added nested call. ENH-013 (Closes #23): the parse_argv_short_clustered arm is no longer an unconditional ERR_CLUSTERED_SHORT reject — it two-passes the cluster (validation via cluster_probe, dispatch via cluster_scratch_buf indexed by flag_count*2) and either expands `-abc` into three flag_count++ stores or fails with ERR_CLUSTER_WITH_ARITY (16) at the first value-consuming kind. The same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for the added FlagSpec::lookup calls (2N per cluster of length N).",
+      justification: "libpdx-argv.M2 + ENH-004 + ENH-013 + ENH-014 + ENH-017 + ENH-026 + ENH-032 parse_argv_ex entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-017 (Closes #27) generalises the pre-ENH-017 parse_argv into a three-argument primary — the third argument (parse_flags: u64) is spilled to [rsp+0] (the alignment-pad slot the 6-push prologue already reserves; ENH-017 repurposes that byte-for-byte-idle padding without changing the prologue shape) and reloaded on every recoverable-fail gate. Bit 0 (ARGV_COLLECT_ALL_ERRORS): parser records each fail into ParsedArgs::error_ring_* and advances past the offending argv slot instead of returning; up to MAX_COLLECTED_ERRORS (16) records accumulate before subsequent fails are silently dropped from the ring. Also enables inline FKIND_INT value validation: after every store whose kind == 2 (FKIND_INT) and value != 0, calls Typed::parse_int_u64(value) and records ERR_BAD_INT (17) on ok == 0. Bit unset (parse_argv thin wrapper) preserves the pre-ENH-017 return-on-first-error behavior byte-for-byte, including that no inline INT validation is performed. First-error semantics: the FIRST error observed always writes error_code / error_arg_index and lands in error_ring[0]; the return value on any exit path with ring content is that first-error code (parse_argv_epilogue reads error_ring_codes[0] into rax before ret). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default and returns ERR_VERSION_EMITTED (13). ENH-014 (Closes #24): matching id 1 with HelpBackend::doc_backend_unavailable != 0 calls emit_from_argspec and returns ERR_HELP_EMITTED (15). These two auto-emit paths deliberately terminate the parse (they are success signals for the tool's exit-immediately behavior); they are NOT routed through the collect-all recovery machinery even when the bit is set. ENH-013 (Closes #23): the parse_argv_short_clustered arm is no longer an unconditional ERR_CLUSTERED_SHORT reject — it two-passes the cluster (validation via cluster_probe, dispatch via cluster_scratch_buf indexed by flag_count*2) and either expands `-abc` into three flag_count++ stores or fails with ERR_CLUSTER_WITH_ARITY (16) at the first value-consuming kind. The same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for every added nested call (lookup/parse_int_u64/emit_default/emit_from_argspec).",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -218,6 +291,13 @@ module Parser = structure {
         push r14;
         push r15;
         sub rsp, 8;
+
+        // ENH-017: spill parse_flags into the alignment slot at [rsp+0].
+        // The slot was previously unused padding — reused here without
+        // changing the prologue shape (rsp%16 stays 0 for nested calls).
+        // Every fail-path gate below reloads via `mov rcx, [rsp]` and
+        // tests bit 0 (ARGV_COLLECT_ALL_ERRORS).
+        mov [rsp + 0], rdx;
 
         mov rbx, rdi;                       // rbx = argv base
         mov r12, rsi;                       // r12 = argc
@@ -392,6 +472,40 @@ module Parser = structure {
         lea r11, [rip + flag_count];
         mov [r11], rcx;
 
+        // -- ENH-017: FKIND_INT value validation under collect-all --
+        // Fires only when parse_flags bit 0 (ARGV_COLLECT_ALL_ERRORS)
+        // is set AND the just-stored flag has kind == FKIND_INT (2)
+        // AND its value pointer is non-null. rax still holds the kind
+        // from the lookup return (the store paths above deliberately
+        // avoid clobbering rax); r14 still holds the value pointer.
+        // Calls Typed::parse_int_u64 to validate; on ok == 0, jumps
+        // to parse_argv_bad_int which routes through
+        // parse_argv_maybe_collect (records ERR_BAD_INT + advances
+        // OR falls to epilogue when the bit is unset — but the bit
+        // guard here already ensures the bit is set at this call
+        // site, so the maybe_collect path always takes the advance
+        // branch on this route). Placed BEFORE the ENH-032/ENH-014
+        // auto-emit checks and the --pdx-schema inline compare
+        // because those clobber rax via byte loads and would lose
+        // the kind we need for the FKIND_INT test. INT flags cannot
+        // legitimately be --version/--help/--pdx-schema (id 2 / 1 /
+        // schema-word; all registered as FKIND_BOOL or STD_ID_HELP-
+        // scoped), so this ordering has no observable effect on
+        // the auto-emit dispatch.
+        mov rcx, [rsp + 0];                 // parse_flags
+        and rcx, 1;
+        cmp rcx, 0;
+        je parse_argv_long_skip_int_validate;
+        cmp rax, 2;                         // FKIND_INT
+        jne parse_argv_long_skip_int_validate;
+        cmp r14, 0;
+        je parse_argv_long_skip_int_validate;
+        mov rdi, r14;                       // rdi = value ptr
+        call parse_int_u64;                 // rax = ok, rdx = val
+        cmp rax, 0;
+        je parse_argv_bad_int;              // ok == 0 → record + advance
+      parse_argv_long_skip_int_validate:
+
         // -- ENH-032: --version auto-emit dispatch (Closes #25) --------
         // If the just-stored flag is StdVocab's --version (id 2) and
         // the tool has not opted out via
@@ -536,6 +650,26 @@ module Parser = structure {
         add rcx, 1;
         lea r11, [rip + flag_count];
         mov [r11], rcx;
+
+        // -- ENH-017: FKIND_INT value validation under collect-all --
+        // Mirror of the long-flag gate above (same rationale; see
+        // parse_argv_long_skip_int_validate). Fires only when
+        // parse_flags bit 0 is set AND kind == FKIND_INT AND value
+        // pointer is non-null. rax and r14 preserved into the gate
+        // from the store block above.
+        mov rcx, [rsp + 0];                 // parse_flags
+        and rcx, 1;
+        cmp rcx, 0;
+        je parse_argv_short_skip_int_validate;
+        cmp rax, 2;                         // FKIND_INT
+        jne parse_argv_short_skip_int_validate;
+        cmp r14, 0;
+        je parse_argv_short_skip_int_validate;
+        mov rdi, r14;
+        call parse_int_u64;                 // rax = ok, rdx = val
+        cmp rax, 0;
+        je parse_argv_bad_int;
+      parse_argv_short_skip_int_validate:
 
         // -- ENH-032: --version auto-emit dispatch (Closes #25) --------
         // Same check as the long-flag store path. StdVocab does not
@@ -710,10 +844,6 @@ module Parser = structure {
       parse_argv_cluster_disp_done:
         jmp parse_argv_advance_loop;
 
-      parse_argv_cluster_with_arity:
-        mov rax, 16;                        // ERR_CLUSTER_WITH_ARITY
-        jmp parse_argv_fail;
-
       parse_argv_positional:
         lea r11, [rip + pos_count];
         mov rax, [r11];
@@ -734,36 +864,199 @@ module Parser = structure {
 
       parse_argv_long_missing_name:
         mov rax, 5;                         // ERR_LONG_MISSING_NAME
-        jmp parse_argv_fail;
+        jmp parse_argv_maybe_collect;
 
       parse_argv_flag_overflow:
+        // ENH-017: storage-exhaustion errors do NOT route through
+        // maybe_collect — the flag_names/flag_values arrays are full
+        // and every subsequent store would hit the same gate. Route
+        // to parse_argv_fail directly; the record path there still
+        // populates error_ring[0] if it is empty, and preserves the
+        // first-collected error otherwise (see parse_argv_fail).
         mov rax, 1;                         // ERR_FLAG_OVERFLOW
         jmp parse_argv_fail;
 
       parse_argv_pos_overflow:
+        // ENH-017: same rationale as parse_argv_flag_overflow — the
+        // pos_ptrs array is full; continuing would trip this gate on
+        // every subsequent positional. Direct fail.
         mov rax, 2;                         // ERR_POS_OVERFLOW
         jmp parse_argv_fail;
 
       parse_argv_missing_value:
         mov rax, 6;                         // ERR_MISSING_VALUE
-        jmp parse_argv_fail;
+        jmp parse_argv_maybe_collect;
 
       parse_argv_unknown_flag:
         mov rax, 12;                        // ERR_UNKNOWN_FLAG (ENH-004)
-        jmp parse_argv_fail;
+        jmp parse_argv_maybe_collect;
 
       parse_argv_unknown_arg_form:
         mov rax, 3;                         // ERR_UNKNOWN_ARG_FORM (ENH-026)
-        jmp parse_argv_fail;
+        jmp parse_argv_maybe_collect;
 
-      parse_argv_fail:
-        // rax = error code. Record error_code + error_arg_index, then
-        // restore callee-save regs and return rax.
+      parse_argv_bad_int:
+        // ENH-017 (Closes #27): FKIND_INT flag captured a value that
+        // failed Typed::parse_int_u64 decoding. r13 has been advanced
+        // to point at the failing value slot by the store block above,
+        // so recording (17, r13) attaches the error to the argv index
+        // that carried the bad token — a consumer's diagnostic
+        // renderer walks `argv[error_at(i).argv_index]` and gets the
+        // failing string verbatim. The store itself is NOT rolled
+        // back (see ERR_BAD_INT docstring in parsed_args.pdx).
+        mov rax, 17;                        // ERR_BAD_INT
+        jmp parse_argv_maybe_collect;
+
+      parse_argv_cluster_with_arity:
+        mov rax, 16;                        // ERR_CLUSTER_WITH_ARITY
+        jmp parse_argv_maybe_collect;
+
+      parse_argv_maybe_collect:
+        // ENH-017 (Closes #27) — the recoverable-fail router.
+        // Inputs:  rax = err_code, r13 = argv_index
+        // Behavior:
+        //   1. Record (err_code, argv_index) into
+        //      error_ring[error_ring_count] if capacity remains.
+        //      If this is the FIRST error (ring_count == 0), also
+        //      publish into ParsedArgs::error_code / error_arg_index
+        //      so a consumer that never reads the ring still sees the
+        //      first failure via the pre-existing scalar slots.
+        //   2. Load parse_flags from [rsp]; if bit 0
+        //      (ARGV_COLLECT_ALL_ERRORS) is set, advance to the next
+        //      argv slot (jmp parse_argv_advance_loop). Otherwise
+        //      fall through to parse_argv_epilogue, which returns
+        //      rax (the current err_code, same as the pre-ENH-017
+        //      fail-return value).
+        //
+        // Clobbers: rcx (parse_flags reload / ring_count / bit test),
+        //           r11 (lea scratch). rax and r13 preserved.
+        //
+        // Note: this path is NEVER entered on an overflow-class fail
+        // (see parse_argv_flag_overflow / pos_overflow above), so the
+        // "advance-past-argv-slot" recovery is always safe — the
+        // recoverable ERR_* codes leave the storage arrays in a
+        // coherent state, either because no store happened
+        // (unknown/missing_name/unknown_flag/cluster_with_arity) or
+        // because the store succeeded and only the value was
+        // semantically bad (bad_int).
+        lea r11, [rip + error_ring_count];
+        mov rcx, [r11];
+        cmp rcx, 16;                        // MAX_COLLECTED_ERRORS
+        jge parse_argv_maybe_collect_gate;
+        lea r11, [rip + error_ring_codes];
+        mov [r11 + rcx*8], rax;
+        lea r11, [rip + error_ring_indices];
+        mov [r11 + rcx*8], r13;
+        cmp rcx, 0;
+        jne parse_argv_maybe_collect_incr;
+        // First error: also publish to the scalar slots.
         lea r11, [rip + error_code];
         mov [r11], rax;
         lea r11, [rip + error_arg_index];
         mov [r11], r13;
+      parse_argv_maybe_collect_incr:
+        add rcx, 1;
+        lea r11, [rip + error_ring_count];
+        mov [r11], rcx;
 
+      parse_argv_maybe_collect_gate:
+        // Test bit 0 of the spilled parse_flags.
+        mov rcx, [rsp + 0];
+        and rcx, 1;
+        cmp rcx, 0;
+        je parse_argv_epilogue;             // no bit → return rax
+        jmp parse_argv_advance_loop;        // bit set → keep parsing
+
+      parse_argv_fail:
+        // Hard-fail path (overflow class + auto-emit signals).
+        // rax = err_code, r13 = argv_index.
+        //
+        // ENH-017 (Closes #27) first-error preservation:
+        // If the ring already has content (a prior recoverable error
+        // captured under collect-all mode), leave error_code /
+        // error_arg_index unchanged — they hold the FIRST error's
+        // code per the "first error wins" contract. Otherwise this
+        // IS the first error (non-collect mode's single error, or an
+        // overflow that fired before any recoverable one), so
+        // populate error_ring[0] + the scalar slots + set ring_count
+        // to 1 so a consumer's error_at(0) walk still finds the
+        // hard-stop error.
+        //
+        // Auto-emit success signals (ENH-032/ENH-014) also route
+        // here with rax == 13 / 15 respectively; those codes end up
+        // in error_ring[0] alongside the scalar slot writes — which
+        // is defensive for a consumer that queries the ring even on
+        // a success signal. In collect-all mode with prior
+        // recoverable errors, the auto-emit code appends only if
+        // capacity remains and lets the epilogue return the FIRST
+        // error's code (auto-emit still fires — the fd-1 write
+        // already happened before this label).
+        lea r11, [rip + error_ring_count];
+        mov rcx, [r11];
+        cmp rcx, 0;
+        jne parse_argv_fail_append;
+        // First error via hard-fail: seed the ring + scalar slots.
+        lea r11, [rip + error_ring_codes];
+        mov [r11], rax;
+        lea r11, [rip + error_ring_indices];
+        mov [r11], r13;
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        lea r11, [rip + error_arg_index];
+        mov [r11], r13;
+        mov rcx, 1;
+        lea r11, [rip + error_ring_count];
+        mov [r11], rcx;
+        jmp parse_argv_epilogue;
+
+      parse_argv_fail_append:
+        // Ring already has content — append this hard-fail (or
+        // auto-emit signal) if capacity remains, then jump to
+        // epilogue which returns the FIRST-error code from ring[0].
+        cmp rcx, 16;                        // MAX_COLLECTED_ERRORS
+        jge parse_argv_epilogue;
+        lea r11, [rip + error_ring_codes];
+        mov [r11 + rcx*8], rax;
+        lea r11, [rip + error_ring_indices];
+        mov [r11 + rcx*8], r13;
+        add rcx, 1;
+        lea r11, [rip + error_ring_count];
+        mov [r11], rcx;
+        jmp parse_argv_epilogue;
+
+      parse_argv_done_ok:
+        // ENH-017 (Closes #27): under collect-all mode the parser
+        // may reach end-of-argv with N > 0 recorded errors. In that
+        // case error_code was set to the FIRST error's code by
+        // parse_argv_maybe_collect; leave it and fall through to
+        // the epilogue, which reads error_ring_codes[0] into rax.
+        // With ring empty (the pre-ENH-017 success path), clear
+        // error_code and return ERR_OK (0) — behavior byte-for-byte
+        // identical to the pre-ENH-017 shape.
+        lea r11, [rip + error_ring_count];
+        mov rcx, [r11];
+        cmp rcx, 0;
+        jne parse_argv_epilogue;
+        xor rax, rax;                       // ERR_OK
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        // fall through to epilogue
+
+      parse_argv_epilogue:
+        // ENH-017 return-value discipline: if the ring has content,
+        // return error_ring_codes[0] (first-error code) regardless
+        // of the rax value at entry; otherwise return whatever rax
+        // is (ERR_OK from done_ok, or the current err_code from a
+        // non-collect fail). Consumers see the "first error wins"
+        // return-value semantics on every exit path.
+        lea r11, [rip + error_ring_count];
+        mov rcx, [r11];
+        cmp rcx, 0;
+        je parse_argv_epilogue_pop;
+        lea r11, [rip + error_ring_codes];
+        mov rax, [r11];
+
+      parse_argv_epilogue_pop:
         add rsp, 8;
         pop r15;
         pop r14;
@@ -772,18 +1065,46 @@ module Parser = structure {
         pop rbp;
         pop rbx;
         ret;
+      }
+    }
 
-      parse_argv_done_ok:
-        xor rax, rax;                       // ERR_OK
-        lea r11, [rip + error_code];
-        mov [r11], rax;
-
-        add rsp, 8;
-        pop r15;
-        pop r14;
-        pop r13;
-        pop r12;
-        pop rbp;
+  // parse_argv(argv, argc) → u64
+  //
+  // libpdx-argv.ENH-017 (Closes #27) — thin wrapper over parse_argv_ex
+  // that forwards parse_flags = 0, giving every pre-ENH-017 caller
+  // byte-for-byte identical behavior: return on first error, no
+  // multi-error accumulation, no inline INT validation. The ring
+  // still captures the first error (parse_argv_maybe_collect / the
+  // parse_argv_fail seed both populate error_ring[0]), so a consumer
+  // that opts into the ring API can still walk error_at(0) after a
+  // plain parse_argv call — the single-error case just reports
+  // error_count() == 1.
+  //
+  //   rdi = argv (u64* array, unchanged from the pre-ENH-017 shape)
+  //   rsi = argc
+  //   rax = same as parse_argv_ex — ERR_OK or one of the ERR_* codes.
+  //
+  // Non-leaf (calls parse_argv_ex). One-push prologue (rbx unused,
+  // pushed only for stack alignment) brings rsp%16 to 0 for the
+  // nested call, per the same pattern parse_argv_skipping_zero uses.
+  // rax survives the pop rbx / ret path (rbx is callee-save and
+  // unused; no instruction between the call return and the epilogue
+  // touches rax).
+  //
+  // Register plan:
+  //   rdi = argv       (passed straight to parse_argv_ex)
+  //   rsi = argc       (passed straight to parse_argv_ex)
+  //   rdx = parse_flags = 0 (staged before the call)
+  //   rbx = scratch (unused, pushed only for stack alignment)
+  //   rax = return value from parse_argv_ex (passed through unchanged)
+  pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-017 (Closes #27) Parser::parse_argv — thin wrapper over parse_argv_ex that forwards (rdi=argv, rsi=argc, rdx=0). The pre-ENH-017 signature (u64, u64) -> u64 is preserved so every existing consumer (pkg, ls, cp, mkdir, mv, rm, mkfs.pdxfs, mount.pdxfs, umount.pdxfs, and every satellite/test that links libpdx-argv today) sees no ABI change. parse_flags = 0 means bit 0 (ARGV_COLLECT_ALL_ERRORS) is unset, so parse_argv_ex's fail paths route through parse_argv_maybe_collect but the gate at parse_argv_maybe_collect_gate falls through to parse_argv_epilogue on the first error — byte-for-byte identical to the pre-ENH-017 return-on-first-error contract, including that no inline FKIND_INT validation happens (the validation is gated on the same bit). Non-leaf: 1-push prologue (rbx unused, for rsp alignment) → rsp%16: 8 → 0 for the nested parse_argv_ex call. rax survives pop rbx / ret unchanged.",
+      block: {
+        push rbx;                           // align rsp (rsp%16: 8 → 0)
+        xor rdx, rdx;                       // parse_flags = 0
+        call parse_argv_ex;                 // rax = parse_argv_ex result
         pop rbx;
         ret;
       }

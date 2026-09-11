@@ -26,6 +26,19 @@ libpdx-argv - argv parser for PaideiaOS tools
 
         let err = parse_from_schema_record(rec_ptr, rec_len)
 
+    or, when the tool wants to accumulate every parse failure
+    into one diagnostic pass (libpdx-argv.ENH-017, Closes #27):
+
+        parsed_args_reset()
+        let err = parse_argv_ex(argv, argc, ARGV_COLLECT_ALL_ERRORS)
+        for i in 0..error_count() {
+            let (code, argv_i) = error_at(i)                  // rax:rdx
+            // render one diagnostic line per (code, argv[argv_i])
+        }
+        // err = first-error code (same as pre-ENH-017 parse_argv
+        // would have returned); ERR_OK iff every argv slot parsed
+        // cleanly.
+
     ENH-030 (v1.1.0) renamed three previously-colliding globals:
     `ParsedArgs::reset`   -> parsed_args_reset
     `FlagSpec::reset`     -> flag_spec_reset
@@ -374,6 +387,34 @@ whole-buffer header failure.
                                      (12) instead. Klog tag:
                                      pdxargv.short-cluster.
 
+  ERR_BAD_INT (17)                  FKIND_INT flag's value failed
+                                     Typed::parse_int_u64 decoding
+                                     (libpdx-argv.ENH-017, #27). Fires
+                                     ONLY when the caller passed
+                                     ARGV_COLLECT_ALL_ERRORS in
+                                     parse_argv_ex's parse_flags; the
+                                     pre-ENH-017 parse_argv (and
+                                     parse_argv_ex with parse_flags=0)
+                                     never validates INT values at
+                                     parse time — the consumer's own
+                                     dispatch-site decoder catches
+                                     them exactly as before. When
+                                     fired, the stored flag slot is
+                                     NOT rolled back: flag_names[k] /
+                                     flag_values[k] / flag_ids[k] /
+                                     flag_kinds[k] all reflect the
+                                     (name, raw-string-value, id,
+                                     INT) triple the parser observed.
+                                     argv_index attaches to the value
+                                     slot (not the flag slot), so a
+                                     consumer's diagnostic renderer
+                                     dereferences argv[argv_index] to
+                                     get the failing token verbatim.
+                                     Not emitted on the SchemaInvoke
+                                     path (typed values are decoded
+                                     upstream). Klog tag:
+                                     pdxargv.collect-errors.
+
   ERR_INT_RANGE (14)                INT-flag value fell outside the
                                      registered inclusive-unsigned
                                      [min, max] interval
@@ -532,6 +573,29 @@ in .rodata (27 chars + NUL).
                        / `--jobs UINT64_MAX` all rejected with
                        ERR_INT_RANGE. Plain register keeps the
                        range OFF (0, 0 sentinel).
+  Unreleased          libpdx-argv.ENH-017 (Closes #27) — collect-all-
+                       errors mode. Adds Parser::parse_argv_ex(argv,
+                       argc, parse_flags) as the primary entry point;
+                       existing parse_argv becomes a thin wrapper
+                       passing parse_flags=0 (byte-for-byte backward
+                       compatible). Bit 0 of parse_flags
+                       (ARGV_COLLECT_ALL_ERRORS = 1) opts into: (a)
+                       keep parsing after every recoverable failure,
+                       accumulating up to MAX_COLLECTED_ERRORS (16)
+                       records into ParsedArgs::error_ring_codes /
+                       error_ring_indices (16B per slot × 16 slots
+                       = 256B .bss); (b) inline Typed::parse_int_u64
+                       validation of every FKIND_INT flag's value,
+                       recording ERR_BAD_INT (17) on decode failure.
+                       New readers ParsedArgs::error_count and
+                       error_at (multi-return rax:rdx pair). First-
+                       error semantics preserved on every exit
+                       (parse_argv_epilogue reads error_ring_codes[0]
+                       into rax for the return). Overflow (ERR_
+                       FLAG_OVERFLOW / ERR_POS_OVERFLOW) still stops
+                       the parse under both modes; ring caps silently
+                       (extra errors dropped from the ring, parse
+                       still advances).
 
 .section AUTHORS
   paideia-os-team.  Repo: github.com/paideia-os/libpdx-argv.

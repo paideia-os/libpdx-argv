@@ -6,6 +6,210 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-017 — Collect-all-errors mode via `ARGV_COLLECT_ALL_ERRORS` (Closes #27)
+
+Pre-ENH-017 `Parser::parse_argv` returned on the first parse
+failure — a config-file linter or a shell-completion analyser that
+wanted every diagnostic in one pass had to re-invoke the parser
+per fixup or roll its own argv walk (losing the library's typed-
+flag / clustered-short / strict-mode discipline). ENH-017 lands
+an opt-in accumulator that keeps the parser walking after each
+recoverable failure, capping at `MAX_COLLECTED_ERRORS = 16`
+records in a bss ring the consumer reads via
+`error_count()` / `error_at(i)`.
+
+Public surface additions (all in `ParsedArgs`):
+
+  - `ARGV_COLLECT_ALL_ERRORS : u64 = 1` — bit 0 of
+    `parse_argv_ex`'s third argument; opts into multi-error
+    accumulation AND inline `FKIND_INT` value validation.
+  - `MAX_COLLECTED_ERRORS : u64 = 16` — ring capacity.
+  - `ERR_BAD_INT : u64 = 17` — recorded when an inline
+    `Typed::parse_int_u64` call on a stored INT flag's value
+    returns `ok == 0` (fires ONLY under collect-all mode).
+  - `error_ring_codes : [u64; 16]`, `error_ring_indices : [u64; 16]`,
+    `error_ring_count : u64` — parallel-array ring (256 B .bss)
+    plus live-entry counter.
+  - `error_count() -> u64` (leaf) — returns `error_ring_count`.
+  - `error_at(idx) -> u64` (leaf, multi-return `rax:rdx`) — reads
+    `(error_ring_codes[idx], error_ring_indices[idx])`; OOB
+    returns `(0, 0)`.
+
+Parser surface additions:
+
+  - `parse_argv_ex(argv, argc, parse_flags) -> u64` — the ENH-017
+    primary. `parse_flags = 0` reproduces the pre-ENH-017 shape
+    byte-for-byte; bit 0 (`ARGV_COLLECT_ALL_ERRORS`) turns on the
+    accumulator + inline INT validation.
+  - `parse_argv(argv, argc) -> u64` — now a thin wrapper over
+    `parse_argv_ex(argv, argc, 0)`. Signature preserved: every
+    existing consumer (pkg, ls, cp, mkdir, mv, rm, mkfs.pdxfs,
+    mount.pdxfs, umount.pdxfs, every satellite/test) links
+    unchanged and sees zero behavior change.
+
+Semantics summary:
+
+  - **First-error preservation.** The FIRST error observed
+    always writes into `ParsedArgs::error_code` / `error_arg_index`
+    AND lands in `error_ring[0]`, regardless of the collect bit.
+    A consumer that never reads the ring still sees the first
+    failure via the pre-existing scalar slots.
+  - **Return-value discipline.** Every exit path with ring
+    content returns `error_ring_codes[0]` — the first-error
+    code. `parse_argv_epilogue` reads the ring and updates rax
+    before ret, so consumers see the "first error wins" semantic
+    on every exit (success, hard-stop, collect-mode end-of-argv).
+  - **Recoverable-fail routing.** `parse_argv_unknown_flag`,
+    `parse_argv_missing_value`, `parse_argv_unknown_arg_form`,
+    `parse_argv_long_missing_name`,
+    `parse_argv_cluster_with_arity`, and (new)
+    `parse_argv_bad_int` all jump to `parse_argv_maybe_collect`.
+    The router records + tests the bit; on set, advances to the
+    next argv slot; on unset, falls through to
+    `parse_argv_epilogue` (return).
+  - **Hard-stop fails.** `parse_argv_flag_overflow` and
+    `parse_argv_pos_overflow` still route directly to
+    `parse_argv_fail` (storage-exhausted; continuing would trip
+    the same gate on every subsequent slot). The direct-fail
+    path also populates `error_ring[0]` if the ring is empty and
+    appends the hard-stop error otherwise.
+  - **Auto-emit success signals unchanged.** `ERR_VERSION_EMITTED`
+    (ENH-032) and `ERR_HELP_EMITTED` (ENH-014) still stop the
+    parse under both modes; they are intentional early exits.
+  - **Ring overflow is silent.** Beyond `MAX_COLLECTED_ERRORS`
+    the ring drops subsequent records but the parse still
+    advances past each — parse-side state stays coherent.
+
+Ring layout (per-slot fields, chosen over embedding the full
+`PdxArgvParseErrorRecord@0.1` layout):
+
+  - **Two parallel `[u64; 16]` arrays**: `error_ring_codes` and
+    `error_ring_indices`. Each slot carries `(err_code,
+    argv_index)` in 16 B total. 16 slots × 16 B = 256 B .bss.
+  - Deliberately NOT `PdxArgvParseErrorRecord@0.1` records
+    (32 B header + variable-length token bytes). The full-record
+    shape is what `SchemaEmit::emit_parse_error` writes into a
+    caller-supplied buffer for wire-form serialisation; the
+    parse-time ring keeps only the two scalar fields the parser
+    already has in hand and defers token retrieval to the
+    caller (`argv[error_at(i).argv_index]` reads the offending
+    token verbatim). This keeps the ring inside 256 B of .bss,
+    stays inside the paideia-as `mov [reg + rcx*8], reg`
+    addressing mode (no scaled `(rcx*16)` or two-store
+    sequences), and avoids a variable-length-record allocator
+    inside the parser.
+
+Inline `FKIND_INT` value validation (opt-in with the collect bit):
+
+  - After every long-flag or short-flag store whose `kind ==
+    FKIND_INT (2)` and `value != null`, the parser calls
+    `Typed::parse_int_u64(value)`. On `ok == 0` it records
+    `ERR_BAD_INT (17)` with `argv_index = r13` (the value slot,
+    since the parser has already advanced past the flag onto its
+    value) and jumps to `parse_argv_maybe_collect` for the
+    advance-past-argv-slot recovery.
+  - The store is NOT rolled back: `flag_names[k]` / `flag_values[k]`
+    / `flag_ids[k]` / `flag_kinds[k]` reflect the (name, raw-
+    string-value, id, INT) triple the parser observed. Consumers
+    walking `ParsedArgs` post-parse in collect-all mode treat any
+    FKIND_INT slot whose value fails `parse_int_u64` as
+    diagnostic-only.
+  - The validation is opt-in with the collect bit — plain
+    `parse_argv(argv, argc)` (bit unset) never calls the decoder
+    at parse time; the pre-ENH-017 contract that INT decoding
+    happens at the consumer's dispatch site is preserved byte-
+    for-byte. This also avoids a behavior change for consumers
+    that deliberately accept non-numeric INT values (e.g.
+    `--jobs auto` where "auto" is a tool-specific sentinel).
+
+Fingerprint (issue #27):
+
+Under `ARGV_COLLECT_ALL_ERRORS` with argv
+`["tool", "--zog", "--bad-int", "notanumber", "--", "pos"]`
+(`parse_argv_ex`, argc = 6), where `--zog` is unregistered under
+`FlagSpec::set_strict(1)` and `--bad-int` is registered as
+`FKIND_INT` with id 100:
+
+  - Return value = `ERR_UNKNOWN_FLAG` (12) — first-error code
+    via `parse_argv_epilogue`'s ring[0] read.
+  - `error_code == 12`, `error_arg_index == 1` — first-error
+    scalar slots seeded by the very first
+    `parse_argv_maybe_collect`.
+  - `error_count() == 2`.
+  - `error_at(0) == (12, 1)` — `--zog` unknown-flag record.
+  - `error_at(1) == (17, 3)` — `notanumber` bad-int record;
+    argv_index is the value slot the parser was on when
+    `parse_int_u64` returned ok = 0.
+  - `pos_count == 2` — `argv[0]="tool"` + `argv[5]="pos"`.
+  - `ddash_seen == 1`, `ddash_arg_index == 4`.
+
+Without the bit (plain `parse_argv(argv, 6)`), the same argv
+returns after `--zog` with `error_count() == 1`, `error_code == 12`,
+`pos_count == 1` — byte-for-byte identical to the pre-ENH-017
+`parse_argv` return-on-first-error contract. The ring's single-
+slot seed is the only observable delta and does not affect any
+consumer that reads only the scalar slots.
+
+Implementation shape:
+
+  - `parse_argv_ex` spills its third argument (`parse_flags`)
+    into the alignment-pad slot at `[rsp + 0]` (the 8-byte
+    padding the 6-push prologue already reserves for nested-call
+    stack alignment). The slot was previously unused; ENH-017
+    repurposes it without changing the prologue shape or the
+    `rsp%16 = 0` invariant for nested calls. Every recoverable-
+    fail gate reloads via `mov rcx, [rsp + 0]` and tests bit 0.
+  - `parse_argv` (the thin wrapper) uses a 1-push prologue
+    (`push rbx` for alignment, `rbx` unused), stages
+    `rdx = 0`, and calls `parse_argv_ex` — same shape
+    `parse_argv_skipping_zero` uses for its own wrap.
+  - `parse_argv_maybe_collect`, `parse_argv_bad_int`, and
+    `parse_argv_epilogue` are new labels. `parse_argv_fail`
+    grows a first-error preservation check (skip the scalar-
+    slot writes if the ring already has content) so a hard-fail
+    after prior recoverable errors does not clobber the first-
+    error slots. `parse_argv_done_ok` grows the same guard so a
+    collect-mode success walk with prior errors returns the
+    first-error code, not `ERR_OK`.
+
+Files touched:
+
+  - `src/parsed_args.pdx` — adds `ARGV_COLLECT_ALL_ERRORS`,
+    `MAX_COLLECTED_ERRORS`, `ERR_BAD_INT`, the ring bss trio
+    (`error_ring_codes`, `error_ring_indices`, `error_ring_count`),
+    `error_count`, `error_at`. Updates `parsed_args_reset` to
+    zero the ring counter.
+  - `src/parser.pdx` — renames the primary implementation to
+    `parse_argv_ex(u64, u64, u64)`; adds `parse_flags` spill at
+    `[rsp + 0]`; adds INT-validate gates to both long-flag and
+    short-flag store paths; adds `parse_argv_maybe_collect`,
+    `parse_argv_bad_int`, `parse_argv_epilogue`, and a thin
+    `parse_argv` wrapper. Re-routes every recoverable-fail
+    label to `parse_argv_maybe_collect` (keeps the two overflow
+    labels routing to `parse_argv_fail` directly).
+  - `tests/parse_grammar_tests.pdx` — adds case 35 (the
+    fingerprint above), which exercises both the bit-set path
+    (collect-all + INT validation) AND the pre-ENH-017 backward-
+    compat shape (`parse_argv` — same argv returns after `--zog`
+    with `error_count() == 1`).
+  - `tests/smoke_driver.pdx` — wires `run_case35` into the
+    driver after `run_case34`.
+  - `design/architecture.md` — adds §17 (Collect-all-errors
+    mode) covering entry-point surface, ring semantics, overflow
+    behavior, inline FKIND_INT validation, recoverable-fail
+    routing, fingerprint, and the "explicitly does not do" list.
+  - `README.md` — appends `ERR_BAD_INT` (17) to the error-
+    constant paragraph, adds the ENH-017 additions block, wires
+    `parse_argv_ex` into the parser API table, annotates
+    `parse_argv` as a thin wrapper, adds `error_count` and
+    `error_at` rows to the ParsedArgs API table, extends the
+    `parsed_args_reset` row.
+  - `doc/libpdx-argv.pdxdoc` — appends a collect-all invocation
+    example to SYNOPSIS, adds `ERR_BAD_INT (17)` to DIAGNOSTICS,
+    adds an Unreleased HISTORY entry.
+
+Klog tag: `pdxargv.collect-errors`.
+
 ### ENH-013 — Clustered short flags for BOOL/COUNTED registrations (Closes #23)
 
 M1-002 (#2) locked a one-per-hyphen short-flag grammar: any cluster

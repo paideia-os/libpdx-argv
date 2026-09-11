@@ -62,14 +62,31 @@ short-flag cluster `-abc` contained at least one letter whose
 dispatched, `flag_count` unchanged from cluster entry. Replaces the
 now-unreachable `ERR_CLUSTERED_SHORT` for the specific case that
 motivates the D3 one-per-hyphen rule. `-vv`/`-abc` clusters of
-BOOL/COUNTED short flags are now expanded instead of rejected).
+BOOL/COUNTED short flags are now expanded instead of rejected),
+`ERR_BAD_INT` 17 (`libpdx-argv.ENH-017`, Closes #27 — inline
+`Typed::parse_int_u64` decoding failed on an FKIND_INT flag's value;
+fires ONLY under `parse_argv_ex(..., ARGV_COLLECT_ALL_ERRORS)`; the
+stored flag slot is NOT rolled back, and the pre-ENH-017
+`parse_argv` never triggers this code so existing consumers see no
+behavior change).
+
+ENH-017 additions: `ARGV_COLLECT_ALL_ERRORS = 1` (bit 0 of
+`parse_argv_ex`'s third argument — turns on multi-error accumulation
+and inline INT-value validation), `MAX_COLLECTED_ERRORS = 16` (bss
+ring capacity; extra errors silently dropped from the ring but the
+parse still advances past each), and two ring-reader functions
+`error_count() -> u64` and `error_at(idx: u64) -> u64` (multi-return
+`(err_code in rax, argv_index in rdx)`, same convention as
+`FlagSpec::lookup`; an out-of-range `idx` returns `(0, 0)`).
 
 | Function | Purpose |
 | --- | --- |
-| `parsed_args_reset() -> () !{mem} @{}` | Zero the bookkeeping slots so the next parse starts clean. Arrays are consumed by index, so only counters are cleared. **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** |
+| `parsed_args_reset() -> () !{mem} @{}` | Zero the bookkeeping slots so the next parse starts clean. Arrays are consumed by index, so only counters are cleared. **(Renamed from `reset` in `libpdx-argv.ENH-030`, v1.1.0.)** **(`libpdx-argv.ENH-017`, Closes #27)** Also zeroes `error_ring_count` so the next parse starts with an empty error ring. |
 | `find_flag_by_id(id: u64) -> u64 !{mem} @{}` | Linear scan of `flag_ids`; returns the storage index `k`, or `32` (`MAX_FLAGS`) if that id was never seen. **First-wins** on a repeated flag (`libpdx-argv.ENH-008`). |
 | `find_last_flag_by_id(id: u64) -> u64 !{mem} @{}` | **(ENH-008)** Same as above but **last-wins** — scans downward, so a later occurrence of a repeated flag shadows an earlier one (e.g. `--color=auto --color=never` → `never`). |
 | `count_flag_by_id(id: u64) -> u64 !{mem} @{}` | **(ENH-008)** Number of stored flags with the given id (0 if never seen) — for the repeat-count idiom (`-v -v -v`). |
+| `error_count() -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** Number of error records the current parse accumulated into the ring (0..`MAX_COLLECTED_ERRORS`). A successful parse reports 0; a non-collect-mode parse that failed at the first error reports 1; a collect-mode parse reports the number of recoverable failures, capped at `MAX_COLLECTED_ERRORS`. |
+| `error_at(idx: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** Multi-return `(err_code in rax, argv_index in rdx)` — reads slot `idx` of the error ring. Out-of-range (`idx >= error_count()` or `idx >= MAX_COLLECTED_ERRORS`) returns `(0, 0)`; the `0` err_code is distinguishable from any real `ERR_*` because the ring is only appended to on failure. Callers gate iteration on `error_count()` and treat the ring's `argv_index` field the same way they treat the scalar `error_arg_index` slot for a single-error parse. |
 
 ### flag_spec.pdx — `FlagSpec`
 
@@ -92,7 +109,8 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 
 | Function | Purpose |
 | --- | --- |
-| `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). Treats `argv[0]` as an ordinary argv slot — callers invoked from `_start` should either pre-skip the program-name slot themselves or call `parse_argv_skipping_zero` (see next row). |
+| `parse_argv_ex(argv: u64, argc: u64, parse_flags: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** The ENH-017 primary. Same walk as `parse_argv` plus opt-in behaviors gated on `parse_flags` bits. Bit 0 (`ARGV_COLLECT_ALL_ERRORS`): keep parsing after recoverable failures, accumulating up to `MAX_COLLECTED_ERRORS` (16) records in `ParsedArgs::error_ring_*`; also enables inline `Typed::parse_int_u64` validation of every FKIND_INT flag's value (records `ERR_BAD_INT` on decode failure). Bit unset ⇒ behaves byte-for-byte like `parse_argv`. Bits 1..63 reserved; must be zero. `ERR_FLAG_OVERFLOW` / `ERR_POS_OVERFLOW` still stop the parse under both modes (storage exhaustion). |
+| `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). Treats `argv[0]` as an ordinary argv slot — callers invoked from `_start` should either pre-skip the program-name slot themselves or call `parse_argv_skipping_zero` (see next row). **(`libpdx-argv.ENH-017`, Closes #27)** Now a thin wrapper over `parse_argv_ex(argv, argc, 0)`; the signature is preserved so every existing consumer links unchanged. |
 | `parse_argv_skipping_zero(argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-031`)** Thin wrapper: advances `argv` by one pointer slot and decrements `argc` by 1 before invoking `parse_argv`, so a consumer that received `(argv, argc)` at `_start` per the frozen `execve` ABI (`design/user/execve-abi.md`) can hand them through unmodified without the program name landing in `pos_ptrs[0]`. `argc == 0` short-circuits to `parse_argv(argv, 0)`, which returns `ERR_OK` immediately without dereferencing `argv`. Every satellite `_start` consumer (`pkg`, `ls`, `cp`, `mkdir`, `mv`, `rm`, `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) wants this shape; the bare `parse_argv` remains the lower-level primitive for callers that have already pre-skipped or synthesised argv themselves. |
 
 Grammar: long flags `--foo`, `--foo=bar`, `--foo:bar`, `--foo bar`; short

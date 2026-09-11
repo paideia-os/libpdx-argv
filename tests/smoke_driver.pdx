@@ -110,6 +110,12 @@ module SmokeDriver = structure {
         call ParseGrammarTests::run_case32;
         call ParseGrammarTests::run_case33;
         call ParseGrammarTests::run_case34;
+        // libpdx-argv.ENH-017 (Closes #27): collect-all-errors mode
+        // via parse_argv_ex + ARGV_COLLECT_ALL_ERRORS parse_flags bit.
+        // The case exercises both the bit-set path (accumulate two
+        // errors + advance past both) AND the pre-ENH-017 backward-
+        // compat shape (parse_argv, bit unset, stops at first error).
+        call ParseGrammarTests::run_case35;
 
         // --- ParseTypedValuesTests (module id 2) --------------------
         call ParseTypedValuesTests::run_case1;

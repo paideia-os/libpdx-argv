@@ -1477,3 +1477,220 @@ target) to what typing the N letters space-separated would produce:
   pre-ENH-013 behaviour.
 
 Klog tag: `pdxargv.short-cluster`.
+
+## 17. Collect-all-errors mode (ENH-017, Closes #27)
+
+Before this ENH, `Parser::parse_argv` returned on the first parse
+failure. A tool that wanted to render every diagnostic in one pass
+(a config-file linter, a shell-completion analyser, a `pkg install
+--dry-run` that walks a batch of would-be-installed manifests) had
+to re-invoke the parser once per fixup, or roll its own argv walk
+and lose the library's typed-flag / clustered-short / strict-mode
+discipline. ENH-017 lands an opt-in accumulator that keeps the
+parser walking after each recoverable failure, capping at
+`MAX_COLLECTED_ERRORS = 16` records in a bss ring the consumer
+reads via `error_count()` / `error_at(i)`.
+
+### 17.1 Entry-point surface delta
+
+The library adds one new entry point and preserves the old
+signature as a thin wrapper:
+
+- `parse_argv_ex(argv, argc, parse_flags) -> u64` — the ENH-017
+  primary. `parse_flags` is a `u64` bitfield whose bit 0
+  (`ARGV_COLLECT_ALL_ERRORS`) opts into multi-error accumulation.
+  Bits 1..63 are reserved for future ENHs and must be zero
+  (currently ignored; a caller that passes garbage bits gets
+  today's behavior for the bits that fire but must not rely on
+  it).
+- `parse_argv(argv, argc) -> u64` — thin wrapper that forwards
+  `parse_flags = 0`. Byte-for-byte identical behavior to the
+  pre-ENH-017 shape: return on first error, no ring accumulation
+  beyond the seed at `error_ring[0]`, and no inline FKIND_INT
+  value validation. Every existing consumer (pkg, ls, cp, mkdir,
+  mv, rm, mkfs.pdxfs, mount.pdxfs, umount.pdxfs, and every
+  satellite/test that links libpdx-argv today) sees no ABI change
+  — the signature is preserved and the behavior for `parse_flags
+  = 0` is unchanged.
+
+`ParsedArgs` adds two constants (`ARGV_COLLECT_ALL_ERRORS = 1`,
+`MAX_COLLECTED_ERRORS = 16`), one new error code
+(`ERR_BAD_INT = 17`), a 256-byte ring
+(`error_ring_codes: [u64; 16]` + `error_ring_indices: [u64; 16]`
++ `error_ring_count: u64`), and two reader functions
+(`error_count() -> u64`, `error_at(idx) -> (err_code in rax,
+argv_index in rdx)`). `parsed_args_reset` gains one write
+(`error_ring_count = 0`); the ring arrays are consumed by index
+up to the count, so stale trailing entries are unreachable.
+
+### 17.2 Ring semantics
+
+The ring is a parallel-array pair, 16 slots × 16 bytes per slot
+(err_code + argv_index):
+
+- Slot layout is two 8-byte fields per slot: `error_ring_codes[i]`
+  holds the `ParsedArgs::ERR_*` code the parser observed, and
+  `error_ring_indices[i]` holds the `argv` slot the failure
+  attaches to (the same value the pre-existing `error_arg_index`
+  slot would carry for a single-error parse). The two arrays are
+  parallel, not interleaved, so every store fits inside the
+  paideia-as `mov [reg + rcx*8], reg` addressing mode without any
+  scaled `(rcx*16)` or two-store sequences.
+- `error_ring_count` is the live entry count (0..16). Entries at
+  indices ≥ `error_ring_count` are dead and `error_at` refuses to
+  read them.
+- **First-error preservation.** The FIRST error observed always
+  populates `error_ring[0]` AND writes to the pre-existing scalar
+  slots `error_code` / `error_arg_index` — regardless of whether
+  the collect bit is set. A consumer that never opts into the
+  ring API still sees the first failure via the pre-existing
+  slots (unchanged from the pre-ENH-017 contract).
+- **Return-value discipline.** Every exit path with ring content
+  returns `error_ring_codes[0]` — the FIRST error's code — in
+  `rax`. The exit path is `parse_argv_epilogue`, which reads
+  `error_ring_count`; if it is nonzero the epilogue loads
+  `error_ring_codes[0]` into `rax` before ret, so consumers see
+  the "first error wins" semantic on every exit (success, hard-
+  stop, or collect-mode end-of-argv). A parse with an empty ring
+  returns whatever `rax` was set to by the exit block (0 for
+  `parse_argv_done_ok`, the current err_code for
+  `parse_argv_fail`).
+
+### 17.3 Overflow behavior
+
+The ring caps at 16 records. Beyond that, the parser silently
+drops subsequent errors from the ring but still applies the
+normal advance-past-argv-slot recovery so parse-side state stays
+coherent. A consumer that suspects it is dropping errors sizes
+its argv defensively or opts out of collect-all mode. 16 is the
+smallest cap that covers every I3 tool's worst-case argv (12
+flags + 4 positionals for `pkg install --dry-run --json ...`)
+while staying inside 256 bytes of .bss.
+
+`ERR_FLAG_OVERFLOW` and `ERR_POS_OVERFLOW` (storage-exhaustion
+errors) still stop the parse even under collect-all mode — the
+`flag_names` / `flag_values` / `pos_ptrs` arrays are full and
+continuing would trip the same gate on every subsequent slot.
+The direct-fail path `parse_argv_fail` populates `error_ring[0]`
+if the ring is empty and appends the hard-stop error otherwise
+(preserving the first-error return semantics), then jumps to
+`parse_argv_epilogue` which returns.
+
+### 17.4 Inline FKIND_INT value validation
+
+Setting `ARGV_COLLECT_ALL_ERRORS` also enables an inline
+`Typed::parse_int_u64` call after every store whose kind ==
+FKIND_INT (2) and value != null. A decode failure records
+`ERR_BAD_INT = 17` into the ring at the same argv index the
+failing value slot sits at (r13 has been advanced past the flag
+onto the value by the time the gate fires), then advances past
+the value slot and continues parsing (or, under bit-unset — but
+the gate is dominated by the same bit check, so the "or" is
+unreachable — falls through to the epilogue). The store itself
+is NOT rolled back: a consumer walking `ParsedArgs::flag_*` post-
+parse sees the (name, raw-string-value, id, INT) triple the
+parser observed alongside the `ERR_BAD_INT` record; the ring is
+the diagnostic ground truth for INT-decode failures.
+
+The validation is opt-in with the collect bit: `parse_argv(argv,
+argc)` (bit unset) never calls the decoder at parse time — the
+pre-ENH-017 contract that INT-value decoding happens at the
+consumer's dispatch site is preserved byte-for-byte. This also
+avoids a change of semantics for consumers who deliberately
+accept non-numeric INT values (e.g. `--jobs auto` where "auto"
+is a tool-specific sentinel the consumer's dispatch decodes
+itself).
+
+### 17.5 Recoverable-fail routing
+
+Every recoverable fail label jumps to `parse_argv_maybe_collect`
+instead of `parse_argv_fail`. The router:
+
+  1. Records `(rax=err_code, r13=argv_index)` into
+     `error_ring[error_ring_count]` if capacity remains. If this
+     is the first error (ring_count == 0), also writes into the
+     scalar `error_code` / `error_arg_index` slots.
+  2. Loads `parse_flags` from `[rsp + 0]` (the alignment-pad slot
+     the 6-push prologue reserves; ENH-017 spills the third
+     argument there without changing the prologue shape or the
+     nested-call rsp%16 = 0 invariant). If bit 0 is set, jumps
+     to `parse_argv_advance_loop` (parser continues past the
+     failing argv slot). Otherwise falls through to
+     `parse_argv_epilogue` (parser returns the first-error code
+     — same as the pre-ENH-017 fail-return path).
+
+Recoverable fails: `ERR_UNKNOWN_FLAG`, `ERR_MISSING_VALUE`,
+`ERR_UNKNOWN_ARG_FORM`, `ERR_LONG_MISSING_NAME`,
+`ERR_CLUSTER_WITH_ARITY`, `ERR_BAD_INT`. Hard-stop fails:
+`ERR_FLAG_OVERFLOW`, `ERR_POS_OVERFLOW` (storage exhausted).
+Auto-emit success signals (`ERR_VERSION_EMITTED`,
+`ERR_HELP_EMITTED`) still route to `parse_argv_fail` — they are
+intentional early exits, not errors, and terminate the parse
+under both modes.
+
+### 17.6 Fingerprint (issue #27)
+
+Under `ARGV_COLLECT_ALL_ERRORS` with argv `["tool", "--zog",
+"--bad-int", "notanumber", "--", "pos"]` (parse_argv_ex, argc=6),
+where `--zog` is unregistered under `FlagSpec::set_strict(1)`
+and `--bad-int` is registered as `FKIND_INT` with id 100:
+
+  - Return value: `ERR_UNKNOWN_FLAG` (12) — the first-error code
+    from `error_ring_codes[0]` via `parse_argv_epilogue`.
+  - `error_code = 12`, `error_arg_index = 1` — first-error scalar
+    slots seeded by the very first `parse_argv_maybe_collect`.
+  - `error_count() == 2`.
+  - `error_at(0) == (12, 1)` — the `--zog` unknown-flag record.
+  - `error_at(1) == (17, 3)` — the `notanumber` bad-int record;
+    argv_index is the value slot the parser was on when
+    `parse_int_u64` returned ok=0 (r13 == 3 after the flag
+    consumed argv[i+1] via lookahead).
+  - `pos_count == 2` — `argv[0]="tool"` (classifier at loop head)
+    and `argv[5]="pos"` (via the ddash gate). `argv[0]="tool"`
+    lands as a positional because this fingerprint invokes
+    `parse_argv_ex` directly, not `parse_argv_skipping_zero`.
+  - `ddash_seen == 1`, `ddash_arg_index == 4`.
+
+Without the collect bit (`parse_argv(argv, 6)`), the same argv
+returns after `--zog` with `error_count() == 1`, `error_code =
+12`, `pos_count = 1` (only `"tool"` was seen), and the
+`--bad-int` / `notanumber` / `--` / `pos` slots never processed.
+This backward-compat contract is byte-for-byte identical to the
+pre-ENH-017 `parse_argv` return-on-first-error behavior; the
+ring's single-slot seed is the only observable delta and it does
+not affect any consumer that reads only the scalar slots.
+
+### 17.7 What ENH-017 explicitly does not do
+
+- **No ring emit on `ERR_OK`.** A successful parse leaves the
+  ring empty (`error_ring_count == 0`); `error_at(0)` returns
+  `(0, 0)` and `error_count() == 0`.
+- **No inline FKIND_STR / FKIND_ENUM / FKIND_SIZE / FKIND_TIMESPAN
+  validation.** Only FKIND_INT gets an inline `parse_int_u64`
+  call. The other typed decoders live at the consumer's
+  dispatch site (`Typed::parse_size`, `Typed::parse_timespan`,
+  ENUM/STR are consumer-owned) and adding inline validation for
+  them under the collect bit would multiply the parser's
+  cross-module surface without a matching consumer demand.
+- **No schema-record invocation-path collect.** The
+  `SchemaInvoke::parse_from_schema_record` path is single-error
+  by construction — a malformed record either satisfies the
+  layout or it doesn't. Adding a collect mode there would need
+  a re-cut of the wire schema (an offset per malformed field)
+  and pushes complexity into the peer sender for no consumer
+  benefit today.
+- **No `ERR_VERSION_EMITTED` / `ERR_HELP_EMITTED` collect
+  interaction.** The two auto-emit success signals still stop
+  the parse under both modes; they are intentional early exits
+  and continuing past them would produce output the tool did not
+  ask for.
+- **No ABI change for existing callers.** `parse_argv` keeps its
+  pre-ENH-017 signature `(u64, u64) -> u64` and forwards
+  `parse_flags = 0`. Every pre-ENH-017 call site links unchanged.
+- **No dynamic ring capacity.** MAX_COLLECTED_ERRORS is a compile-
+  time constant (16); a consumer that wants more must resize
+  the ring in a follow-on ENH. Overflow behaviour is intentional
+  and silent — a growing ring would need a re-cut of the reader
+  API to distinguish "16 errors" from "16 or more".
+
+Klog tag: `pdxargv.collect-errors`.
