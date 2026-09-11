@@ -108,7 +108,10 @@ for every tool that calls it. IDs 1..9 are RESERVED for these
 flags; a tool's own flags start at id 100.
 
   id 1  --help           back-end forwards to `doc <tool>`
-  id 2  --version        emits `<tool> <semver>` on stdout
+  id 2  --version        library-owned auto-emitter (ENH-032, #25):
+                          writes `<tool> <ver>\n<TOOL> VERSION OK\n`
+                          to fd 1 and returns ERR_VERSION_EMITTED (13).
+                          Opt out with VersionBackend::set_override(1).
   id 3  --dry-run        report what would change; don't do it
   id 4  --json           emit output as line-delimited JSON
   id 5  --schema         list this tool's declared output schemas
@@ -203,8 +206,18 @@ Consumers that emit no schema-bearing output register nothing
 libpdx-argv itself requires none (see `caps.decl`). It reads
 only the caller's own argv memory, and for the `--foo=bar` form
 mutates that memory in place to null-terminate on `=`. It runs
-synchronously inside the caller's process and issues no
-syscalls.
+synchronously inside the caller's process and, aside from the
+`--version` auto-emitter documented below, issues no syscalls.
+
+`VersionBackend::emit_default` (`libpdx-argv.ENH-032`, #25) issues
+seven raw `sys_write` syscalls on fd 1 when the parser observes
+`--version` and the tool has not opted out via
+`VersionBackend::set_override(1)`. The syscalls inherit the
+caller's fd-1 cap; libpdx-argv holds no cap of its own to gate
+them. Consumers that lack a KIND_TTY / KIND_IPC_ENDPOINT cap on
+fd 1 see the syscalls fail with EBADF and the emitter returns
+anyway — the auto-emit is best-effort, and the tool exits after
+parse_argv returns ERR_VERSION_EMITTED (13) regardless.
 
 .section DIAGNOSTICS
 `Parser::parse_argv` and `SchemaInvoke::parse_from_schema_record`
@@ -247,6 +260,14 @@ whole-buffer header failure.
                                      default — an unregistered flag is
                                      silently accepted as boolean
                                      unless strict mode is enabled.)
+  ERR_VERSION_EMITTED (13)          library-owned --version auto-emitter
+                                     fired (libpdx-argv.ENH-032, #25).
+                                     Not an error — a success signal
+                                     the tool responds to with exit(0)
+                                     (the fingerprint has already been
+                                     written to fd 1). Opt out via
+                                     VersionBackend::set_override(1) to
+                                     render your own --version text.
 
 `ERR_UNKNOWN_ARG_FORM` (3) fires when an argv slot is neither
 flag-shaped (starts with `-` AND has at least one byte after) NOR a

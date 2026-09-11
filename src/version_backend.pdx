@@ -1,0 +1,360 @@
+// src/version_backend.pdx — libpdx-argv.ENH-032 (Closes #25)
+// VersionBackend: library-owned `--version` auto-emitter.
+//
+// Motivation
+// ----------
+// `StdVocab::register_all` reserves `--version` (STD_ID_VERSION = 2),
+// but before this ENH every consumer re-implemented the `--version`
+// emit path: rebuild `<tool> <ver>\n<TOOL> VERSION OK\n` in local
+// .rodata, sys_write it, exit 0 — 20-odd lines of boilerplate
+// duplicated across `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`,
+// `libpdx-audit`, `libpdx-elevate`, `shell`, and every P0 satellite
+// that ships. This module lifts the emit into the library:
+// `Parser::parse_argv` observes `--version` (dispatched by id ==
+// STD_ID_VERSION, not by name compare) and, if the tool has not
+// opted out via `VersionBackend::set_override(1)`, calls
+// `emit_default` and returns the new `ParsedArgs::ERR_VERSION_EMITTED`
+// (13). Consumers dispatch that code exactly as they would any other
+// non-zero return — typically `exit(0)` — and the emit path is one
+// shared implementation, not seven copies.
+//
+// Contract (frozen)
+// -----------------
+// On `Parser::parse_argv(argv, argc)` with any argv slot equal to
+// `--version` AND `override_enabled == 0`:
+//   1. `emit_default` writes to fd 1 (stdout), in seven sys_write
+//      calls, the byte sequence:
+//        <DOC_TOOL_NAME bytes without NUL>
+//        ' '
+//        <PDX_TOOL_VERSION bytes without NUL>
+//        '\n'
+//        <DOC_TOOL_NAME_UPPER bytes without NUL>
+//        ' VERSION OK\n'
+//   2. `ParsedArgs::error_code` is set to `ERR_VERSION_EMITTED` (13).
+//   3. `parse_argv` returns `ERR_VERSION_EMITTED` in rax, WITHOUT
+//      continuing to parse any argv slot after the `--version` slot.
+//      This matches how every existing tool's hand-rolled emit
+//      shortcircuits: once `--version` is observed the tool has said
+//      what it will say.
+//
+// The legacy `<TOOL> VERSION OK\n` line preserves the fingerprint the
+// paideia-os smoke drivers already grep for (an artefact of the
+// hand-rolled emitters this ENH consolidates); dropping it would
+// invalidate half a dozen downstream smoke fixtures on the same
+// commit. New klog tag for the library-side emit is
+// `pdxargv.version-auto`; the tag itself is not printed to fd 1 — it
+// is the identifier a klog subscriber (once the kernel-side klog
+// substrate lands, R51+) uses to correlate an auto-emit with the
+// argv slot that triggered it.
+//
+// Extern symbol convention
+// ------------------------
+// `PDX_TOOL_VERSION` is a NUL-terminated ASCII string in `.rodata`
+// defined per-tool in that tool's own constants module. This module
+// only REFERENCES it via `lea rsi, [rip + PDX_TOOL_VERSION]`; the
+// resulting object carries an UND relocation resolved at final-link
+// time. Consumers that link libpdx-argv without defining
+// `PDX_TOOL_VERSION` fail at ld with an undefined-symbol error naming
+// the missing symbol — a build-time catch, not a run-time surprise.
+// The mirroring symbol on the tool side is:
+//
+//   // e.g. mkfs.pdxfs/src/version_constants.pdx
+//   module VersionConstants = structure {
+//     pub let PDX_TOOL_VERSION : [u8; N] = "<semver>\0"
+//   }
+//
+// No weak-symbol default is provided by libpdx-argv: the paideia-as
+// 0.36 encoder does not currently expose the STB_WEAK binding, and
+// even if it did a wrong-version default ("0.0.0-unset\0" say) would
+// silently pass under `--version` — worse than a link-time failure.
+//
+// The tool-name half is currently sourced from
+// `HelpBackend::DOC_TOOL_NAME` per the issue contract. That symbol is
+// today the fixed literal `"doc\0"` — every tool's auto-emit therefore
+// says `doc <ver>\nDOC VERSION OK\n`. Making it per-tool is a
+// follow-on ENH (probably by promoting DOC_TOOL_NAME to a weak/extern
+// symbol paired with PDX_TOOL_VERSION); the paired uppercase literal
+// `DOC_TOOL_NAME_UPPER` in this module tracks the lowercase mirror.
+// If DOC_TOOL_NAME ever varies at build time, this module's coupled
+// pair must vary with it or the emit's second line will diverge from
+// the first — a fingerprint break the version-emit case in
+// `tests/parse_std_vocab.pdx` catches.
+//
+// Override mechanism
+// ------------------
+// A tool that intends to render its own `--version` output (for
+// instance to include a signing-key fingerprint or a build-hash the
+// library-owned emit does not know about) calls
+// `VersionBackend::set_override(1)` at bootstrap, before
+// `parse_argv`. With `override_enabled == 1` the parser stores
+// `--version` as an ordinary flag and returns `ERR_OK`; the tool
+// then finds it via `ParsedArgs::find_flag_by_id(STD_ID_VERSION)` and
+// emits its own text. `set_override(0)` restores the default.
+// `pdxargv_version_reset()` (called by `TestHarness::full_reset`)
+// zeroes `override_enabled` so each test starts from the auto-emit
+// default.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module VersionBackend (PascalCase basename matching file).
+//   - `version_strlen`, `pdxargv_version_reset`, `set_override` are
+//     leaf; only caller-save regs.
+//   - `emit_default` is non-leaf: it calls `version_strlen` for the
+//     dynamic PDX_TOOL_VERSION length. 4-push (rbx/r12/r13/r14) +
+//     sub rsp, 8 prologue → 40 + 8 = 48 bytes on stack past the
+//     return address, rsp%16 = 0 at every nested call. `syscall`
+//     itself has no alignment requirement (only CALL does), so the
+//     six interleaved sys_writes need no additional bookkeeping.
+//   - No test mnemonic anywhere; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm is well ≤ 0x7FFFFFFF (max: 0x7A for the
+//     ASCII 'z' bound in the uppercase gate; 32 for register push
+//     accounting is in a comment only).
+//   - Byte loads use xor rax,rax; mov_b rax,[ptr] per #1248.
+//   - No `and reg, imm64` on r8-r15; no 2-op `imul r, imm`; no
+//     `cmp reg, [mem]`; no `[reg + N*8]` for uncommon scales.
+//   - Reserved-label discipline: every internal label is prefixed
+//     with `pdxv_` so `loop`/`if`/etc. keywords never appear.
+
+module VersionBackend = structure {
+
+  // ============================================================
+  // Public literals — bytes emitted verbatim by `emit_default`.
+  // Each carries a trailing NUL per this repo's convention (the NUL
+  // is not written; the length shipped to sys_write excludes it).
+  // ============================================================
+
+  // Single ASCII space between the tool name and the version.
+  pub let LIT_SPACE      : [u8; 2]  = " \0"
+
+  // Trailing newline after the version, before the legacy line.
+  pub let LIT_NEWLINE    : [u8; 2]  = "\n\0"
+
+  // Legacy `[legacy: <NAME> VERSION OK]` marker text as it must
+  // reach fd 1 — a single space, then `VERSION OK`, then LF. Twelve
+  // bytes; the NUL is a literal-terminator only.
+  pub let LIT_VERSION_OK : [u8; 13] = " VERSION OK\n\0"
+
+  // Uppercase mirror of HelpBackend::DOC_TOOL_NAME ("doc\0" → "DOC\0").
+  // Coupled with the lowercase symbol at library-ship time (see the
+  // module preamble's "Extern symbol convention"). If either symbol
+  // ever becomes per-tool the pair must vary together.
+  pub let DOC_TOOL_NAME_UPPER     : [u8; 4] = "DOC\0"
+  pub let DOC_TOOL_NAME_UPPER_LEN : u64     = 3
+
+  // Length of HelpBackend::DOC_TOOL_NAME's payload (bytes before the
+  // NUL). Kept alongside its uppercase mirror to save a strlen probe
+  // on every emit_default call.
+  pub let DOC_TOOL_NAME_LEN       : u64     = 3
+
+  // ============================================================
+  // Singleton .bss state.
+  //
+  // `override_enabled`: 0 (default) means the parser's --version
+  // observation triggers `emit_default` + returns
+  // ERR_VERSION_EMITTED. Nonzero means the parser stores --version
+  // as an ordinary flag and returns ERR_OK, leaving the tool to
+  // render its own text. `pdxargv_version_reset` zeros this.
+  // ============================================================
+  pub let mut override_enabled : u64 = uninit @align(8)
+
+  // ============================================================
+  // pdxargv_version_reset()
+  // Signature: () -> () !{mem} @{}
+  //
+  // Leaf. Zero the singleton override flag so the next parse starts
+  // from the auto-emit default. Called by `TestHarness::full_reset`
+  // so a case-scoped `set_override(1)` never leaks into the case
+  // after. Uninit slots have no defined initial value, so a first
+  // parse without a prior reset is undefined behaviour — the reset
+  // is what makes the auto-emit deterministic on a fresh process.
+  // Consumers not using the test harness call this once at
+  // `_start` alongside `parsed_args_reset` and `flag_spec_reset`.
+  // ============================================================
+  pub let pdxargv_version_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-032 VersionBackend::pdxargv_version_reset — zero override_enabled so the next parse defaults to the library-owned --version auto-emitter. Leaf; r11 lea scratch; xor rax,rax produces the zero constant. Mirror of parsed_args_reset / flag_spec_reset / schema_emit_reset in shape; the per-module prefix follows the ENH-030 rename convention (bare `reset` would collide across the four modules on any consumer's link line).",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + override_enabled];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // set_override(on)
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = 0 → auto-emit on (default); nonzero → auto-emit off
+  //
+  // Leaf. Store the caller-supplied value directly into
+  // override_enabled; the parser reads the same slot before deciding
+  // to auto-emit. Idempotent — called twice with the same value has
+  // the same effect as called once. A tool that wants a
+  // build-conditional --version format (release vs. debug, say) can
+  // toggle this per-invocation before calling parse_argv.
+  // ============================================================
+  pub let set_override : (u64) -> () !{mem} @{} =
+    fn (on: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-032 VersionBackend::set_override — store rdi (0 or nonzero) into override_enabled. Leaf; r11 lea scratch. Any nonzero value disables the library-owned auto-emit; the parser's gate is `cmp override_enabled, 0; jne skip-auto-emit`, so the caller need not pass exactly 1 (though 1 is the convention documented in the module preamble). No sanitisation is performed — this is a tool-side opt-out, and the tool that calls it holds the same cap chain as the tool that would render --version anyway.",
+      block: {
+        lea r11, [rip + override_enabled];
+        mov [r11], rdi;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // version_strlen(s) -> len
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   rdi = NUL-terminated string pointer
+  //   rax = byte length before the NUL
+  //
+  // Leaf. Byte-loop strlen, identical shape to
+  // `mkfs.pdxfs::format_record_strlen` (kept as a per-module copy
+  // rather than a shared symbol so version_backend.o has no
+  // cross-file link dependency beyond the extern PDX_TOOL_VERSION).
+  // xor+mov_b loads *rdi into rcx (zero-extended per #1248);
+  // cmp rcx, 0; je done; else add rax,1; add rdi,1; loop.
+  // ============================================================
+  pub let version_strlen : (u64) -> u64 !{mem} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-032 VersionBackend::version_strlen — byte-loop strlen returning the count in rax. Pure leaf; rax/rcx/rdi are all SysV caller-save. Byte load uses xor rcx,rcx; mov_b rcx,[rdi] per #1248 (avoids the false partial-register dependency movzx/mov r64,[m8] pattern would introduce). No `add reg,[mem]`, no test mnemonic. Labels prefixed pdxv_strlen_ per the reserved-label discipline. Duplicated rather than shared with format_record_strlen because libpdx-argv links independently from mkfs.pdxfs and cannot introduce a link-order dependency between two satellite repos.",
+      block: {
+        xor rax, rax;
+
+      pdxv_strlen_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je pdxv_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp pdxv_strlen_loop;
+
+      pdxv_strlen_done:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // emit_default()
+  // Signature: () -> () !{mem} @{}
+  //
+  // Non-leaf. Writes the fingerprint sequence documented in the
+  // module preamble ("Contract (frozen)") to fd 1 via seven raw
+  // sys_write syscalls. The Linux/paideia SysV syscall number for
+  // sys_write is 1 (rax=1, rdi=fd, rsi=buf, rdx=count, syscall;
+  // rax on return = bytes written, unused here — the emit is
+  // best-effort and this function returns success unconditionally
+  // even on a short-write or EBADF: a --version handler that
+  // failed to write on stdout has no meaningful recovery path
+  // and the tool exits after this returns anyway).
+  //
+  // Frame: 4-push (rbx/r12/r13/r14) + sub rsp, 8 = 48 bytes past
+  // the return address → rsp%16 = 0 at the nested call to
+  // version_strlen. rbx/r12/r13/r14 are all callee-save under SysV
+  // so the parser's own callee-save register state (rbx/rbp/r12/
+  // r13/r14/r15 spanning the parse_argv body) is preserved across
+  // this call without additional bookkeeping.
+  //
+  // Register plan inside the frame:
+  //   r14 = DOC_TOOL_NAME_LEN (hoisted once; identical bytes-count
+  //         for both the lowercase write in step 2 and the
+  //         uppercase write in step 6 because DOC_TOOL_NAME_UPPER
+  //         is coupled at ship time — see module preamble).
+  //   r12 = strlen(PDX_TOOL_VERSION), computed once via
+  //         version_strlen and reused for step 4's sys_write
+  //         length.
+  //   rbx, r13 = unused; pushed only for alignment parity so future
+  //              additions (a build-hash line, say) can spill without
+  //              re-padding the frame.
+  //
+  // Caps.decl impact: this module performs sys_write on fd 1.
+  // libpdx-argv 1.1.0 caps.decl said "performs NO syscalls of its
+  // own" — that language is amended in this ENH's caps.decl update
+  // to carve out the version emitter as a deliberate, single-purpose
+  // exception. Consumers that hold a KIND_TTY / KIND_IPC_ENDPOINT
+  // cap on fd 1 (every P0 tool does) see the writes hit stdout;
+  // consumers that do not hold that cap see the syscalls fail with
+  // -EBADF (or the paideia-os equivalent) and this function
+  // returns anyway — same silent-write policy as the schema-emit
+  // consumer pattern uses.
+  // ============================================================
+  pub let emit_default : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-032 VersionBackend::emit_default — seven sys_writes to fd 1 realising the frozen fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n`. Non-leaf: one call to VersionBackend::version_strlen resolves PDX_TOOL_VERSION's length. 4-push prologue (rbx/r12/r13/r14) plus sub rsp, 8 aligns rsp%16 to 0 for the nested call; rbx/r13 are pushed for alignment parity rather than use, so a future extension (build-hash line, signing-key fingerprint) can spill into them without re-padding the frame. r14 hoists DOC_TOOL_NAME_LEN once because the lowercase write in segment 2 and the uppercase write in segment 6 share the same byte count by ship-time coupling (module preamble). r12 preserves the PDX_TOOL_VERSION length across the syscall in segment 4. syscall itself has no rsp-alignment requirement (only CALL does), so the six interleaved sys_writes need no additional bookkeeping between the strlen call and epilogue. Byte loads inside version_strlen use xor+mov_b per #1248. No test mnemonic; every zero-check is cmp reg,0. No `and reg,imm64` on r8-r15; no 2-op `imul r,imm`; no `cmp reg,[mem]`; no `[reg + N*8]` non-unit scale. Reserved-label discipline: labels prefixed pdxv_emit_ where any exist (no internal branches in this function's body — every fall-through is straight-line syscall issue).",
+      block: {
+        // ---- prologue (4 pushes + 8-byte pad → rsp%16 = 0) --------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        // Hoist DOC_TOOL_NAME_LEN into r14 (shared by segments 2 and 6).
+        lea r11, [rip + DOC_TOOL_NAME_LEN];
+        mov r14, [r11];
+
+        // -- Segment 1: compute strlen(PDX_TOOL_VERSION) into r12 --------
+        // PDX_TOOL_VERSION is an UND extern in this object; the linker
+        // binds it to the per-repo constants module at final link time.
+        lea rdi, [rip + PDX_TOOL_VERSION];
+        call version_strlen;
+        mov r12, rax;                       // r12 = version-string length
+
+        // -- Segment 2: sys_write(1, DOC_TOOL_NAME, DOC_TOOL_NAME_LEN) ---
+        mov rax, 1;                         // SYS_write
+        mov rdi, 1;                         // fd = stdout
+        lea rsi, [rip + DOC_TOOL_NAME];     // HelpBackend export
+        mov rdx, r14;
+        syscall;
+
+        // -- Segment 3: sys_write(1, LIT_SPACE, 1) -----------------------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + LIT_SPACE];
+        mov rdx, 1;
+        syscall;
+
+        // -- Segment 4: sys_write(1, PDX_TOOL_VERSION, r12) --------------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + PDX_TOOL_VERSION];
+        mov rdx, r12;
+        syscall;
+
+        // -- Segment 5: sys_write(1, LIT_NEWLINE, 1) ---------------------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + LIT_NEWLINE];
+        mov rdx, 1;
+        syscall;
+
+        // -- Segment 6: sys_write(1, DOC_TOOL_NAME_UPPER, r14) -----------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + DOC_TOOL_NAME_UPPER];
+        mov rdx, r14;
+        syscall;
+
+        // -- Segment 7: sys_write(1, LIT_VERSION_OK, 12) -----------------
+        mov rax, 1;
+        mov rdi, 1;
+        lea rsi, [rip + LIT_VERSION_OK];
+        mov rdx, 12;
+        syscall;
+
+        // ---- epilogue (mirror the prologue, restore rsp) --------------
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

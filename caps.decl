@@ -5,10 +5,32 @@
 #
 # libpdx-argv is a pure userspace library. It reads only the caller's own
 # argv memory and (for --foo=bar) mutates that memory in place to null-
-# terminate on the '='. It performs NO syscalls of its own and therefore
-# requires NO capabilities of its own. The caller's argv memory is
-# already backed by cap grants the caller holds (typically the loader's
-# InitCap sidecar per src/kernel/core/loader/init_caps.pdx in paideia-os).
+# terminate on the '='. It requires NO capabilities of its own. The
+# caller's argv memory is already backed by cap grants the caller holds
+# (typically the loader's InitCap sidecar per
+# src/kernel/core/loader/init_caps.pdx in paideia-os).
+#
+# libpdx-argv.ENH-032 (Closes #25, 2026-09-10): the pre-1.2 language
+# "performs NO syscalls of its own" is narrowed. VersionBackend::
+# emit_default issues seven raw sys_write syscalls on fd 1 (seven,
+# so the byte sequence is written as separate segments rather than
+# buffered into a single write — the library holds no scratch large
+# enough to buffer arbitrary tool-side PDX_TOOL_VERSION strings, and
+# a short-write on any segment leaves fd 1 in a self-consistent state
+# rather than a truncated mid-buffer state). The emit path fires only
+# when the parser observes the argv slot equal to `--version` AND
+# the tool has not opted out via VersionBackend::set_override(1);
+# every other libpdx-argv entry point remains syscall-free.
+#
+# Cap posture unchanged: the syscall inherits the caller's fd-1 cap
+# at the process boundary, not any cap this library holds. A
+# consumer that lacks a KIND_TTY / KIND_IPC_ENDPOINT cap on fd 1
+# (there is no such consumer among the R49+R50 P0 tools; every P0
+# holds it) sees the syscalls fail with EBADF and emit_default
+# returns anyway — the auto-emit is best-effort and the tool exits
+# after parse_argv returns ERR_VERSION_EMITTED (13) either way.
+# This is the same silent-write policy the schema-emit consumer
+# pattern uses.
 #
 # Callers that use libpdx-argv must independently declare in their own
 # caps.decl any caps their tool needs (KIND_USER, KIND_TTY, KIND_PDXFS_*,

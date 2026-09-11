@@ -172,4 +172,112 @@ module ParseStdVocabTests = structure {
         pop rbx; ret;
       }
     }
+
+  // ============================================================
+  // --version auto-emitter tests (libpdx-argv.ENH-032, Closes #25)
+  //
+  // Two cases:
+  //   3 — auto-emit fires:      parse_argv on ["--version"] returns
+  //                              ERR_VERSION_EMITTED (13); error_code
+  //                              records the same code.
+  //   4 — override yields:      after set_override(1), the same argv
+  //                              returns ERR_OK; --version stores as
+  //                              an ordinary flag (flag_count=1;
+  //                              find_flag_by_id(STD_ID_VERSION)!=32).
+  //
+  // Both cases share a single-slot argv (the flag itself; no argv[0]
+  // program-name slot — parse_argv treats every argv entry as an
+  // ordinary token per its M1 shape). Case 3's emit_default DOES
+  // write to fd 1 while the smoke driver runs — the seven sys_writes
+  // land on stdout unless the smoke wrapper redirects them, which is
+  // deliberate: verifying the return code is the assertion this
+  // module owns; the byte sequence itself is verified by a
+  // downstream paideia-os shell fixture that greps for `<TOOL>
+  // VERSION OK`. In the smoke driver a definition of
+  // PDX_TOOL_VERSION (any nonempty NUL-terminated string) must be
+  // supplied at link time — the smoke_driver.pdx `tool_ver_stub`
+  // symbol is the in-repo stub; consumers linking libpdx-argv into
+  // their own tool supply their own per-repo constants module.
+  // ============================================================
+  // Reuses `a_version` (line 22) as the single argv slot; `argv_ver`
+  // is scoped to case 3, `argv_ver2` to case 4, so the two cases can
+  // share the a_version pointer without cross-case interference.
+  pub let mut argv_ver : [u64; 1] = uninit @align(8)
+
+  pub let run_version_auto_emit : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-032 (Closes #25) case 3 — --version auto-emitter fires when StdVocab::register_all has registered the flag with id=2 AND VersionBackend::override_enabled == 0. TestHarness::full_reset (post-ENH-032) zeros override_enabled via pdxargv_version_reset, so the default path is exercised. parse_argv on ['--version'] must return ERR_VERSION_EMITTED (13) in rax AND write the same code into ParsedArgs::error_code (both are done by parse_argv_fail, the shared error-return path). Case 3 in module id 5 → last_fail_tag = 0x500000003 on failure. 1-push (rbx) prologue for the parse_argv/find_flag_by_id/full_reset nested calls' alignment.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        lea rbx, [rip + argv_ver];
+        lea r11, [rip + a_version];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + argv_ver];
+        mov rsi, 1;
+        call parse_argv;
+
+        cmp rax, 13; jne va_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 13; jne va_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      va_fail:
+        mov rdi, 0x500000003;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  pub let mut argv_ver2 : [u64; 1] = uninit @align(8)
+
+  pub let run_version_override : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-032 (Closes #25) case 4 — VersionBackend::set_override(1) opts the tool out of the library-owned auto-emit. After the override is set, parse_argv on ['--version'] must return ERR_OK (0) and store --version as an ordinary flag (flag_count=1; find_flag_by_id(STD_ID_VERSION) returns 0, not MAX_FLAGS=32). Case 4 in module id 5 → last_fail_tag = 0x500000004 on failure. The override is scoped to this case — TestHarness::full_reset at the next case entry zeroes override_enabled via pdxargv_version_reset. 1-push (rbx) prologue aligns rsp%16 for the nested calls.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        mov rdi, 1;
+        call set_override;
+
+        lea rbx, [rip + argv_ver2];
+        lea r11, [rip + a_version];
+        mov [rbx + 0], r11;
+
+        lea rdi, [rip + argv_ver2];
+        mov rsi, 1;
+        call parse_argv;
+
+        cmp rax, 0; jne vo_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne vo_fail;
+
+        mov rdi, 2;
+        call find_flag_by_id;
+        cmp rax, 32; je vo_fail;
+
+        call record_pass;
+        pop rbx; ret;
+
+      vo_fail:
+        mov rdi, 0x500000004;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
 }

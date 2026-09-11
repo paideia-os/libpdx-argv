@@ -5,7 +5,7 @@
 // implements the following long flags with identical semantics:
 //
 //   --help          structured help, paginated, hyperlinked into doc
-//   --version       semver + build hash + signing key fingerprint
+//   --version       semver (library-owned auto-emit, ENH-032 Closes #25)
 //   --dry-run       preview effect without executing side-effects
 //   --json          emit schema stream as JSON on stdout
 //   --schema        print the tool's output schema definition and exit
@@ -13,6 +13,20 @@
 //   --quiet         suppress non-error stderr
 //   --color=...     color emission policy (auto|always|never)
 //   --no-cap:...    strip the named capability before exec
+//
+// libpdx-argv.ENH-032 dispatch (Closes #25): registering `--version`
+// via `register_all` (id = STD_ID_VERSION = 2) opts the tool into
+// the library-owned auto-emitter. `Parser::parse_argv` observes the
+// stored id and, unless the tool called
+// `VersionBackend::set_override(1)` at bootstrap, calls
+// `VersionBackend::emit_default` (writes
+// `<tool> <ver>\n<TOOL> VERSION OK\n` to fd 1 via seven raw
+// sys_writes) and returns `ParsedArgs::ERR_VERSION_EMITTED` (13).
+// The dispatch is by id, not by name compare — a tool that
+// deliberately re-registers `--version` with a different id (say
+// 100) keeps StdVocab's other 8 flags but takes the emit path
+// itself, so the compatibility contract is opt-out at either the
+// override-flag level or the registration-id level.
 //
 // StdVocab::register_all() registers all nine with FlagSpec so the
 // Parser knows their arity and the consumer can dispatch by

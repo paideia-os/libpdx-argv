@@ -6,6 +6,148 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-032 — Library-owned `--version` auto-emitter (Closes #25)
+
+`StdVocab::register_all` reserves `--version` (id `STD_ID_VERSION` =
+2) but the M2 shape left every consumer to re-implement the emit
+path: build `<tool> <ver>\n<TOOL> VERSION OK\n` in tool-local
+`.rodata`, sys_write it, exit 0 — 20-odd lines of near-identical
+boilerplate duplicated across six P0 satellites (`mkfs.pdxfs`,
+`mount.pdxfs`, `umount.pdxfs`, `libpdx-audit`, `libpdx-elevate`,
+`shell`) and every satellite the next wave adds. ENH-032 lifts the
+emit into a new library module `VersionBackend`
+(`src/version_backend.pdx`); `Parser::parse_argv` dispatches to it
+when the just-stored flag's id equals `STD_ID_VERSION` AND the tool
+has not opted out via `VersionBackend::set_override(1)`.
+
+Contract (frozen):
+
+  Parser::parse_argv observes an argv slot == "--version"
+    → VersionBackend::emit_default writes to fd 1, via seven
+      sys_write syscalls, the byte sequence:
+        <DOC_TOOL_NAME bytes>' '<PDX_TOOL_VERSION bytes>'\n'
+        <DOC_TOOL_NAME_UPPER bytes>' VERSION OK\n'
+    → ParsedArgs::error_code = ERR_VERSION_EMITTED (13)
+    → parse_argv returns ERR_VERSION_EMITTED
+
+Dispatch is by id, not by name compare — a tool that registers
+`--version` with a non-2 id (say 100) keeps StdVocab's other 8 flags
+but takes the emit path itself. The check runs in both the
+long-flag and short-flag store paths for symmetry (StdVocab does
+not register a short alias for `--version`, but a tool wanting a
+`-V` alias for the library-owned auto-emit gets it by calling
+`flag_spec_register(&NAME_V, FKIND_BOOL, 2)` after `register_all`).
+
+Extern discipline: `PDX_TOOL_VERSION` is a per-tool
+NUL-terminated ASCII string in `.rodata` defined by the consumer's
+own constants module (e.g. `mkfs.pdxfs/src/version_constants.pdx`).
+`version_backend.o` carries an UND relocation on the symbol; a
+consumer that forgets to define it fails at ld with an
+undefined-symbol error naming `PDX_TOOL_VERSION` — a build-time
+catch, not a run-time surprise. No weak default is provided
+(paideia-as 0.36 does not expose STB_WEAK, and a wrong-default
+fallback would silently pass under `--version`).
+
+`HelpBackend::DOC_TOOL_NAME` supplies the lowercase tool-name half
+per the issue contract. That symbol is today the fixed literal
+`"doc\0"` — every tool's auto-emit therefore says
+`doc <ver>\nDOC VERSION OK\n`. Making it per-tool is a follow-on
+ENH (promote DOC_TOOL_NAME / DOC_TOOL_NAME_UPPER to a paired
+extern/weak pair supplied alongside PDX_TOOL_VERSION); the paired
+`VersionBackend::DOC_TOOL_NAME_UPPER` literal tracks the lowercase
+mirror at library-ship time to save a per-invocation uppercase
+conversion. The legacy `<TOOL> VERSION OK\n` line preserves the
+fingerprint several paideia-os smoke drivers already grep for.
+The new klog tag for the library-side emit is `pdxargv.version-auto`.
+
+Override mechanism: `VersionBackend::set_override(1)` opts the tool
+out. With override set, `parse_argv` stores `--version` as an
+ordinary flag and returns `ERR_OK`; the tool dispatches on
+`find_flag_by_id(STD_ID_VERSION)` and renders its own text
+(useful when a tool wants to include a build-hash or signing-key
+fingerprint the library-owned emit does not know about).
+`set_override(0)` restores the default; `pdxargv_version_reset()`
+(called by `TestHarness::full_reset`) zeroes the flag so each test
+starts from the auto-emit default.
+
+Cap posture: the pre-1.2 caps.decl language "performs NO syscalls
+of its own" is narrowed to carve out the seven sys_writes
+`emit_default` issues on fd 1. Consumers hold the fd-1 cap they
+already needed for their own I3 dispatch output; libpdx-argv itself
+holds no cap of its own to gate them (the syscall inherits the
+caller's cap at the process boundary). Consumers lacking the cap
+see EBADF returned by the syscall and the emit path returns anyway
+— the auto-emit is best-effort, same silent-write policy the
+schema-emit consumer pattern uses.
+
+Files touched:
+
+  - src/version_backend.pdx (NEW)
+      module VersionBackend: override_enabled, three literal
+      symbols, three .rodata length symbols, four public
+      functions (pdxargv_version_reset, set_override,
+      version_strlen, emit_default).
+
+  - src/parsed_args.pdx
+      +ERR_VERSION_EMITTED = 13.
+
+  - src/parser.pdx
+      +--version dispatch after the long-flag and short-flag
+      stores (id==2 + override==0 → call emit_default; return
+      ERR_VERSION_EMITTED via parse_argv_fail). The existing
+      6-push + sub rsp,8 prologue keeps rsp%16 aligned for the
+      added nested call.
+
+  - src/std_vocab.pdx
+      +docstring note that registering --version via register_all
+      opts the tool into the auto-emitter.
+
+  - tests/harness.pdx
+      +TestHarness::full_reset now calls pdxargv_version_reset
+      alongside the other three resets.
+
+  - tests/parse_std_vocab.pdx
+      +run_version_auto_emit (case 3): parse_argv on ["--version"]
+      returns ERR_VERSION_EMITTED; error_code records the same.
+      +run_version_override  (case 4): after set_override(1), the
+      same argv returns ERR_OK and stores --version as an ordinary
+      flag.
+
+  - tests/smoke_driver.pdx
+      +PDX_TOOL_VERSION stub ("1.2.0-libpdx-smoke\0") so the
+      smoke binary links end to end without a per-repo
+      constants module. +Case-3/4 dispatch in _start.
+
+  - caps.decl
+      +ENH-032 note narrowing the "no syscalls" language.
+
+  - design/architecture.md
+      +§12 documenting the version-backend module surface, extern
+      symbol, dispatch shape, legacy-fingerprint contract, and
+      explicit non-goals. Module-id table for id 5 grows from 2 to
+      4 cases.
+
+  - doc/libpdx-argv.pdxdoc
+      +STANDARD FLAGS row updated for --version; DIAGNOSTICS gains
+      an ERR_VERSION_EMITTED entry; CAPABILITY REQUIREMENTS
+      narrowed with the same language as caps.decl.
+
+  - README.md
+      +API surface entry for version_backend.pdx; ERR_*
+      constants list gains ERR_VERSION_EMITTED (13).
+
+Downstream migration: no existing consumer breaks. A consumer that
+already dispatches on `find_flag_by_id(STD_ID_VERSION)` in response
+to a real parse error now sees `ERR_VERSION_EMITTED` (13) in
+`parse_argv`'s return instead — the existing "if err != ERR_OK"
+branch fires. The consumer either treats 13 like ERR_OK (exit 0,
+the emit has already happened) or calls `set_override(1)` at
+bootstrap to render its own text with the pre-ENH-032 dispatch
+unchanged. Six satellite `--version` hand-rollers can retire
+their local emit path in the same commit that bumps their
+libpdx-argv pin, folding their `PDX_TOOL_VERSION` string into a
+per-repo `version_constants.pdx`.
+
 ### ENH-031 — `argv[0]`-skip convention: `parse_argv_skipping_zero` helper (Closes #41)
 
 `Parser::parse_argv` has always treated `argv[0]` as a real argv slot

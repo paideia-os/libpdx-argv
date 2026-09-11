@@ -1,5 +1,6 @@
 // src/parser.pdx — libpdx-argv.M1-001 + M1-002 + M2-001 + M2-002 + M2-003
 //               + ENH-031 (argv[0]-skip wrapper)
+//               + ENH-032 (--version auto-emit dispatch, Closes #25)
 // Parser: entry points parse_argv(argv, argc) → error_code
 //         and parse_argv_skipping_zero(argv, argc) → error_code
 //         (thin wrapper that drops argv[0] before forwarding).
@@ -34,6 +35,22 @@
 //   storing it as a boolean. SchemaInvoke::parse_from_schema_record
 //   applies the identical policy on its own invocation path.
 //
+// libpdx-argv.ENH-032 (--version auto-emit, Closes #25):
+//   After every long-flag or single-letter short-flag store,
+//   parse_argv checks whether the just-stored id equals
+//   StdVocab::STD_ID_VERSION (2) AND VersionBackend::override_enabled
+//   == 0. On both hits it calls VersionBackend::emit_default (which
+//   writes the fingerprint `<tool> <ver>\n<TOOL> VERSION OK\n` to fd
+//   1 via seven raw sys_writes) and returns ERR_VERSION_EMITTED (13)
+//   via parse_argv_fail — the same failure return path every other
+//   ERR_* code takes, so error_code and error_arg_index are recorded
+//   uniformly. The check is by id, not by name compare: a tool that
+//   registers --version via StdVocab::register_all gets the
+//   auto-emit; a tool that does not register --version at all (or
+//   that registers it with a non-2 id) never triggers it. Consumers
+//   that want to render their own --version output opt out via
+//   VersionBackend::set_override(1) at bootstrap.
+//
 // libpdx-argv.ENH-026 (malformed-argv-slot classification):
 //   The classifier now rejects two argv shapes that fit neither the
 //   flag nor the positional grammar with
@@ -56,10 +73,11 @@
 // (paideia-os).
 //
 // Cross-module symbols read/written (all resolved by unqualified name):
-//   ParsedArgs: flag_names, flag_values, flag_count, pos_ptrs,
-//               pos_count, error_code, error_arg_index, emit_schema,
-//               flag_ids, flag_kinds, ddash_seen, ddash_arg_index
-//   FlagSpec::  lookup (called via qualified name)
+//   ParsedArgs:      flag_names, flag_values, flag_count, pos_ptrs,
+//                    pos_count, error_code, error_arg_index, emit_schema,
+//                    flag_ids, flag_kinds, ddash_seen, ddash_arg_index
+//   FlagSpec::       lookup (called via qualified name)
+//   VersionBackend:: override_enabled, emit_default (ENH-032, Closes #25)
 //
 // paideia-as compliance
 // ---------------------
@@ -108,7 +126,7 @@ module Parser = structure {
   pub let parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2 + ENH-004 + ENH-026 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration).",
+      justification: "libpdx-argv.M2 + ENH-004 + ENH-026 + ENH-032 parse_argv entry point. Non-leaf: consults FlagSpec::lookup(name) once per parsed flag to decide arity (BOOL/UNKNOWN → no lookahead; typed → consume argv[i+1] or ERR_MISSING_VALUE). ENH-004: immediately after every lookup, if the returned kind is FKIND_UNKNOWN and FlagSpec::strict_mode is nonzero, fails with ERR_UNKNOWN_FLAG (12) before the inline-value short-circuit, so a strict-mode-rejected flag never gets a chance to store via its `=`/`:` inline value either; strict_mode==0 (the default FlagSpec::reset() restores) reproduces byte-identical pre-ENH-004 behaviour. Also handles the M2-003 `--` sentinel (records ddash_seen + ddash_arg_index; every subsequent argv[j] joins pos_ptrs regardless of leading byte) and the `:` value separator (used by `--no-cap:KIND_TTY` per I3). Prologue pushes rbx/rbp/r12/r13/r14/r15 (6 callee-save preserved for loop state + call-crossing spills) and adds sub rsp, 8 to bring rsp%16 to 0 for the nested call. Every store into ParsedArgs writes flag_ids and flag_kinds alongside the raw name/value pointers so consumers can dispatch via ParsedArgs::find_flag_by_id. Well-known --pdx-schema compare preserved from M1 (sets emit_schema=1 independently of FlagSpec registration). ENH-032 (Closes #25): after every long-flag or short-flag store, the just-stored id is checked against STD_ID_VERSION (2); on a match with VersionBackend::override_enabled == 0, the parser calls VersionBackend::emit_default (writes the fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n` to fd 1 via seven raw sys_writes) and returns ERR_VERSION_EMITTED (13) via parse_argv_fail — the same 6-push + sub rsp,8 prologue keeps rsp%16 aligned for the added nested call.",
       block: {
         // ---- prologue (6 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -292,6 +310,28 @@ module Parser = structure {
         lea r11, [rip + flag_count];
         mov [r11], rcx;
 
+        // -- ENH-032: --version auto-emit dispatch (Closes #25) --------
+        // If the just-stored flag is StdVocab's --version (id 2) and
+        // the tool has not opted out via
+        // VersionBackend::set_override(1), call the library-owned
+        // emitter and return ERR_VERSION_EMITTED via parse_argv_fail.
+        // r15 still holds the id from the store above; r10/r11/rax are
+        // caller-save and safe to clobber here. The nested call to
+        // emit_default is aligned by parse_argv's own 6-push +
+        // sub rsp,8 prologue (rsp%16 = 0 at every nested call site);
+        // control never returns to parse_argv_advance_loop on the
+        // auto-emit path — the tool exits after this return.
+        cmp r15, 2;                         // STD_ID_VERSION
+        jne parse_argv_long_not_version;
+        lea r11, [rip + override_enabled];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne parse_argv_long_not_version;
+        call emit_default;
+        mov rax, 13;                        // ERR_VERSION_EMITTED
+        jmp parse_argv_fail;
+      parse_argv_long_not_version:
+
         // -- Well-known --pdx-schema inline compare (M1 back-compat) --
         // If name (rbp) equals "pdx-schema\0" byte-for-byte, set
         // emit_schema=1. Any mismatch falls through to advance.
@@ -388,6 +428,27 @@ module Parser = structure {
         add rcx, 1;
         lea r11, [rip + flag_count];
         mov [r11], rcx;
+
+        // -- ENH-032: --version auto-emit dispatch (Closes #25) --------
+        // Same check as the long-flag store path. StdVocab does not
+        // register a short alias for --version — a `-v` would collide
+        // with grep/tail's invert-match convention — so this path
+        // only fires for a tool that has explicitly registered a
+        // single-letter short flag with id == STD_ID_VERSION (2).
+        // Consumers wanting a `-V` short alias for the library-owned
+        // auto-emit get it by calling flag_spec_register(&NAME_V,
+        // FKIND_BOOL, 2) after register_all.
+        cmp r15, 2;                         // STD_ID_VERSION
+        jne parse_argv_short_not_version;
+        lea r11, [rip + override_enabled];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne parse_argv_short_not_version;
+        call emit_default;
+        mov rax, 13;                        // ERR_VERSION_EMITTED
+        jmp parse_argv_fail;
+      parse_argv_short_not_version:
+
         jmp parse_argv_advance_loop;
 
       parse_argv_short_clustered:

@@ -46,7 +46,9 @@ The record itself: `flag_names`/`flag_values`/`flag_ids`/`flag_kinds`
 `ERR_MISSING_VALUE` 6, `ERR_SCHEMA_BAD_MAGIC` 7,
 `ERR_SCHEMA_UNSUPPORTED_VERSION` 8, `ERR_SCHEMA_BAD_LAYOUT` 9,
 `ERR_SCHEMA_BAD_OFFSET` 10, `ERR_SCHEMA_UNTERMINATED` 11,
-`ERR_UNKNOWN_FLAG` 12 (opt-in strict mode only — see `FlagSpec::set_strict`).
+`ERR_UNKNOWN_FLAG` 12 (opt-in strict mode only — see `FlagSpec::set_strict`),
+`ERR_VERSION_EMITTED` 13 (library-owned `--version` auto-emit fired —
+success signal, not an error; see `VersionBackend` below).
 
 | Function | Purpose |
 | --- | --- |
@@ -146,6 +148,46 @@ consumer's synthesized help invocation shares.
 | Function | Purpose |
 | --- | --- |
 | `fill_doc_argv(out_argv_slot_ptr: u64, tool_name_ptr: u64) -> () !{mem} @{}` | Write `(&DOC_TOOL_NAME, tool_name_ptr)` into a caller-owned `[u64; 2]`, so `--help` can hand `("doc", "<tool>")` to the `doc` renderer. Only the argv-fill primitive is exposed — a static dependency on `doc` would be circular. |
+
+### version_backend.pdx — `VersionBackend`
+
+**(`libpdx-argv.ENH-032`, Closes #25.)** Library-owned `--version`
+auto-emitter. When `Parser::parse_argv` observes an argv slot equal to
+`--version` (dispatched by id `== StdVocab::STD_ID_VERSION`, not by
+name compare) AND the tool has not opted out via
+`VersionBackend::set_override(1)`, the parser calls
+`VersionBackend::emit_default` and returns
+`ParsedArgs::ERR_VERSION_EMITTED` (13). The emitter writes
+`<tool> <ver>\n<TOOL> VERSION OK\n` to fd 1 via seven raw sys_writes.
+The `[legacy: <TOOL> VERSION OK]` line preserves the fingerprint the
+paideia-os smoke drivers already grep for.
+
+Two symbols are inputs to `emit_default`:
+
+- **`HelpBackend::DOC_TOOL_NAME`** — the lowercase tool-name string
+  (currently the fixed literal `"doc\0"`; see the `VersionBackend`
+  module preamble for the coupling with `DOC_TOOL_NAME_UPPER`).
+- **`PDX_TOOL_VERSION`** — an **extern** NUL-terminated ASCII string
+  defined per-tool at build time in a per-repo constants module
+  (e.g. `mkfs.pdxfs/src/version_constants.pdx`). The reference in
+  `version_backend.o` is an UND relocation; a consumer that forgets
+  to define it fails at ld with an undefined-symbol error naming
+  `PDX_TOOL_VERSION` — a build-time catch, not a run-time surprise.
+  No weak default is provided (paideia-as 0.36 does not currently
+  expose STB_WEAK; a wrong-default fallback would silently pass
+  `--version`).
+
+| Function | Purpose |
+| --- | --- |
+| `pdxargv_version_reset() -> () !{mem} @{}` | Zero `override_enabled` so the next parse defaults to the auto-emit. Called by `TestHarness::full_reset`. |
+| `set_override(on: u64) -> () !{mem} @{}` | `on != 0` opts the tool out of the auto-emit; parse_argv then stores `--version` as an ordinary flag and returns `ERR_OK`. |
+| `emit_default() -> () !{mem} @{}` | Writes the frozen fingerprint to fd 1 via seven raw sys_writes. Non-leaf (calls `version_strlen`). The parser calls this on the auto-emit path; consumers typically do not call it directly. |
+| `version_strlen(s: u64) -> u64 !{mem} @{}` | Byte-loop strlen over a NUL-terminated string. Leaf. |
+
+Cap posture: `emit_default` issues sys_writes on fd 1. See
+[`caps.decl`](caps.decl) for the narrowed language (pre-1.2 said
+"performs NO syscalls of its own" — the version emitter is the
+deliberate, single-purpose exception).
 
 ### schema_emit.pdx — `SchemaEmit`
 

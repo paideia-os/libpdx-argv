@@ -49,6 +49,26 @@ module ParsedArgs = structure {
   // (FlagSpec::strict_mode == 0) is unchanged permissive behaviour —
   // an unregistered flag stores as boolean, same as before ENH-004.
   pub let ERR_UNKNOWN_FLAG              : u64 = 12 // strict mode: unregistered flag name
+  // Added by libpdx-argv.ENH-032 (Closes #25): library-owned `--version`
+  // auto-emitter. `Parser::parse_argv` sets this code, writes the
+  // fingerprint to fd 1 via `VersionBackend::emit_default`, and
+  // returns immediately when it observes an argv slot equal to
+  // `--version` (dispatched by id == StdVocab::STD_ID_VERSION, not by
+  // name compare) AND the tool has not opted out via
+  // `VersionBackend::set_override(1)`. A tool that intends to render
+  // its own `--version` text calls `set_override(1)` at bootstrap;
+  // parse_argv then stores `--version` as an ordinary flag and returns
+  // ERR_OK, and the tool dispatches on
+  // `find_flag_by_id(STD_ID_VERSION)` as before.
+  //
+  // Return-code semantics for a consumer: `ERR_VERSION_EMITTED` is a
+  // success signal, not an error — the tool exits 0 in response. It
+  // occupies the ERR_* space (rather than a separate return-code
+  // family) so a consumer's existing "if err != ERR_OK { … }" branch
+  // still fires, keeping the dispatch shape uniform. Callers that need
+  // to distinguish it from a real parse error compare `err ==
+  // ERR_VERSION_EMITTED` against the others.
+  pub let ERR_VERSION_EMITTED           : u64 = 13
 
   // --- Slot counts. Both fit inside cmp reg, imm ≤ 0x7FFFFFFF. --------
   pub let MAX_FLAGS : u64 = 32

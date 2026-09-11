@@ -43,6 +43,20 @@
 
 module SmokeDriver = structure {
 
+  // libpdx-argv.ENH-032 (Closes #25): in-repo stub for the extern
+  // symbol VersionBackend::emit_default reads at auto-emit time. A
+  // real consumer's per-repo constants module (e.g.
+  // `mkfs.pdxfs/src/version_constants.pdx` with `pub let
+  // PDX_TOOL_VERSION : [u8; N] = "<semver>\0"`) supplies this at
+  // final-link time; the smoke binary links THIS stub instead, so
+  // the ENH-032 tests can exercise the auto-emit end to end
+  // (ParseStdVocabTests::run_version_auto_emit runs parse_argv on
+  // ['--version'] which triggers seven sys_writes into stdout — the
+  // string below is what lands after the tool name and space). The
+  // string is deliberately marked "smoke" so an operator inspecting
+  // the smoke output can tell it apart from a real tool's version.
+  pub let PDX_TOOL_VERSION : [u8; 19] = "1.2.0-libpdx-smoke\0"
+
   // Entry point. Runs every M4 test case in module order, then exits
   // with (pass_count << 16 | fail_count).
   pub let _start : () -> () !{mem} @{} =
@@ -123,6 +137,8 @@ module SmokeDriver = structure {
         // --- ParseStdVocabTests (module id 5) -----------------------
         call ParseStdVocabTests::run_all_9;
         call ParseStdVocabTests::run_ids_unique;
+        call ParseStdVocabTests::run_version_auto_emit;    // ENH-032 case 3
+        call ParseStdVocabTests::run_version_override;     // ENH-032 case 4
 
         // --- ParseSchemaRecordTests (module id 6) -------------------
         call ParseSchemaRecordTests::run_case1;

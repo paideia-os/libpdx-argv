@@ -829,7 +829,7 @@ reshuffle case numbers.
 | 2  | `ParseTypedValuesTests` (parse_typed_values.pdx) | 24 |
 | 3  | `ParseTypedArgsTests` (parse_typed_args.pdx) | 5  |
 | 4  | *reserved* (parse_positional_ext)         | —  |
-| 5  | `ParseStdVocabTests` (parse_std_vocab.pdx) | 2  |
+| 5  | `ParseStdVocabTests` (parse_std_vocab.pdx) | 4  |
 | 6  | `ParseSchemaRecordTests` (parse_schema_record.pdx) | 10 |
 | 7  | `HelpBackendTests` (help_backend.pdx)     | 3  |
 | 8  | `SchemaEmitTests` (schema_emit.pdx)       | 5  |
@@ -890,3 +890,94 @@ with `pkg.M4` — see the M4→M5 dependency chain in
 - MAX_POS / MAX_FLAGS overflow tests — 32-slot cap is heavily
   overprovisioned for every observed P0 tool (max 12 flags + 4 pos
   in `pkg install`); a dedicated stress test is a M4+ stretch.
+
+## 12. `--version` auto-emitter (ENH-032, Closes #25)
+
+`StdVocab::register_all` reserves `--version` (id 2) but the M2 shape
+left every consumer to re-implement the emit path — build the
+`<tool> <ver>\n<TOOL> VERSION OK\n` byte sequence in tool-local
+`.rodata`, sys_write it, exit 0. Six live P0 satellites
+(`mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`, `libpdx-audit`,
+`libpdx-elevate`, `shell`) each ship 20-odd lines of near-identical
+boilerplate to do this. `libpdx-argv.ENH-032` lifts the emit into a
+new library module `VersionBackend` (file `src/version_backend.pdx`);
+`Parser::parse_argv` dispatches to it when it observes an argv slot
+equal to `--version` AND `VersionBackend::override_enabled == 0`.
+
+### 12.1 Module surface
+
+| symbol | kind | purpose |
+|--------|------|---------|
+| `override_enabled`        | `.bss u64` | 0 → auto-emit fires; non-0 → tool renders its own |
+| `LIT_SPACE`               | `.rodata` [u8;2] | `" \0"` — space between tool + version |
+| `LIT_NEWLINE`             | `.rodata` [u8;2] | `"\n\0"` — newline between the two lines |
+| `LIT_VERSION_OK`          | `.rodata` [u8;13] | `" VERSION OK\n\0"` — legacy fingerprint tail |
+| `DOC_TOOL_NAME_UPPER`     | `.rodata` [u8;4] | `"DOC\0"` — coupled uppercase of `HelpBackend::DOC_TOOL_NAME` |
+| `DOC_TOOL_NAME_UPPER_LEN` | `.rodata u64` | 3 — length of the uppercase payload |
+| `DOC_TOOL_NAME_LEN`       | `.rodata u64` | 3 — length of the lowercase payload |
+| `pdxargv_version_reset()` | leaf | zero `override_enabled` |
+| `set_override(on: u64)`   | leaf | store `on` into `override_enabled` |
+| `version_strlen(s: u64) -> u64` | leaf | byte-loop strlen |
+| `emit_default() -> ()`    | non-leaf | seven sys_writes realising the fingerprint |
+
+### 12.2 Extern symbol
+
+`PDX_TOOL_VERSION` is a NUL-terminated ASCII string in `.rodata`
+defined per-tool at build time in a per-repo constants module. The
+reference in `version_backend.o` is an UND relocation resolved at
+final-link time. Consumers that link libpdx-argv without defining
+`PDX_TOOL_VERSION` fail at ld with an undefined-symbol error naming
+the missing symbol — a build-time catch, not a run-time surprise.
+
+The tests/ tree carries an in-repo stub
+(`SmokeDriver::PDX_TOOL_VERSION = "1.2.0-libpdx-smoke\0"`) so the
+smoke binary can link end to end and exercise the auto-emit case
+against a real fd-1 write.
+
+### 12.3 Dispatch shape in `parse_argv`
+
+After every long-flag or short-flag store, `parse_argv` runs:
+
+```
+cmp r15, 2                    ; STD_ID_VERSION
+jne <not-version>
+lea r11, [rip + override_enabled]
+mov r10, [r11]
+cmp r10, 0
+jne <not-version>
+call emit_default
+mov rax, 13                   ; ERR_VERSION_EMITTED
+jmp parse_argv_fail
+<not-version>:
+```
+
+The dispatch is by id, not by name compare — a tool that registers
+`--version` with a non-2 id (say 100) keeps StdVocab's other 8 flags
+but takes the emit path itself. The nested call to `emit_default` is
+aligned by parse_argv's own 6-push + sub rsp,8 prologue; no
+additional frame bookkeeping is needed.
+
+### 12.4 Contract with the legacy fingerprint
+
+The `<TOOL> VERSION OK\n` line is deliberate: several paideia-os
+smoke fixtures grep for it (`grep -q 'VERSION OK'`) as their
+`--version` sentinel. Dropping the line would invalidate half a
+dozen downstream smoke drivers on the same commit. Once every
+downstream driver switches to a schema-parsed `.pdxrec` check for
+tool version detection (post-R51), the legacy line can retire.
+
+### 12.5 What ENH-032 explicitly does not do
+
+- Per-tool `DOC_TOOL_NAME`. Every tool's auto-emit currently says
+  `doc <ver>\nDOC VERSION OK\n` because `HelpBackend::DOC_TOOL_NAME`
+  is the fixed literal `"doc\0"`. Making it per-tool is a follow-on
+  ENH (promote `DOC_TOOL_NAME` and `DOC_TOOL_NAME_UPPER` to a
+  paired extern/weak symbol supplied alongside `PDX_TOOL_VERSION`).
+- Build-hash / signing-key fingerprint in the auto-emit output.
+  Tools that need that line render their own `--version` via
+  `set_override(1)`; the library's fingerprint is deliberately
+  minimal so the emit is a single byte-sequence contract.
+- Runtime uppercase-conversion of `DOC_TOOL_NAME`. The coupled
+  `DOC_TOOL_NAME_UPPER` literal saves the tool-per-invocation
+  conversion cost; if `DOC_TOOL_NAME` ever varies, add the
+  conversion here rather than in every downstream tool.
