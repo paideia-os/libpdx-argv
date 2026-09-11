@@ -44,7 +44,7 @@ module Harness = structure {
   //     1 = parse_grammar        6 = parse_schema_record
   //     2 = parse_typed_values   7 = help_backend
   //     3 = parse_typed_args     8 = schema_emit
-  //     4 = parse_positional     9 = (reserved — parse_mixed)
+  //     4 = parse_positional     9 = parse_multi_context (ENH-006, #17)
   //     5 = parse_vocab         10 = parse_subcommands (ENH-020, #30)
   pub let mut last_fail_tag : u64 = uninit @align(8)
 

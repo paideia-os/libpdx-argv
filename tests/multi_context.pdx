@@ -1,0 +1,402 @@
+// tests/multi_context.pdx — libpdx-argv.ENH-006 (Closes #17)
+// Caller-owned ParsedArgsCtx multi-parse regression fixtures.
+//
+// ENH-006 lets a caller allocate one or more `ParsedArgsCtx` blocks
+// (each `[u64; 168]` @align(8), = 1344 bytes = PA_CTX_SIZE) and run
+// independent parses into each via `Parser::parse_argv_ctx(ctx_ptr,
+// argv, argc)`. After the parse the ctx block holds a snapshot of
+// all 13 per-parse slots; `ParsedArgs::find_flag_by_id_ctx(ctx_ptr,
+// id)` reads directly from that snapshot, so two consecutive
+// `parse_argv_ctx(&a, …)` / `parse_argv_ctx(&b, …)` calls leave
+// `&a` and `&b` with byte-independent results even though the
+// underlying parser body still writes to the singleton .bss (the
+// snapshot-after design that keeps ENH-006 additive).
+//
+// Three cases:
+//   1. Two contexts, two parses, no cross-talk. `argv_a = [--help,
+//      foo]`, `argv_b = [--json, bar]`; verifies
+//      find_flag_by_id_ctx(&a, HELP)!=32, find_flag_by_id_ctx(&a,
+//      JSON)==32 (a has no --json), find_flag_by_id_ctx(&b, JSON)!=32,
+//      find_flag_by_id_ctx(&b, HELP)==32 (b has no --help). Also
+//      checks flag_count and pos_count per ctx.
+//   2. Re-read after cross-parse. After case 1's sequence, re-runs
+//      find_flag_by_id_ctx(&a, HELP) — must still return the same
+//      slot because parse_argv_ctx(&b, …) never touched ctx_a.
+//   3. reset_ctx isolation. `reset_ctx(&a)` zeroes only ctx_a's
+//      bookkeeping (flag_count / pos_count etc.); ctx_b remains
+//      intact and its find_flag_by_id_ctx keeps working. Also
+//      verifies the singleton .bss is untouched by reset_ctx (a
+//      caller's follow-up singleton `find_flag_by_id` still returns
+//      whatever the last singleton-touching call left there).
+//
+// Module id in TestHarness::last_fail_tag: 9 (the slot previously
+// reserved for parse_mixed; ENH-006 claims it and updates
+// tests/README.md's module-id table accordingly).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module MultiContext (PascalCase basename matching multi_context.pdx).
+//   - run_case* fns non-leaf; 1-push (rbx) prologue where a case
+//     has no other callee-save spill.
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max seen: 32, 512, 776, 1336).
+//   - r11 lea scratch for cross-module .bss bases.
+//   - Byte loads unused (this fixture reads only qword-aligned ctx
+//     slots and pointer indirections through find_flag_by_id_ctx).
+//   - Labels prefixed with `mc_` (short for multi_context) so they
+//     do not collide with reserved words (loop/if/…) or with the
+//     ffbic_* / pactx_* labels from src/*.
+
+module MultiContext = structure {
+
+  // -- Argv literal fixtures (NUL-terminated so lookup's inline
+  // -- strcmp finds the terminator; the '=' / ':' inline-value
+  // -- paths are not exercised here — BOOL flags never mutate argv).
+  pub let mc_a_help : [u8; 7]  = "--help\0"
+  pub let mc_a_foo  : [u8; 4]  = "foo\0"
+  pub let mc_a_json : [u8; 7]  = "--json\0"
+  pub let mc_a_bar  : [u8; 4]  = "bar\0"
+
+  // -- Per-fixture argv backing arrays (bss; filled inline at run
+  // -- time from the .rodata literals above).
+  pub let mut mc_argv_a : [u64; 2] = uninit @align(8)   // --help foo
+  pub let mut mc_argv_b : [u64; 2] = uninit @align(8)   // --json bar
+
+  // -- Two caller-allocated ParsedArgsCtx blocks. 168 qwords ×
+  // -- 8 bytes = 1344 = PA_CTX_SIZE per block. @align(8) is
+  // -- required by the offset arithmetic in reset_ctx /
+  // -- find_flag_by_id_ctx / pa_ctx_snapshot.
+  pub let mut mc_ctx_a : [u64; 168] = uninit @align(8)
+  pub let mut mc_ctx_b : [u64; 168] = uninit @align(8)
+
+  // ============================================================
+  // run_case1  Two independent parse_argv_ctx calls; no cross-talk.
+  //
+  //   Setup: full_reset + register_all (StdVocab).
+  //   argv_a = [--help, foo]; argv_b = [--json, bar].
+  //   Expected:
+  //     parse_argv_ctx(&ctx_a, argv_a, 2) → rax = 0 (ERR_OK)
+  //     parse_argv_ctx(&ctx_b, argv_b, 2) → rax = 0
+  //     find_flag_by_id_ctx(&ctx_a, HELP=1) != 32
+  //     find_flag_by_id_ctx(&ctx_a, JSON=4) == 32
+  //     find_flag_by_id_ctx(&ctx_b, JSON=4) != 32
+  //     find_flag_by_id_ctx(&ctx_b, HELP=1) == 32
+  //     ctx_a.flag_count == 1, ctx_a.pos_count == 1
+  //     ctx_b.flag_count == 1, ctx_b.pos_count == 1
+  //
+  // Module id 9, case 1 → fail tag 0x900000001.
+  //
+  // Non-leaf; 1-push (rbx = argv row cursor while inserting argv
+  // pointers) prologue → rsp%16 = 0 for the nested calls. Register
+  // plan: rbx staging pointer (short-lived; freed before every
+  // parse_argv_ctx call — that entry uses rbx internally too),
+  // r11 lea scratch.
+  // ============================================================
+  pub let run_case1 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) case1 — two ParsedArgsCtx blocks, two consecutive parse_argv_ctx calls, verify no cross-talk. Sets up StdVocab flags via register_all (so --help gets id=STD_ID_HELP=1 and --json gets id=STD_ID_JSON=4, both FKIND_BOOL — no auto-emit fires because full_reset called pdxargv_help_reset AND pdxargv_version_reset, both leave the doc_backend_unavailable / override_enabled slots at 0 so --help stores as an ordinary flag rather than triggering ERR_HELP_EMITTED / ERR_VERSION_EMITTED). Two argv fixtures deliberately picked with disjoint flag-id sets (argv_a has HELP not JSON; argv_b has JSON not HELP) so the cross-talk test is unambiguous: find_flag_by_id_ctx(&a, JSON) must return 32 (not found) even after parse into b. Also verifies flag_count/pos_count are captured per-ctx (both parses have flag_count=1 and pos_count=1 — the trailing 'foo' / 'bar' positional). Non-leaf; 1-push (rbx) prologue aligns rsp%16 = 0 for the ~10 nested calls. rbx is reused as an argv-staging cursor early in the case (before any parse_argv_ctx) then freed — parse_argv_ctx does its own push rbx internally, so no live rbx state needs to survive across it.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        // Fill argv_a = [&mc_a_help, &mc_a_foo]
+        lea rbx, [rip + mc_argv_a];
+        lea r11, [rip + mc_a_help]; mov [rbx + 0], r11;
+        lea r11, [rip + mc_a_foo];  mov [rbx + 8], r11;
+
+        // parse_argv_ctx(&mc_ctx_a, mc_argv_a, 2)
+        lea rdi, [rip + mc_ctx_a];
+        lea rsi, [rip + mc_argv_a];
+        mov rdx, 2;
+        call parse_argv_ctx;
+        cmp rax, 0;
+        jne mc_case1_fail;
+
+        // Fill argv_b = [&mc_a_json, &mc_a_bar]
+        lea rbx, [rip + mc_argv_b];
+        lea r11, [rip + mc_a_json]; mov [rbx + 0], r11;
+        lea r11, [rip + mc_a_bar];  mov [rbx + 8], r11;
+
+        // parse_argv_ctx(&mc_ctx_b, mc_argv_b, 2)
+        lea rdi, [rip + mc_ctx_b];
+        lea rsi, [rip + mc_argv_b];
+        mov rdx, 2;
+        call parse_argv_ctx;
+        cmp rax, 0;
+        jne mc_case1_fail;
+
+        // find_flag_by_id_ctx(&mc_ctx_a, STD_ID_HELP=1) != 32
+        lea rdi, [rip + mc_ctx_a];
+        mov rsi, 1;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        je mc_case1_fail;
+
+        // find_flag_by_id_ctx(&mc_ctx_a, STD_ID_JSON=4) == 32
+        // (a has no --json — no cross-talk from b)
+        lea rdi, [rip + mc_ctx_a];
+        mov rsi, 4;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        jne mc_case1_fail;
+
+        // find_flag_by_id_ctx(&mc_ctx_b, STD_ID_JSON=4) != 32
+        lea rdi, [rip + mc_ctx_b];
+        mov rsi, 4;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        je mc_case1_fail;
+
+        // find_flag_by_id_ctx(&mc_ctx_b, STD_ID_HELP=1) == 32
+        // (b has no --help — no cross-talk from a)
+        lea rdi, [rip + mc_ctx_b];
+        mov rsi, 1;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        jne mc_case1_fail;
+
+        // ctx_a.flag_count == 1
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 512];
+        cmp rax, 1;
+        jne mc_case1_fail;
+
+        // ctx_a.pos_count == 1
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 776];
+        cmp rax, 1;
+        jne mc_case1_fail;
+
+        // ctx_b.flag_count == 1
+        lea r11, [rip + mc_ctx_b];
+        mov rax, [r11 + 512];
+        cmp rax, 1;
+        jne mc_case1_fail;
+
+        // ctx_b.pos_count == 1
+        lea r11, [rip + mc_ctx_b];
+        mov rax, [r11 + 776];
+        cmp rax, 1;
+        jne mc_case1_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      mc_case1_fail:
+        mov rdi, 0x900000001;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // run_case2  Re-read ctx_a AFTER ctx_b's parse; unchanged.
+  //
+  //   Setup: repeat case1's parse sequence (fresh full_reset +
+  //   register_all + two parse_argv_ctx calls). Then, WITHOUT any
+  //   further parse, re-invoke find_flag_by_id_ctx(&mc_ctx_a,
+  //   HELP=1) and find_flag_by_id_ctx(&mc_ctx_a, JSON=4). The
+  //   HELP lookup must still succeed and the JSON lookup must
+  //   still miss — a regression in the snapshot design (e.g. a
+  //   pa_ctx_snapshot that accidentally overwrites the caller's
+  //   ctx via a stale base pointer) would flip either result.
+  //
+  //   Also touches ctx_a.subcommand_id (offset 1336) — a fresh
+  //   ctx snapshotted after a parse WITHOUT a subcommand table
+  //   registered must read back subcommand_id == 0.
+  //
+  // Module id 9, case 2 → fail tag 0x900000002.
+  // ============================================================
+  pub let run_case2 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) case2 — re-read ctx_a after ctx_b's parse to catch a snapshot-clobber regression. Every case shares the same mc_ctx_a / mc_ctx_b .bss blocks and the same mc_argv_a / mc_argv_b argv arrays (see the module-level `pub let mut` declarations), so the case2 sequence re-runs the case1 setup rather than relying on case1's ctx state (each case is independent per the M4 harness discipline). After the two-parse sequence, the case does not touch the ctx blocks between parse and read — so a clean pa_ctx_snapshot must leave ctx_a byte-identical to what it was immediately after parse_argv_ctx(&mc_ctx_a, ...) returned. Verifies via find_flag_by_id_ctx that HELP is still findable and JSON is still absent from ctx_a. Also touches ctx_a.subcommand_id at offset 1336: since no subcommand table is registered, subcommand_id should read back 0 (the 'no dispatch' sentinel; parse_argv_ctx snapshots the singleton subcommand_id which parsed_args_reset just zeroed and no dispatch overwrote). 1-push prologue.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        // Prep and parse argv_a into ctx_a.
+        lea rbx, [rip + mc_argv_a];
+        lea r11, [rip + mc_a_help]; mov [rbx + 0], r11;
+        lea r11, [rip + mc_a_foo];  mov [rbx + 8], r11;
+
+        lea rdi, [rip + mc_ctx_a];
+        lea rsi, [rip + mc_argv_a];
+        mov rdx, 2;
+        call parse_argv_ctx;
+        cmp rax, 0;
+        jne mc_case2_fail;
+
+        // Prep and parse argv_b into ctx_b.
+        lea rbx, [rip + mc_argv_b];
+        lea r11, [rip + mc_a_json]; mov [rbx + 0], r11;
+        lea r11, [rip + mc_a_bar];  mov [rbx + 8], r11;
+
+        lea rdi, [rip + mc_ctx_b];
+        lea rsi, [rip + mc_argv_b];
+        mov rdx, 2;
+        call parse_argv_ctx;
+        cmp rax, 0;
+        jne mc_case2_fail;
+
+        // Re-read ctx_a — HELP still findable.
+        lea rdi, [rip + mc_ctx_a];
+        mov rsi, 1;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        je mc_case2_fail;
+
+        // Re-read ctx_a — JSON still absent.
+        lea rdi, [rip + mc_ctx_a];
+        mov rsi, 4;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        jne mc_case2_fail;
+
+        // ctx_a.subcommand_id == 0 (no dispatch)
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 1336];
+        cmp rax, 0;
+        jne mc_case2_fail;
+
+        // ctx_b.subcommand_id == 0 (no dispatch)
+        lea r11, [rip + mc_ctx_b];
+        mov rax, [r11 + 1336];
+        cmp rax, 0;
+        jne mc_case2_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      mc_case2_fail:
+        mov rdi, 0x900000002;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // run_case3  reset_ctx(&mc_ctx_a) zeroes ctx_a bookkeeping only.
+  //
+  //   Setup: repeat case1's parse sequence, then call reset_ctx
+  //   on ctx_a only. Verify:
+  //     ctx_a.flag_count == 0
+  //     ctx_a.pos_count  == 0
+  //     ctx_a.error_code == 0
+  //     ctx_a.ddash_seen == 0
+  //     find_flag_by_id_ctx(&mc_ctx_a, HELP=1) == 32  (bookkeeping
+  //                                                   zeroed, so
+  //                                                   scan sees
+  //                                                   count=0)
+  //     ctx_b.flag_count == 1                          (untouched)
+  //     find_flag_by_id_ctx(&mc_ctx_b, JSON=4) != 32   (untouched)
+  //
+  // This is the isolation witness — a reset_ctx that mistakenly
+  // used [rip + flag_count] instead of [rdi + 512] would zero the
+  // singleton (which the caller may still be reading from
+  // elsewhere) and would fail this case even though ctx_a-only
+  // reads happen to look correct.
+  //
+  // Module id 9, case 3 → fail tag 0x900000003.
+  // ============================================================
+  pub let run_case3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) case3 — reset_ctx isolation. After a two-parse sequence into ctx_a and ctx_b, calls reset_ctx(&mc_ctx_a) and verifies (a) ctx_a's 4 bookkeeping slots (flag_count / pos_count / error_code / ddash_seen — a proxy for the 8 zeroed slots; the other 4 follow the same store pattern) all read back 0, (b) ctx_a's flag_ids-scan via find_flag_by_id_ctx returns MAX_FLAGS (=32) for the pre-zero HELP id because the flag_count gate short-circuits the scan at 0, and (c) ctx_b's bookkeeping and reachability are UNAFFECTED by ctx_a's reset — the isolation witness. A regression where reset_ctx accidentally used [rip + flag_count] instead of [rdi + 512] would zero the singleton (a shared surface every existing consumer reads through) but would NOT fail the ctx_a checks; it would fail on ctx_b's flag_count==1 check (which relies on ctx_b's snapshot being intact) OR on ctx_b's find_flag_by_id_ctx returning a valid slot (relies on ctx_b.flag_count staying at 1). 1-push prologue.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call register_all;
+
+        // Parse argv_a → ctx_a.
+        lea rbx, [rip + mc_argv_a];
+        lea r11, [rip + mc_a_help]; mov [rbx + 0], r11;
+        lea r11, [rip + mc_a_foo];  mov [rbx + 8], r11;
+        lea rdi, [rip + mc_ctx_a];
+        lea rsi, [rip + mc_argv_a];
+        mov rdx, 2;
+        call parse_argv_ctx;
+        cmp rax, 0;
+        jne mc_case3_fail;
+
+        // Parse argv_b → ctx_b.
+        lea rbx, [rip + mc_argv_b];
+        lea r11, [rip + mc_a_json]; mov [rbx + 0], r11;
+        lea r11, [rip + mc_a_bar];  mov [rbx + 8], r11;
+        lea rdi, [rip + mc_ctx_b];
+        lea rsi, [rip + mc_argv_b];
+        mov rdx, 2;
+        call parse_argv_ctx;
+        cmp rax, 0;
+        jne mc_case3_fail;
+
+        // reset_ctx(&mc_ctx_a)
+        lea rdi, [rip + mc_ctx_a];
+        call reset_ctx;
+
+        // ctx_a.flag_count == 0
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 512];
+        cmp rax, 0;
+        jne mc_case3_fail;
+
+        // ctx_a.pos_count == 0
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 776];
+        cmp rax, 0;
+        jne mc_case3_fail;
+
+        // ctx_a.error_code == 0
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 784];
+        cmp rax, 0;
+        jne mc_case3_fail;
+
+        // ctx_a.ddash_seen == 0
+        lea r11, [rip + mc_ctx_a];
+        mov rax, [r11 + 1320];
+        cmp rax, 0;
+        jne mc_case3_fail;
+
+        // find_flag_by_id_ctx(&mc_ctx_a, HELP=1) == 32 (post-reset)
+        lea rdi, [rip + mc_ctx_a];
+        mov rsi, 1;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        jne mc_case3_fail;
+
+        // ctx_b.flag_count == 1 (untouched by ctx_a's reset)
+        lea r11, [rip + mc_ctx_b];
+        mov rax, [r11 + 512];
+        cmp rax, 1;
+        jne mc_case3_fail;
+
+        // ctx_b JSON reachable (untouched)
+        lea rdi, [rip + mc_ctx_b];
+        mov rsi, 4;
+        call find_flag_by_id_ctx;
+        cmp rax, 32;
+        je mc_case3_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      mc_case3_fail:
+        mov rdi, 0x900000003;
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
+}

@@ -1592,4 +1592,81 @@ module Parser = structure {
         ret;
       }
     }
+
+  // parse_argv_ctx(ctx_ptr, argv, argc) → u64
+  //
+  // libpdx-argv.ENH-006 (Closes #17). Caller-owned ParsedArgsCtx variant
+  // of parse_argv. Resets the ParsedArgs singleton, calls parse_argv on
+  // the caller's argv, then snapshots the singleton state into the
+  // caller's ctx block and returns the parse error code unchanged. The
+  // net effect: two consecutive `parse_argv_ctx(&a, …)` /
+  // `parse_argv_ctx(&b, …)` calls leave `&a` and `&b` with byte-
+  // independent parse results — the multi-parse fingerprint ENH-006
+  // exists to deliver (shell needs it for many command lines per
+  // process, subshells, pkg subcommand re-parse).
+  //
+  //   rdi = ctx_ptr (caller-owned [u64; 168] block @align(8); MUST
+  //         be non-null — the singleton path is served by the
+  //         pre-existing parse_argv entry point, kept unchanged)
+  //   rsi = argv    (u64* array, as parse_argv accepts)
+  //   rdx = argc    (count of entries in argv)
+  //   rax = same as parse_argv — ERR_OK on success, else an ERR_*
+  //         code. The code AND the ParsedArgs slots are ALSO published
+  //         into ctx via ParsedArgs::pa_ctx_snapshot, so a caller who
+  //         only reads through the ctx pointer gets the full result
+  //         without touching the singleton.
+  //
+  // Implicit reset: parse_argv_ctx calls parsed_args_reset before the
+  // nested parse_argv, so the caller need NOT reset explicitly between
+  // successive parse_argv_ctx calls. This differs from parse_argv
+  // (which relies on the caller's own parsed_args_reset) and is
+  // deliberate: the multi-parse idiom does not want a bookkeeping
+  // dance between every parse.
+  //
+  // Non-leaf (calls parsed_args_reset + parse_argv + pa_ctx_snapshot).
+  // Stack shape:
+  //   push rbx           (rsp%16: 8 → 0)  ; rbx = argv survives calls
+  //   push r12           (rsp%16: 0 → 8)  ; r12 = ctx_ptr survives calls
+  //   sub  rsp, 8        (rsp%16: 8 → 0)  ; argc spill + return-value spill
+  //
+  //   [rsp + 0] initially holds argc (before parse_argv); after
+  //   parse_argv returns it is reused to hold the return value across
+  //   the nested pa_ctx_snapshot call.
+  //
+  // Register plan:
+  //   rbx = argv       (callee-save; survives every nested call)
+  //   r12 = ctx_ptr    (callee-save; survives every nested call)
+  //   [rsp+0] = argc, then parse_argv rax
+  //   rax = final return value
+  pub let parse_argv_ctx : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ctx_ptr: u64) (argv: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) Parser::parse_argv_ctx — caller-owned ParsedArgsCtx wrapper around parse_argv. Sequence: parsed_args_reset (zero the singleton so a prior parse's residue does not leak), parse_argv(argv, argc) (runs the entire existing parser unmodified, writing into the singleton), pa_ctx_snapshot(ctx) (copies the 13 per-parse slots from singleton into caller's ctx block). Return value = parse_argv's rax, passed through unchanged. The snapshot design keeps ENH-006 additive: the massive parse_argv_ex body (1200+ lines, every ENH-004/013/014/017/019/020/026/032 dispatch inside it) is not touched — every existing consumer sees byte-identical behaviour through the singleton entry points, and the multi-parse fingerprint is delivered by the snapshot-after step. Non-leaf: 2 pushes (rbx=argv, r12=ctx_ptr — both must survive nested calls that clobber SysV caller-save) + sub rsp,8 for argc/rax spill = 24 bytes on stack after ret addr → rsp%16 = 0 at every nested call site (parsed_args_reset, parse_argv, pa_ctx_snapshot). parsed_args_reset takes no arguments (rdi/rsi/rdx unused); parse_argv takes (rdi=argv, rsi=argc); pa_ctx_snapshot takes (rdi=ctx_ptr). The [rsp+0] slot dual-uses as argc-carrier (before parse_argv) and rax-carrier (across pa_ctx_snapshot); each use lifetime is disjoint so no additional stack slot is needed. 3-arg unsafe-bodied lambda well under B1708's 6-param cap.",
+      block: {
+        push rbx;                             // rsp%16: 8 → 0
+        push r12;                             // rsp%16: 0 → 8
+        sub rsp, 8;                           // rsp%16: 8 → 0
+
+        mov r12, rdi;                         // r12 = ctx_ptr
+        mov rbx, rsi;                         // rbx = argv
+        mov [rsp + 0], rdx;                   // spill argc
+
+        call parsed_args_reset;
+
+        mov rdi, rbx;                         // argv
+        mov rsi, [rsp + 0];                   // argc
+        call parse_argv;
+        mov [rsp + 0], rax;                   // spill parse return value
+
+        mov rdi, r12;                         // ctx_ptr
+        call pa_ctx_snapshot;
+
+        mov rax, [rsp + 0];                   // recover parse return value
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
 }

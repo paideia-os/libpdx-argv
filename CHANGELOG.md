@@ -6,6 +6,169 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-006 — Caller-owned `ParsedArgsCtx` multi-parse contexts (Closes #17)
+
+Pre-ENH-006 every ParsedArgs, FlagSpec and SchemaEmit slot lived in
+`.bss` singletons — one live parse per process. That was the right
+bootstrap call and it is still right as the default, but it was the
+one genuine library-side reason a tool could not adopt libpdx-argv:
+`shell` parses many command lines per process and therefore built
+its own `Pds` (a reimplementation forced by the storage model, not a
+rejection of the design); subshells, `mux` splits and `pkg`'s
+subcommand re-parse all want the same thing. Two of the repo's own
+documents (`design/architecture.md` §3 and
+`src/parsed_args.pdx:32`) had also been claiming for two releases
+that "M4 introduces a caller-owned struct" — a promise M4 never
+delivered; ENH-006 lands the deliverable and rewrites both to
+reflect that.
+
+Public surface additions (additive-only; every existing consumer
+sees zero behaviour change through the singleton entry points):
+
+  - `ParsedArgs::ParsedArgsCtx` — caller-allocated `[u64; 168]`
+    block @align(8) (1344 bytes = `PA_CTX_SIZE`; 168 qwords =
+    `PA_CTX_QWORDS`) that mirrors the 13 per-parse singleton
+    slots. Layout via `PA_CTX_OFF_*` byte-offset constants:
+    `FLAG_NAMES=0`, `FLAG_VALUES=256`, `FLAG_COUNT=512`,
+    `POS_PTRS=520`, `POS_COUNT=776`, `ERROR_CODE=784`,
+    `ERROR_ARG_INDEX=792`, `EMIT_SCHEMA=800`, `FLAG_IDS=808`,
+    `FLAG_KINDS=1064`, `DDASH_SEEN=1320`,
+    `DDASH_ARG_INDEX=1328`, `SUBCOMMAND_ID=1336`. The ENH-017
+    error_ring stays singleton-only (a caller who wants both
+    collect-all mode and multi-parse walks the singleton ring
+    immediately after each `parse_argv_ctx`).
+  - `Parser::parse_argv_ctx(ctx_ptr, argv, argc) -> u64` —
+    caller-owned wrapper around `parse_argv`. Internally resets
+    the singleton (implicit reset so the multi-parse idiom
+    needs no bookkeeping dance between successive calls), runs
+    `parse_argv`, then snapshots the singleton state into the
+    caller's ctx block via `ParsedArgs::pa_ctx_snapshot`.
+    Return value = the parse error code (also mirrored into
+    `ctx.error_code`).
+  - `SchemaInvoke::parse_from_schema_record_ctx(ctx_ptr,
+    rec_ptr, rec_len) -> u64` — sibling for the schema-record
+    invocation path. Same snapshot-after design.
+  - `ParsedArgs::reset_ctx(ctx_ptr) -> ()` — zero the 8
+    bookkeeping slots (flag_count / pos_count / error_code /
+    error_arg_index / emit_schema / ddash_seen /
+    ddash_arg_index / subcommand_id) inside a caller-owned ctx.
+    The singleton is untouched.
+  - `ParsedArgs::find_flag_by_id_ctx(ctx_ptr, id) -> u64` —
+    ctx-relative twin of `find_flag_by_id`. Scans
+    `ctx.flag_ids` up to `ctx.flag_count`; returns slot index
+    or `MAX_FLAGS` (=32). Preserves the ENH-024 id==0 skip.
+  - `ParsedArgs::pa_ctx_snapshot(ctx_ptr) -> ()` — copies the
+    13 per-parse slots from the singleton into the caller's
+    ctx block. Called internally by the two `parse_..._ctx`
+    entry points; also public so a caller who ran a plain
+    `parse_argv` can capture that result into a ctx for later
+    `find_flag_by_id_ctx` reads.
+  - `ParsedArgs::pa_ctx_copy_qwords(dst, src, n) -> ()` —
+    internal qword-copy helper used by `pa_ctx_snapshot` AND
+    by the FlagSpec save/load pair (below).
+  - `FlagSpec::FlagSpecCtx` — caller-allocated `[u64; 295]`
+    block @align(8) (2360 bytes = `FS_CTX_SIZE`; 295 qwords =
+    `FS_CTX_QWORDS`) that mirrors the 16 FlagSpec slot-groups.
+    Layout via `FS_CTX_OFF_*` constants (see
+    `src/flag_spec.pdx` for the full field list).
+  - `FlagSpec::flag_spec_save_ctx(ctx_ptr) -> ()` — snapshot
+    the entire FlagSpec singleton (10 arrays × 32 qwords + 6
+    scalars) into a caller-owned block.
+  - `FlagSpec::flag_spec_load_ctx(ctx_ptr) -> ()` — inverse of
+    the save: copy every field FROM the ctx block INTO the
+    FlagSpec singleton.
+  - `FlagSpec::flag_spec_reset_ctx(ctx_ptr) -> ()` — zero the
+    4 bookkeeping slots inside a caller-owned FlagSpecCtx.
+
+`FlagSpec` uses a save/load swap pattern rather than duplicating
+every per-entry registration function as a `_ctx` variant. A
+caller that wants git-vs-mercurial FlagSpec independence swaps the
+whole registration set with two calls (load target, do work, save
+target); a future ENH-047 may add per-entry `_ctx` variants
+(`flag_spec_register_ctx`, `lookup_ctx`, …) if the swap overhead
+ever measures as prohibitive.
+
+`SchemaEmit` stays singleton (per-tool state, one live tool per
+process) — the same rationale that keeps it singleton in the pre-
+ENH-006 shape.
+
+Additive-only mechanism. The `_ctx` wrappers do NOT rewrite the
+parser to use ctx-relative addressing (that would be a ~1600-line
+internal change with no consumer benefit). Instead the underlying
+parser writes to the singleton exactly as it always has, and the
+wrapper snapshots the 13 fields into the caller's ctx block via
+`pa_ctx_snapshot`. Two consecutive `parse_argv_ctx(&a, …)` /
+`parse_argv_ctx(&b, …)` calls then leave both ctx blocks with
+byte-independent results — the multi-parse fingerprint the ENH-006
+issue text specifies. Every existing consumer (`cp`, `ls`,
+`mkdir`, `mv`, `pkg`, `rm`, every schema-record test, every
+satellite) sees byte-identical behaviour through the unchanged
+singleton entry points.
+
+Test coverage:
+
+  - New module `tests/multi_context.pdx` (module `MultiContext`,
+    module id 9 in the harness — previously reserved for
+    parse_mixed) with three cases wired into
+    `tests/smoke_driver.pdx`:
+    - case1: two contexts, two `parse_argv_ctx` calls, verify
+      no cross-talk via `find_flag_by_id_ctx` (HELP reachable
+      only via ctx_a, JSON only via ctx_b), and correct per-ctx
+      `flag_count` / `pos_count`.
+    - case2: re-read `ctx_a` after `ctx_b`'s parse — must be
+      unchanged (regression witness for a snapshot-clobber
+      that would silently corrupt an earlier ctx).
+    - case3: `reset_ctx(&ctx_a)` isolation — ctx_a bookkeeping
+      zeroed, `ctx_b` untouched.
+  - `tests/README.md` module-id table updated (row 9:
+    `ParseMultiContext`, 3 cases); non-goals section rewritten
+    to reflect the sequential-multi-parse coverage.
+
+Documentation:
+
+  - `design/architecture.md` §3 rewritten. New §3.1 (ENH-006
+    storage model — caller-owned ParsedArgsCtx) documents the
+    layout, entry points, snapshot-after mechanism, FlagSpec
+    save/load pattern, and the concurrency posture (paideia-os
+    is single-threaded, so the coexistence issue that motivated
+    ENH-006 is sequential). §1 comment updated so the two
+    stale-M4 promises no longer contradict what shipped.
+  - `README.md` — new "ParsedArgsCtx — caller-owned multi-parse
+    contexts" subsection under `ParsedArgs`; new rows in the
+    Parser, SchemaInvoke, and FlagSpec tables for
+    `parse_argv_ctx`, `parse_from_schema_record_ctx`,
+    `find_flag_by_id_ctx`, `reset_ctx`, `pa_ctx_snapshot`,
+    `pa_ctx_copy_qwords`, `flag_spec_save_ctx`,
+    `flag_spec_load_ctx`, `flag_spec_reset_ctx`.
+  - `doc/libpdx-argv.pdxdoc` — new SYNOPSIS block for the
+    multi-parse idiom; new HISTORY row describing the
+    surface delta.
+  - `src/parsed_args.pdx` header comment updated so it no
+    longer claims M4 delivered the caller-owned variant.
+
+Compliance notes (paideia-as 0.36+):
+
+  - Every new `pub let :sig = fn ...` carries `capabilities:
+    {}` per the paideia-as 0.36 requirement.
+  - Unsafe-bodied lambda parameter counts: `parse_argv_ctx` and
+    `parse_from_schema_record_ctx` take 3 params (ctx + 2);
+    `flag_spec_save_ctx` / `load_ctx` / `reset_ctx` /
+    `pa_ctx_snapshot` / `reset_ctx` (ParsedArgs) take 1;
+    `pa_ctx_copy_qwords` takes 3; `find_flag_by_id_ctx` takes 2.
+    All well under the B1708 6-param cap.
+  - No `test rN,rN`, no `and reg,imm64`, no 2-op `imul`, no
+    scaled `[reg + N*8]` (register-scaled `[reg + rcx*8]` is
+    the only form used, which is inside the R49 encoder
+    subset). PascalCase basenames for the new test module
+    (`ParseMultiContext`). All labels in the new code are
+    `mc_*` / `pactx_*` / `ffbic_*` / `pacpq_*` prefixed —
+    none collide with reserved words.
+  - SysV push/pop alignment preserved at every nested call:
+    `parse_argv_ctx` and `parse_from_schema_record_ctx` use a
+    2-push + `sub rsp, 8` prologue (24 B on stack after ret
+    addr → rsp%16 = 0); the snapshot / save / load helpers
+    use a 1-push (rbx) prologue (8 B → rsp%16 = 0).
+
 ### ENH-020 — Git-shape subcommand dispatch (Closes #30)
 
 Pre-ENH-020 every tool was a single flat command: `pkg install …`,

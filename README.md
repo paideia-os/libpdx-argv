@@ -117,6 +117,58 @@ parse still advances past each), and two ring-reader functions
 | `error_count() -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** Number of error records the current parse accumulated into the ring (0..`MAX_COLLECTED_ERRORS`). A successful parse reports 0; a non-collect-mode parse that failed at the first error reports 1; a collect-mode parse reports the number of recoverable failures, capped at `MAX_COLLECTED_ERRORS`. |
 | `error_at(idx: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** Multi-return `(err_code in rax, argv_index in rdx)` — reads slot `idx` of the error ring. Out-of-range (`idx >= error_count()` or `idx >= MAX_COLLECTED_ERRORS`) returns `(0, 0)`; the `0` err_code is distinguishable from any real `ERR_*` because the ring is only appended to on failure. Callers gate iteration on `error_count()` and treat the ring's `argv_index` field the same way they treat the scalar `error_arg_index` slot for a single-error parse. |
 
+#### `ParsedArgsCtx` — caller-owned multi-parse contexts (`libpdx-argv.ENH-006`, Closes #17)
+
+Every entry point above operates on the library-owned singleton
+(one live parse per process). A shell that parses many command
+lines per process, a subshell, `mux`'s split panes, or `pkg`'s
+subcommand re-parse all need many parse contexts to coexist inside
+one process. ENH-006 adds a caller-allocated `ParsedArgsCtx` block
+that captures a snapshot of every per-parse slot:
+
+```
+pub let mut myctx : [u64; 168] = uninit @align(8)   // 1344 bytes
+
+let err = parse_argv_ctx(&myctx, argv, argc)
+let k   = find_flag_by_id_ctx(&myctx, StdVocab::STD_ID_HELP)
+// … ctx block outlives the call; another parse into a different
+// ctx block does not touch this one …
+```
+
+Byte layout (`PA_CTX_OFF_*` constants published from `ParsedArgs`):
+`flag_names[32]` at 0, `flag_values[32]` at 256, `flag_count` at
+512, `pos_ptrs[32]` at 520, `pos_count` at 776, `error_code` at
+784, `error_arg_index` at 792, `emit_schema` at 800,
+`flag_ids[32]` at 808, `flag_kinds[32]` at 1064, `ddash_seen` at
+1320, `ddash_arg_index` at 1328, `subcommand_id` at 1336
+(= 1344 B total = `PA_CTX_SIZE`; 168 qwords = `PA_CTX_QWORDS`).
+The ENH-017 error_ring stays singleton-only — collect-all mode is
+a diagnostics opt-in; a caller that wants both features walks the
+singleton ring immediately after each `parse_argv_ctx`.
+
+Additive-only: every existing consumer of the singleton entry
+points sees zero behaviour change. The `_ctx` variants internally
+reset the singleton, run the pre-existing parser, then snapshot
+the singleton into the caller's ctx block via
+`ParsedArgs::pa_ctx_snapshot`; the entire parser body is
+unchanged.
+
+| Function | Purpose |
+| --- | --- |
+| `parse_argv_ctx(ctx_ptr: u64, argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Parse `argv` into a caller-owned `ParsedArgsCtx`. Implicit `parsed_args_reset` first (multi-parse ergonomics — no bookkeeping dance needed between successive `parse_argv_ctx` calls). Return value is the same as `parse_argv`; also mirrored into `ctx.error_code`. Defined in `src/parser.pdx`. |
+| `parse_from_schema_record_ctx(ctx_ptr: u64, record_ptr: u64, record_len: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Sibling to `parse_argv_ctx` for the schema-record invocation path. Defined in `src/schema_invoke.pdx`. |
+| `reset_ctx(ctx_ptr: u64) -> () !{mem} @{}` | Zero the 8 bookkeeping slots inside a caller-owned ctx (mirrors `parsed_args_reset` but operates on the ctx block; the singleton is untouched). |
+| `find_flag_by_id_ctx(ctx_ptr: u64, id: u64) -> u64 !{mem} @{}` | Ctx-relative twin of `find_flag_by_id`. Scans `ctx.flag_ids` up to `ctx.flag_count`; returns slot index or `MAX_FLAGS` (=32). Preserves the ENH-024 id==0 skip. |
+| `pa_ctx_snapshot(ctx_ptr: u64) -> () !{mem} @{}` | Copies the 13 per-parse slots from the singleton into the caller's ctx. Called internally by the two `parse_..._ctx` entry points; also useful as a public "take a snapshot" primitive (a caller that ran an existing singleton `parse_argv` can capture the result into a ctx block for later `find_flag_by_id_ctx` reads). |
+| `pa_ctx_copy_qwords(dst: u64, src: u64, n: u64) -> () !{mem} @{}` | Internal qword-copy helper shared by `pa_ctx_snapshot` and the FlagSpec save/load pair. |
+
+`FlagSpec` gets a save/load pair (`flag_spec_save_ctx`,
+`flag_spec_load_ctx`, `flag_spec_reset_ctx`) so a shell that wants
+git-vs-mercurial FlagSpec independence swaps the whole registration
+set with two calls (load target, do work, save target) rather than
+duplicating every per-entry registration function. See the FlagSpec
+entries below.
+
 ### flag_spec.pdx — `FlagSpec`
 
 Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
@@ -135,6 +187,9 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `register_subcommands(table_ptr: u64, count: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-020`, Closes #30)** Install a git-shape subcommand table. `table_ptr` points at a caller-owned array of `SubSpec` entries (`SUBSPEC_STRIDE = 40` bytes each: `{name_ptr, id, flag_specs_ptr, flag_count, help_ptr}` — see `SUBSPEC_OFF_*` for the field offsets); each `SubSpec.flag_specs_ptr` points at an array of `SubFlagSpec` entries (`SUBFLAGSPEC_STRIDE = 24` bytes each: `{name_ptr, kind, id}` — mirrors `flag_spec_register`'s 3-arg surface). `Parser::parse_argv_ex` reads the pair at the top of its walk; a null pointer OR zero count trips the "no dispatch" short-circuit, so a caller wanting to disable dispatch temporarily calls `register_subcommands(0, 0)` or never calls this. On subcommand match, the parser internally calls `flag_spec_reset` (wipes both top-level FlagSpec AND the sub table) and re-registers each of the sub's `flag_specs` before the main argv walk. See the `Parser` table below for the dispatch semantics. |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
 | `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `parse_argv` and `parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `flag_spec_reset()` restores 0. |
+| `flag_spec_save_ctx(ctx_ptr: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Snapshot the entire FlagSpec singleton (10 arrays × 32 qwords + 6 scalars, `FS_CTX_SIZE = 2360` bytes) into a caller-owned `[u64; 295]` block @align(8). One half of the swap pattern that gives callers per-context registration tables without duplicating every per-entry function as `_ctx`. See `FS_CTX_OFF_*` for the ctx byte offsets. |
+| `flag_spec_load_ctx(ctx_ptr: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Inverse of `flag_spec_save_ctx`: copy every field FROM the ctx block INTO the FlagSpec singleton, restoring an earlier snapshot. |
+| `flag_spec_reset_ctx(ctx_ptr: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Zero the 4 bookkeeping slots (spec_count, strict_mode, subcommand_table_ptr, subcommand_table_count) inside a caller-owned FlagSpecCtx block. The singleton is untouched. |
 
 ### parser.pdx — `Parser`
 
@@ -143,6 +198,7 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `parse_argv_ex(argv: u64, argc: u64, parse_flags: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-017`, Closes #27)** The ENH-017 primary. Same walk as `parse_argv` plus opt-in behaviors gated on `parse_flags` bits. Bit 0 (`ARGV_COLLECT_ALL_ERRORS`): keep parsing after recoverable failures, accumulating up to `MAX_COLLECTED_ERRORS` (16) records in `ParsedArgs::error_ring_*`; also enables inline `Typed::parse_int_u64` validation of every FKIND_INT flag's value (records `ERR_BAD_INT` on decode failure). Bit unset ⇒ behaves byte-for-byte like `parse_argv`. Bits 1..63 reserved; must be zero. `ERR_FLAG_OVERFLOW` / `ERR_POS_OVERFLOW` still stop the parse under both modes (storage exhaustion). |
 | `parse_argv(argv: u64, argc: u64) -> u64 !{mem} @{}` | The text-CLI entry point. Walks `argv`, classifies each slot, fills `ParsedArgs`, returns `ERR_OK` or an `ERR_*` code (also recorded with the offending index in `error_arg_index`). Treats `argv[0]` as an ordinary argv slot — callers invoked from `_start` should either pre-skip the program-name slot themselves or call `parse_argv_skipping_zero` (see next row). **(`libpdx-argv.ENH-017`, Closes #27)** Now a thin wrapper over `parse_argv_ex(argv, argc, 0)`; the signature is preserved so every existing consumer links unchanged. **(`libpdx-argv.ENH-020`, Closes #30)** When a subcommand table is installed via `FlagSpec::register_subcommands`, `parse_argv_ex` runs a pre-loop dispatch phase: it treats `argv[0]` as the program name (skipped), classifies `argv[1]` — if flag-shaped, empty, or absent it stays with the top-level FlagSpec table intact and starts the main loop at `argv[1]` (so `git --version` still triggers StdVocab's `--version` auto-emit); if a plausible sub-name candidate matches a `SubSpec.name`, it publishes `SubSpec.id` into `ParsedArgs::subcommand_id`, calls `flag_spec_reset`, re-registers each of the sub's `flag_specs` entries, and starts the main loop at `argv[2]`; a plausible non-flag candidate with no match fails `ERR_UNKNOWN_SUBCOMMAND` (19) via the hard-stop path. Callers that never `register_subcommands` see this phase short-circuit at the null-pointer check and observe byte-for-byte pre-ENH-020 behavior. |
 | `parse_argv_skipping_zero(argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-031`)** Thin wrapper: advances `argv` by one pointer slot and decrements `argc` by 1 before invoking `parse_argv`, so a consumer that received `(argv, argc)` at `_start` per the frozen `execve` ABI (`design/user/execve-abi.md`) can hand them through unmodified without the program name landing in `pos_ptrs[0]`. `argc == 0` short-circuits to `parse_argv(argv, 0)`, which returns `ERR_OK` immediately without dereferencing `argv`. Every satellite `_start` consumer (`pkg`, `ls`, `cp`, `mkdir`, `mv`, `rm`, `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) wants this shape; the bare `parse_argv` remains the lower-level primitive for callers that have already pre-skipped or synthesised argv themselves. |
+| `parse_argv_ctx(ctx_ptr: u64, argv: u64, argc: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Caller-owned `ParsedArgsCtx` variant of `parse_argv`. Internally resets the singleton, runs `parse_argv`, then snapshots the singleton state into the caller's ctx block via `ParsedArgs::pa_ctx_snapshot`. Return value = the parse error code (also mirrored into `ctx.error_code`). Implicit reset makes two consecutive `parse_argv_ctx(&a, …)` / `parse_argv_ctx(&b, …)` calls leave both ctx blocks with byte-independent results without a bookkeeping dance between them — the multi-parse fingerprint the ENH-006 issue text specifies. |
 
 Grammar: long flags `--foo`, `--foo=bar`, `--foo:bar`, `--foo bar`; short
 flags one letter per hyphen (`-f`), with **BOOL/COUNTED clusters expanded**
@@ -198,6 +254,7 @@ Wire constants: `SCHEMA_HEADER_SIZE` 32, `SCHEMA_FLAG_STRIDE` 16,
 | Function | Purpose |
 | --- | --- |
 | `parse_from_schema_record(record_ptr: u64, record_len: u64) -> u64 !{mem} @{}` | The alternate invocation path: validate a v1 record, then fill the same `ParsedArgs` the argv path fills, consulting `FlagSpec::lookup` per flag. Returns `ERR_OK` or an `ERR_SCHEMA_*` / overflow code. |
+| `parse_from_schema_record_ctx(ctx_ptr: u64, record_ptr: u64, record_len: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-006`, Closes #17)** Caller-owned `ParsedArgsCtx` variant of `parse_from_schema_record`. Same snapshot-after design as `parse_argv_ctx`: reset singleton, parse into singleton, snapshot into ctx. Return value = the schema parser's rax (also mirrored into `ctx.error_code`). |
 
 Preconditions mirror `parse_argv`: `parsed_args_reset()` first, `FlagSpec`
 already populated. Stored pointers are interior pointers into the caller's

@@ -522,4 +522,62 @@ module SchemaInvoke = structure {
         ret;
       }
     }
+
+  // ============================================================
+  // parse_from_schema_record_ctx(ctx_ptr, record_ptr, record_len) → u64
+  //
+  // libpdx-argv.ENH-006 (Closes #17). Caller-owned ParsedArgsCtx variant
+  // of parse_from_schema_record. Resets the singleton, runs the
+  // schema-record parse into it, then snapshots into the caller's ctx
+  // block and returns the parser's rax unchanged. Sibling to
+  // Parser::parse_argv_ctx — the same snapshot-after design keeps the
+  // massive schema_invoke body untouched.
+  //
+  //   rdi = ctx_ptr    (caller-owned [u64; 168] block @align(8); MUST
+  //                     be non-null)
+  //   rsi = record_ptr (as parse_from_schema_record accepts)
+  //   rdx = record_len (bytes of caller-owned record buffer)
+  //   rax = same as parse_from_schema_record — ERR_OK or one of the
+  //         ERR_* codes; also mirrored into ctx.error_code /
+  //         ctx.error_arg_index via pa_ctx_snapshot.
+  //
+  // Non-leaf. Stack shape identical to parse_argv_ctx: 2 pushes
+  // (rbx, r12) + sub rsp, 8 → rsp%16 = 0 at every nested call.
+  //
+  // Register plan:
+  //   rbx = record_ptr (callee-save; survives every nested call)
+  //   r12 = ctx_ptr    (callee-save; survives every nested call)
+  //   [rsp+0] = record_len, then parse rax
+  // ============================================================
+  pub let parse_from_schema_record_ctx : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ctx_ptr: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) SchemaInvoke::parse_from_schema_record_ctx — caller-owned ParsedArgsCtx wrapper around parse_from_schema_record. Sequence mirrors Parser::parse_argv_ctx exactly: parsed_args_reset, parse_from_schema_record(rec_ptr, rec_len), pa_ctx_snapshot(ctx). Return value = the schema parser's rax passed through unchanged. Additive-only: the entire M3-001 + ENH-001 + ENH-004 body of parse_from_schema_record is unmodified — the multi-context fingerprint is delivered by the snapshot-after step. Non-leaf: 2 pushes (rbx=record_ptr, r12=ctx_ptr — both must survive across the nested calls that clobber SysV caller-save regs) + sub rsp,8 for record_len/rax spill = 24 bytes on stack after ret addr → rsp%16 = 0 at every nested call site (parsed_args_reset, parse_from_schema_record, pa_ctx_snapshot). The [rsp+0] slot dual-uses as record_len-carrier (before parse) and rax-carrier (across snapshot); each use lifetime is disjoint. 3-arg unsafe-bodied lambda under the 6-param cap.",
+      block: {
+        push rbx;                             // rsp%16: 8 → 0
+        push r12;                             // rsp%16: 0 → 8
+        sub rsp, 8;                           // rsp%16: 8 → 0
+
+        mov r12, rdi;                         // r12 = ctx_ptr
+        mov rbx, rsi;                         // rbx = record_ptr
+        mov [rsp + 0], rdx;                   // spill record_len
+
+        call parsed_args_reset;
+
+        mov rdi, rbx;                         // record_ptr
+        mov rsi, [rsp + 0];                   // record_len
+        call parse_from_schema_record;
+        mov [rsp + 0], rax;                   // spill parse return value
+
+        mov rdi, r12;                         // ctx_ptr
+        call pa_ctx_snapshot;
+
+        mov rax, [rsp + 0];                   // recover parse return value
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
 }

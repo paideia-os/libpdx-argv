@@ -47,6 +47,27 @@ libpdx-argv - argv parser for PaideiaOS tools
     `SchemaEmit::register`-> schema_emit_register
     Pre-1.1 call sites that still use the bare names will not link.
 
+    ENH-006 (Closes #17): caller-owned ParsedArgsCtx multi-parse:
+
+        pub let mut ctx_a : [u64; 168] = uninit @align(8)
+        pub let mut ctx_b : [u64; 168] = uninit @align(8)
+        flag_spec_reset()
+        register_all()
+        let ea = parse_argv_ctx(&ctx_a, argv_a, argc_a)
+        let eb = parse_argv_ctx(&ctx_b, argv_b, argc_b)
+        let ka = find_flag_by_id_ctx(&ctx_a, STD_ID_HELP)
+        let kb = find_flag_by_id_ctx(&ctx_b, STD_ID_JSON)
+        // ctx_a still shows a's parse after b's parse — no
+        // cross-talk. Implicit reset inside parse_argv_ctx means
+        // no parsed_args_reset() between the two calls.
+
+    FlagSpec save/load for per-context registration tables:
+
+        pub let mut git_ctx : [u64; 295] = uninit @align(8)
+        flag_spec_reset(); register_all(); register_sub_flags_git()
+        flag_spec_save_ctx(&git_ctx)   // snapshot git's registrations
+        flag_spec_load_ctx(&git_ctx)   // later, restore them
+
 .section DESCRIPTION
 libpdx-argv turns a `_start`-time argv (or an equivalent
 `PdxArgvRecord@0.1` semantic-pipe record) into a `ParsedArgs`
@@ -718,6 +739,37 @@ in .rodata (27 chars + NUL).
                        the parse under both modes; ring caps silently
                        (extra errors dropped from the ring, parse
                        still advances).
+
+  Unreleased          libpdx-argv.ENH-006 (Closes #17) — caller-owned
+                       ParsedArgsCtx multi-parse contexts. Adds
+                       ParsedArgs::ParsedArgsCtx (caller-allocated
+                       [u64; 168] block @align(8), 1344 B, mirrors
+                       the 13 per-parse singleton slots via
+                       PA_CTX_OFF_* offsets), Parser::parse_argv_ctx
+                       (resets singleton, runs parse_argv, snapshots
+                       into caller ctx via pa_ctx_snapshot),
+                       SchemaInvoke::parse_from_schema_record_ctx
+                       (schema-record twin), ParsedArgs::reset_ctx +
+                       find_flag_by_id_ctx (ctx-relative twins of the
+                       singleton reset + first-wins finder),
+                       ParsedArgs::pa_ctx_snapshot + pa_ctx_copy_qwords
+                       (public snapshot primitive + internal qword-copy
+                       helper). FlagSpec gets its own 2360-byte
+                       FlagSpecCtx layout plus a save/load/reset_ctx
+                       triple (flag_spec_save_ctx / _load_ctx /
+                       _reset_ctx) rather than duplicating every
+                       per-entry registration function. SchemaEmit
+                       stays singleton (per-tool state). Additive-only:
+                       every existing consumer (cp, ls, mkdir, mv, pkg,
+                       rm, every schema-record test) sees zero
+                       behaviour change through the unchanged singleton
+                       entry points; two consecutive parse_argv_ctx
+                       calls into different ctx blocks leave both
+                       independent, delivering the multi-parse
+                       coexistence fingerprint the shell / subshells /
+                       pkg subcommand re-parse all wanted. Test module
+                       id 9 (ParseMultiContext, 3 cases) wired into
+                       the smoke driver.
 
   Unreleased          libpdx-argv.ENH-020 (Closes #30) — git-shape
                        subcommand dispatch. Adds

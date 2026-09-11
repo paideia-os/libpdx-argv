@@ -894,4 +894,348 @@ module FlagSpec = structure {
         ret;
       }
     }
+
+  // ============================================================
+  // ENH-006 (Closes #17) — caller-owned FlagSpecCtx layout
+  // ============================================================
+  // A caller declares one FlagSpec context per registration set it
+  // needs to keep live:
+  //
+  //   pub let mut myfsctx : [u64; 295] = uninit @align(8)
+  //
+  // and uses `flag_spec_save_ctx(&myfsctx)` / `flag_spec_load_ctx(
+  // &myfsctx)` to swap the singleton registration table in and out.
+  // The `flag_spec_reset_ctx(&myfsctx)` zeroes the bookkeeping slots
+  // inside the ctx block without touching the singleton (mirrors
+  // `flag_spec_reset` but on ctx storage).
+  //
+  //   Offset  Size  Field                     (mirrors singleton .bss)
+  //   ------  ----  -----------------------
+  //   0       256   spec_names[32]
+  //   256     256   spec_kinds[32]
+  //   512     256   spec_ids[32]
+  //   768     8     spec_count
+  //   776     256   spec_sep_required[32]
+  //   1032    256   spec_min[32]
+  //   1288    256   spec_max[32]
+  //   1544    256   spec_help[32]
+  //   1800    256   spec_allowed_ptr[32]
+  //   2056    256   spec_allowed_count[32]
+  //   2312    8     last_lookup_sep_required
+  //   2320    8     last_lookup_allowed_ptr
+  //   2328    8     last_lookup_allowed_count
+  //   2336    8     strict_mode
+  //   2344    8     subcommand_table_ptr
+  //   2352    8     subcommand_table_count
+  //   ---------------
+  //   2360 bytes total (= FS_CTX_SIZE; 295 qwords = FS_CTX_QWORDS)
+  //
+  // Storage model. FlagSpecCtx gets its OWN struct (not shared with
+  // ParsedArgsCtx) because registration state and per-parse state
+  // have different lifetimes: a shell typically wants one FlagSpec
+  // context per SUBCOMMAND (git commit vs git push each have their
+  // own flag_specs table) but many ParsedArgs contexts within that
+  // one FlagSpec context (each invocation is a fresh parse). The
+  // two-ctx split lets a caller reuse a FlagSpecCtx across many
+  // parse_argv_ctx calls without re-registering flags each time,
+  // and lets it save/restore FlagSpec state across a switch without
+  // clobbering the ParsedArgsCtx.
+  //
+  // The 6 flag_spec_register / register_sep / register_int /
+  // register_with_help / register_string_enum / register_subcommands
+  // entry points are NOT duplicated as _ctx variants: the swap
+  // pattern (load → register → save) covers the multi-registration
+  // use case at a fraction of the code weight and preserves the
+  // exact registration semantics every existing caller relies on.
+  //   flag_spec_load_ctx(&git_ctx)     // restore git's registrations
+  //   flag_spec_register(...)          // (or use the pre-saved ones)
+  //   parse_argv_ctx(&pa_ctx, argv)    // parse into pa_ctx
+  //   flag_spec_save_ctx(&git_ctx)     // (optional; if flags mutated)
+  //
+  // A future ENH-047 may add per-entry _ctx variants
+  // (flag_spec_register_ctx, lookup_ctx, …); the offset constants
+  // defined here are that rewrite's ABI.
+
+  pub let FS_CTX_OFF_SPEC_NAMES          : u64 = 0
+  pub let FS_CTX_OFF_SPEC_KINDS          : u64 = 256
+  pub let FS_CTX_OFF_SPEC_IDS            : u64 = 512
+  pub let FS_CTX_OFF_SPEC_COUNT          : u64 = 768
+  pub let FS_CTX_OFF_SPEC_SEP_REQUIRED   : u64 = 776
+  pub let FS_CTX_OFF_SPEC_MIN            : u64 = 1032
+  pub let FS_CTX_OFF_SPEC_MAX            : u64 = 1288
+  pub let FS_CTX_OFF_SPEC_HELP           : u64 = 1544
+  pub let FS_CTX_OFF_SPEC_ALLOWED_PTR    : u64 = 1800
+  pub let FS_CTX_OFF_SPEC_ALLOWED_COUNT  : u64 = 2056
+  pub let FS_CTX_OFF_LAST_LOOKUP_SEP     : u64 = 2312
+  pub let FS_CTX_OFF_LAST_LOOKUP_ALLOWED_PTR   : u64 = 2320
+  pub let FS_CTX_OFF_LAST_LOOKUP_ALLOWED_COUNT : u64 = 2328
+  pub let FS_CTX_OFF_STRICT_MODE         : u64 = 2336
+  pub let FS_CTX_OFF_SUBCOMMAND_TABLE_PTR    : u64 = 2344
+  pub let FS_CTX_OFF_SUBCOMMAND_TABLE_COUNT  : u64 = 2352
+  pub let FS_CTX_SIZE                    : u64 = 2360
+  pub let FS_CTX_QWORDS                  : u64 = 295
+
+  // ============================================================
+  // flag_spec_reset_ctx(ctx_ptr) — zero the ctx bookkeeping
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = ctx_ptr (caller-owned [u64; 295] block @align(8);
+  //         MUST be non-null)
+  //
+  // Leaf. Zeroes spec_count / strict_mode / subcommand_table_ptr /
+  // subcommand_table_count inside the ctx block (the four slots
+  // flag_spec_reset zeroes on the singleton). The array slots
+  // (spec_names / spec_kinds / spec_ids / spec_* companions) are
+  // consumed by index up to spec_count so their stale trailing
+  // entries stay unreachable — singleton discipline preserved.
+  // ============================================================
+  pub let flag_spec_reset_ctx : (u64) -> () !{mem} @{} =
+    fn (ctx_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) FlagSpec::flag_spec_reset_ctx — zeroes the four bookkeeping slots (spec_count / strict_mode / subcommand_table_ptr / subcommand_table_count) inside a caller-owned FlagSpecCtx. Mirrors flag_spec_reset field-for-field; the difference is the base address (rdi = caller ctx) rather than [rip + singleton_slot]. Leaf; no cross-module lea (every store is [rdi + imm]). xor rax,rax produces the zero constant. Every displacement fits imm32 trivially (max 2352). The 32-entry arrays (names/kinds/ids/sep/min/max/help/allowed_ptr/allowed_count) are consumed by index up to spec_count so trailing stale entries are unreachable — singleton discipline preserved verbatim.",
+      block: {
+        xor rax, rax;
+        mov [rdi + 768],  rax;                // spec_count
+        mov [rdi + 2336], rax;                // strict_mode
+        mov [rdi + 2344], rax;                // subcommand_table_ptr
+        mov [rdi + 2352], rax;                // subcommand_table_count
+        ret;
+      }
+    }
+
+  // ============================================================
+  // flag_spec_save_ctx(ctx_ptr) — snapshot singleton → ctx
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = ctx_ptr (caller-owned [u64; 295] block @align(8);
+  //         MUST be non-null)
+  //
+  // Non-leaf. Copies the 16 slot-groups (10 arrays of 32 qwords +
+  // 6 scalars = 326 stores total) from the FlagSpec singleton .bss
+  // into the ctx block. 1-push prologue (rbx = ctx_ptr survives
+  // across the nested ParsedArgs::pa_ctx_copy_qwords calls). Uses
+  // the pa_ctx_copy_qwords helper from ParsedArgs — a leaf that
+  // touches only caller-save (rax, rcx), so rbx survives cleanly.
+  //
+  // rsp%16: 8 → 0 at every nested call site (single push aligns).
+  // ============================================================
+  pub let flag_spec_save_ctx : (u64) -> () !{mem} @{} =
+    fn (ctx_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) FlagSpec::flag_spec_save_ctx — snapshots the FlagSpec singleton (10 arrays × 32 qwords + 6 scalar slots = 326 qwords = 2608 bytes; padded to 2360-byte FlagSpecCtx via the layout gaps between arrays — every field written land at its documented offset) into a caller-owned FlagSpecCtx block. Reuses ParsedArgs::pa_ctx_copy_qwords as the qword-copy loop (a leaf that only clobbers caller-save rax/rcx). Non-leaf: 1-push (rbx = ctx_ptr) → rsp%16 = 0 for the nested calls. Scalar copies are load-into-rax through a lea r11 scratch + store [rbx + imm]. Every displacement fits imm32 trivially (max 2352). The save/load pattern is the ENH-006 alternative to per-entry register_ctx variants: a shell that wants git-vs-mercurial FlagSpec independence swaps the whole registration set with two calls (load target, do work, save target) rather than duplicating every registration entry point.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                         // rbx = ctx_ptr
+
+        // spec_names[32] → ctx+0
+        mov rdi, rbx;
+        lea rsi, [rip + spec_names];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_kinds[32] → ctx+256
+        mov rdi, rbx;
+        add rdi, 256;
+        lea rsi, [rip + spec_kinds];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_ids[32] → ctx+512
+        mov rdi, rbx;
+        add rdi, 512;
+        lea rsi, [rip + spec_ids];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_count (scalar) → ctx+768
+        lea r11, [rip + spec_count];
+        mov rax, [r11];
+        mov [rbx + 768], rax;
+
+        // spec_sep_required[32] → ctx+776
+        mov rdi, rbx;
+        add rdi, 776;
+        lea rsi, [rip + spec_sep_required];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_min[32] → ctx+1032
+        mov rdi, rbx;
+        add rdi, 1032;
+        lea rsi, [rip + spec_min];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_max[32] → ctx+1288
+        mov rdi, rbx;
+        add rdi, 1288;
+        lea rsi, [rip + spec_max];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_help[32] → ctx+1544
+        mov rdi, rbx;
+        add rdi, 1544;
+        lea rsi, [rip + spec_help];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_allowed_ptr[32] → ctx+1800
+        mov rdi, rbx;
+        add rdi, 1800;
+        lea rsi, [rip + spec_allowed_ptr];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_allowed_count[32] → ctx+2056
+        mov rdi, rbx;
+        add rdi, 2056;
+        lea rsi, [rip + spec_allowed_count];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // Scalars: last_lookup_sep_required / allowed_ptr / allowed_count
+        //         strict_mode / subcommand_table_ptr / subcommand_table_count
+        lea r11, [rip + last_lookup_sep_required];
+        mov rax, [r11];
+        mov [rbx + 2312], rax;
+
+        lea r11, [rip + last_lookup_allowed_ptr];
+        mov rax, [r11];
+        mov [rbx + 2320], rax;
+
+        lea r11, [rip + last_lookup_allowed_count];
+        mov rax, [r11];
+        mov [rbx + 2328], rax;
+
+        lea r11, [rip + strict_mode];
+        mov rax, [r11];
+        mov [rbx + 2336], rax;
+
+        lea r11, [rip + subcommand_table_ptr];
+        mov rax, [r11];
+        mov [rbx + 2344], rax;
+
+        lea r11, [rip + subcommand_table_count];
+        mov rax, [r11];
+        mov [rbx + 2352], rax;
+
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // flag_spec_load_ctx(ctx_ptr) — restore ctx → singleton
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = ctx_ptr (caller-owned [u64; 295] block @align(8);
+  //         MUST be non-null; typically populated by a prior
+  //         flag_spec_save_ctx call)
+  //
+  // Non-leaf. Inverse of flag_spec_save_ctx: copies every field
+  // FROM the ctx block INTO the FlagSpec singleton .bss. Same
+  // pa_ctx_copy_qwords helper, arguments reversed. 1-push prologue.
+  // ============================================================
+  pub let flag_spec_load_ctx : (u64) -> () !{mem} @{} =
+    fn (ctx_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) FlagSpec::flag_spec_load_ctx — inverse of flag_spec_save_ctx. Copies every field from a caller-owned FlagSpecCtx INTO the singleton .bss. Same pa_ctx_copy_qwords helper, arguments swapped (rdi = singleton .bss, rsi = ctx). Non-leaf; 1-push (rbx = ctx_ptr survives across every nested call). rsp%16 = 0 at every call site. This is the second half of the save/load swap pattern the ENH-006 design uses in lieu of duplicating every registration entry point as a _ctx variant — after a swap-in the singleton acts exactly like it did at the save moment (all 10 array + 6 scalar fields restored).",
+      block: {
+        push rbx;
+        mov rbx, rdi;                         // rbx = ctx_ptr
+
+        // spec_names[32] ← ctx+0
+        lea rdi, [rip + spec_names];
+        mov rsi, rbx;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_kinds[32] ← ctx+256
+        lea rdi, [rip + spec_kinds];
+        mov rsi, rbx;
+        add rsi, 256;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_ids[32] ← ctx+512
+        lea rdi, [rip + spec_ids];
+        mov rsi, rbx;
+        add rsi, 512;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_count (scalar) ← ctx+768
+        mov rax, [rbx + 768];
+        lea r11, [rip + spec_count];
+        mov [r11], rax;
+
+        // spec_sep_required[32] ← ctx+776
+        lea rdi, [rip + spec_sep_required];
+        mov rsi, rbx;
+        add rsi, 776;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_min[32] ← ctx+1032
+        lea rdi, [rip + spec_min];
+        mov rsi, rbx;
+        add rsi, 1032;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_max[32] ← ctx+1288
+        lea rdi, [rip + spec_max];
+        mov rsi, rbx;
+        add rsi, 1288;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_help[32] ← ctx+1544
+        lea rdi, [rip + spec_help];
+        mov rsi, rbx;
+        add rsi, 1544;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_allowed_ptr[32] ← ctx+1800
+        lea rdi, [rip + spec_allowed_ptr];
+        mov rsi, rbx;
+        add rsi, 1800;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // spec_allowed_count[32] ← ctx+2056
+        lea rdi, [rip + spec_allowed_count];
+        mov rsi, rbx;
+        add rsi, 2056;
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // Scalars.
+        mov rax, [rbx + 2312];
+        lea r11, [rip + last_lookup_sep_required];
+        mov [r11], rax;
+
+        mov rax, [rbx + 2320];
+        lea r11, [rip + last_lookup_allowed_ptr];
+        mov [r11], rax;
+
+        mov rax, [rbx + 2328];
+        lea r11, [rip + last_lookup_allowed_count];
+        mov [r11], rax;
+
+        mov rax, [rbx + 2336];
+        lea r11, [rip + strict_mode];
+        mov [r11], rax;
+
+        mov rax, [rbx + 2344];
+        lea r11, [rip + subcommand_table_ptr];
+        mov [r11], rax;
+
+        mov rax, [rbx + 2352];
+        lea r11, [rip + subcommand_table_count];
+        mov [r11], rax;
+
+        pop rbx;
+        ret;
+      }
+    }
 }

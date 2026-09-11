@@ -32,12 +32,12 @@ Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
 | 6  | ParseSchemaRecordTests      | 10    |
 | 7  | HelpBackendTests            | 4     |
 | 8  | SchemaEmitTests             | 5     |
-| 9  | (reserved: parse_mixed_ext) | —     |
+| 9  | MultiContext                | 3     |
 
 **Total M4-001 cases:** 69 (2 added by `libpdx-argv.ENH-002`, 2 more by
 `libpdx-argv.ENH-001`, 3 more by `libpdx-argv.ENH-004`, 1 more by
 `libpdx-argv.ENH-008`, 7 more by `libpdx-argv.ENH-009`, 4 more by
-`libpdx-argv.ENH-010`).
+`libpdx-argv.ENH-010`, 3 more by `libpdx-argv.ENH-006`).
 
 `last_fail_tag` encoding: `(module_id << 32) | case_number`.
 `case_number` is the last hex digit of the module's `run_caseN` name;
@@ -213,5 +213,10 @@ depends on pkg.M4 per §5.12).
   needs `doc.M2` runnable, which is a downstream tool. The M4 test
   here verifies the argv-synthesis contract, which is what libpdx-argv
   can guarantee without doc being present.
-- No concurrent multi-parse — M2/M3 ParsedArgs is singleton-scoped;
-  the caller-owned `ParsedArgs*` variant is a post-M5 concern.
+- No concurrent multi-parse across threads — paideia-os is
+  single-threaded so the coexistence issue that motivated
+  `ParsedArgsCtx` (see `libpdx-argv.ENH-006`, module id 9 above)
+  is sequential, not concurrent. The `MultiContext` module
+  covers the sequential-coexistence fingerprint (two contexts,
+  two `parse_argv_ctx` calls, no cross-talk); a future ENH may
+  add a concurrent-parse test once a thread substrate exists.

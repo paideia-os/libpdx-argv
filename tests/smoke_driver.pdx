@@ -195,6 +195,15 @@ module SmokeDriver = structure {
         call ParseSubcommandsTests::run_case5;
         call ParseSubcommandsTests::run_case6;
 
+        // --- MultiContext (module id 9, ENH-006 Closes #17) ---------
+        // Caller-owned ParsedArgsCtx multi-parse coexistence: two
+        // ctx blocks, two consecutive parse_argv_ctx calls, no
+        // cross-talk. Module id 9 was previously reserved for
+        // parse_mixed; ENH-006 claims it (see tests/README.md).
+        call MultiContext::run_case1;
+        call MultiContext::run_case2;
+        call MultiContext::run_case3;
+
         // --- SchemaEmitTests (module id 8) --------------------------
         call SchemaEmitTests::run_case1;
         call SchemaEmitTests::run_case2;

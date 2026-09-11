@@ -1,10 +1,16 @@
 // src/parsed_args.pdx — libpdx-argv.M1-001 + M2-001 + M2-002 + M2-003 + M3-001
-// ParsedArgs record: singleton .bss storage for one parse_argv() call.
-// See design/architecture.md §2–§3 (M1 record shape) and §9 (M2
-// additions: typed flags, standard vocabulary, positional-list) and
-// §10 (M3 additions: schema-record invocation, doc back-end, --schema
-// emission). Upstream: design/tooling/r49-r50-plan.md §3.3 + §5.12
-// (paideia-os).
+//                       + ENH-006 (Closes #17: caller-owned ParsedArgsCtx)
+// ParsedArgs record: singleton .bss storage for one parse_argv() call,
+// plus (from ENH-006) a caller-allocated ParsedArgsCtx variant so
+// multi-parse contexts coexist inside one process — the shape a
+// shell (many command lines per process), a subshell, or pkg's
+// subcommand re-parse all need.
+//
+// See design/architecture.md §2–§3 (M1 record shape + ENH-006 storage
+// model) and §9 (M2 additions: typed flags, standard vocabulary,
+// positional-list) and §10 (M3 additions: schema-record invocation,
+// doc back-end, --schema emission). Upstream:
+// design/tooling/r49-r50-plan.md §3.3 + §5.12 (paideia-os).
 
 module ParsedArgs = structure {
   // --- Error codes (0 = OK). Consumers pattern-match on these. ---------
@@ -307,7 +313,8 @@ module ParsedArgs = structure {
   pub let MAX_FLAGS : u64 = 32
   pub let MAX_POS   : u64 = 32
 
-  // --- Singleton storage (bootstrap-scope; M4 migrates to caller-owned). -
+  // --- Singleton storage (bootstrap-scope; ENH-006 adds the caller-owned
+  // --- variant — the singleton is retained as the default context). -
   // Existing (M1) slots:
   pub let mut flag_names        : [u64; 32] = uninit @align(8)
   pub let mut flag_values       : [u64; 32] = uninit @align(8)
@@ -684,6 +691,310 @@ module ParsedArgs = structure {
       error_at_oob:
         xor rax, rax;                         // OOB → (0, 0)
         xor rdx, rdx;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // ENH-006 (Closes #17) — caller-owned ParsedArgsCtx layout
+  // ============================================================
+  // A caller declares one context per parse it needs to keep live:
+  //
+  //   pub let mut myctx : [u64; 168] = uninit @align(8)
+  //
+  // and hands its interior pointer to any of the `_ctx` entry points
+  // (Parser::parse_argv_ctx, SchemaInvoke::parse_from_schema_record_ctx,
+  // ParsedArgs::reset_ctx, ParsedArgs::find_flag_by_id_ctx). The
+  // layout captures the 13 per-parse slots the singleton .bss carries
+  // — the ENH-017 error_ring_* slots stay singleton-only (collect-all
+  // mode is a diagnostics opt-in; multi-parse contexts do not need
+  // it, and a caller who does can walk the singleton ring immediately
+  // after each parse_argv_ctx returns).
+  //
+  //   Offset  Size  Field                    (mirrors singleton .bss)
+  //   ------  ----  -----------------------
+  //   0       256   flag_names[32]
+  //   256     256   flag_values[32]
+  //   512     8     flag_count
+  //   520     256   pos_ptrs[32]
+  //   776     8     pos_count
+  //   784     8     error_code
+  //   792     8     error_arg_index
+  //   800     8     emit_schema
+  //   808     256   flag_ids[32]
+  //   1064    256   flag_kinds[32]
+  //   1320    8     ddash_seen
+  //   1328    8     ddash_arg_index
+  //   1336    8     subcommand_id
+  //   ---------------
+  //   1344 bytes total (= PA_CTX_SIZE; 168 qwords = PA_CTX_QWORDS)
+  //
+  // Storage model (ENH-006 pragmatic shape). The singleton .bss slots
+  // remain the primary parse-time storage — every existing consumer
+  // (cp, ls, mkdir, mv, pkg, rm and every non-shell caller) sees
+  // byte-identical semantics through the unchanged singleton entry
+  // points. `parse_argv_ctx(ctx, argv, argc)` is a snapshot wrapper:
+  // it resets the singleton, calls `parse_argv(argv, argc)` (which
+  // parses into the singleton), then copies the 13 fields above into
+  // the caller's ctx and returns the parser's return code. Readers
+  // (`find_flag_by_id_ctx`) scan the ctx directly, so
+  // `parse_argv_ctx(&a, …)` followed by `parse_argv_ctx(&b, …)`
+  // leaves both ctx blocks with their own independent results — the
+  // fingerprint the ENH-006 issue calls out.
+  //
+  // The snapshot design keeps ENH-006 additive: the massive M1..ENH-020
+  // parser + schema_invoke code is unchanged. A future ENH-046 may
+  // rewrite the parser to write directly into a ctx block (removing
+  // the singleton dependency entirely); the surface defined here
+  // (`parse_argv_ctx` / `find_flag_by_id_ctx` / `reset_ctx` /
+  // `parse_from_schema_record_ctx`) is that rewrite's public API.
+  //
+  // Ownership. The ctx block is caller-owned .bss (or .rodata for a
+  // read-only replay); libpdx-argv writes only to the slot range the
+  // caller pointed it at. The flag_names / flag_values / pos_ptrs
+  // pointers stored in ctx are interior pointers into caller-owned
+  // argv memory (same discipline as the singleton). A ctx block
+  // outlives its argv only if the caller keeps the argv strings live.
+
+  pub let PA_CTX_OFF_FLAG_NAMES        : u64 = 0
+  pub let PA_CTX_OFF_FLAG_VALUES       : u64 = 256
+  pub let PA_CTX_OFF_FLAG_COUNT        : u64 = 512
+  pub let PA_CTX_OFF_POS_PTRS          : u64 = 520
+  pub let PA_CTX_OFF_POS_COUNT         : u64 = 776
+  pub let PA_CTX_OFF_ERROR_CODE        : u64 = 784
+  pub let PA_CTX_OFF_ERROR_ARG_INDEX   : u64 = 792
+  pub let PA_CTX_OFF_EMIT_SCHEMA       : u64 = 800
+  pub let PA_CTX_OFF_FLAG_IDS          : u64 = 808
+  pub let PA_CTX_OFF_FLAG_KINDS        : u64 = 1064
+  pub let PA_CTX_OFF_DDASH_SEEN        : u64 = 1320
+  pub let PA_CTX_OFF_DDASH_ARG_INDEX   : u64 = 1328
+  pub let PA_CTX_OFF_SUBCOMMAND_ID     : u64 = 1336
+  pub let PA_CTX_SIZE                  : u64 = 1344
+  pub let PA_CTX_QWORDS                : u64 = 168
+
+  // ============================================================
+  // reset_ctx(ctx_ptr)
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = ctx_ptr (caller-owned [u64; 168] block; MUST be non-null
+  //         and @align(8))
+  //
+  // Leaf. Zero the 8 bookkeeping slots inside the ctx (mirrors
+  // `parsed_args_reset` but writes into the caller's block instead
+  // of the singleton .bss). The 5 array slots (flag_names /
+  // flag_values / pos_ptrs / flag_ids / flag_kinds) are consumed by
+  // index up to flag_count / pos_count so their stale trailing
+  // entries stay unreachable — the discipline is identical to the
+  // singleton reset.
+  //
+  // Register plan (all caller-save; leaf):
+  //   rdi = ctx_ptr (unchanged)
+  //   rax = zero literal source
+  // ============================================================
+  pub let reset_ctx : (u64) -> () !{mem} @{} =
+    fn (ctx_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) ParsedArgs::reset_ctx — zeroes the 8 bookkeeping slots inside a caller-owned ParsedArgsCtx (flag_count / pos_count / error_code / error_arg_index / emit_schema / ddash_seen / ddash_arg_index / subcommand_id). Mirrors parsed_args_reset field-for-field; the difference is the base address (rdi = caller ctx) rather than [rip + singleton_slot]. Leaf; no cross-module lea (every store is [rdi + imm]). xor rax,rax produces the zero constant. Every displacement is a small imm32 (max 1336, well ≤ 0x7FFFFFFF). Array slots (flag_names/values/ids/kinds/pos_ptrs) are consumed by index up to their counter so stale entries stay unreachable — the singleton discipline preserved verbatim.",
+      block: {
+        xor rax, rax;
+        mov [rdi + 512],  rax;                // flag_count
+        mov [rdi + 776],  rax;                // pos_count
+        mov [rdi + 784],  rax;                // error_code
+        mov [rdi + 792],  rax;                // error_arg_index
+        mov [rdi + 800],  rax;                // emit_schema
+        mov [rdi + 1320], rax;                // ddash_seen
+        mov [rdi + 1328], rax;                // ddash_arg_index
+        mov [rdi + 1336], rax;                // subcommand_id
+        ret;
+      }
+    }
+
+  // ============================================================
+  // find_flag_by_id_ctx(ctx_ptr, id) -> u64
+  // Signature: (u64, u64) -> u64 !{mem} @{}
+  //   rdi (in)  = ctx_ptr (caller-owned; MUST be non-null)
+  //   rsi (in)  = target id (0 = "no id / unregistered"; skipped
+  //               per ENH-024, same shape as singleton find_flag_by_id)
+  //   rax (out) = k (0..ctx.flag_count-1) on match, else 32 (MAX_FLAGS)
+  //
+  // Ctx-relative twin of ParsedArgs::find_flag_by_id. The scan walks
+  // ctx.flag_ids (at offset 808) up to ctx.flag_count (at offset 512);
+  // the id==0 skip (ENH-024) is preserved so a caller who allocated
+  // a fresh ctx block and never parsed sees the "not found" sentinel
+  // for every legitimate (nonzero) id lookup.
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rcx = loop index i
+  //   rax = flag_count upper bound / return value
+  //   r8  = &ctx.flag_ids[0]
+  //   rdx = per-iteration flag_ids[i]
+  // ============================================================
+  pub let find_flag_by_id_ctx : (u64, u64) -> u64 !{mem} @{} =
+    fn (ctx_ptr: u64) (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) + ENH-024 ParsedArgs::find_flag_by_id_ctx — ctx-relative twin of find_flag_by_id. Iterates ctx.flag_ids (at ctx+808) up to ctx.flag_count (at ctx+512), returning the first matching slot's index or MAX_FLAGS (=32) on miss. ENH-024 id==0 skip is preserved unchanged: permissive-mode unregistered flags land in flag_ids[k] with id==0, and passing 0 as the target must return 32 (per the singleton contract). Leaf; only caller-save regs used. No cross-module lea — r8 is computed from ctx_ptr + 808 rather than lea [rip + flag_ids]. Mirrors find_flag_by_id's O(MAX_FLAGS) linear-scan shape exactly, differing only in base address. Displacements (512, 808) fit imm32 trivially.",
+      block: {
+        xor rcx, rcx;                         // rcx = i = 0
+        mov rax, [rdi + 512];                 // rax = ctx.flag_count
+        mov r8,  rdi;
+        add r8,  808;                         // r8 = &ctx.flag_ids[0]
+
+      ffbic_loop:
+        cmp rcx, rax;
+        jge ffbic_not_found;
+
+        mov rdx, [r8 + rcx*8];                // rdx = flag_ids[i]
+        cmp rdx, 0;                           // ENH-024 skip
+        je ffbic_skip;
+        cmp rdx, rsi;
+        je ffbic_found;
+
+      ffbic_skip:
+        add rcx, 1;
+        jmp ffbic_loop;
+
+      ffbic_found:
+        mov rax, rcx;
+        ret;
+
+      ffbic_not_found:
+        mov rax, 32;                          // MAX_FLAGS
+        ret;
+      }
+    }
+
+  // ============================================================
+  // pa_ctx_copy_qwords(dst, src, n)  — internal helper
+  // Signature: (u64, u64, u64) -> () !{mem} @{}
+  //   rdi = dst (byte pointer)
+  //   rsi = src (byte pointer)
+  //   rdx = n   (qword count)
+  //
+  // Leaf. Straight-line qword-copy loop. Used by pa_ctx_snapshot
+  // below to fold every 32-qword array copy into a shared body.
+  // ============================================================
+  pub let pa_ctx_copy_qwords : (u64, u64, u64) -> () !{mem} @{} =
+    fn (dst: u64) (src: u64) (n: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) internal helper — qword copy loop shared by pa_ctx_snapshot. Reads rdi=dst, rsi=src, rdx=n; walks 0..n copying one qword per iteration via [rsi+rcx*8] / [rdi+rcx*8] (register-scaled index, inside the R49 encoder subset). Leaf; no callee-save touched; only caller-save regs (rcx, rax) used. No test mnemonic; every loop-head compare is cmp reg, reg.",
+      block: {
+        xor rcx, rcx;
+      pacpq_head:
+        cmp rcx, rdx;
+        jge pacpq_done;
+        mov rax, [rsi + rcx*8];
+        mov [rdi + rcx*8], rax;
+        add rcx, 1;
+        jmp pacpq_head;
+      pacpq_done:
+        ret;
+      }
+    }
+
+  // ============================================================
+  // pa_ctx_snapshot(ctx_ptr)
+  // Signature: (u64) -> () !{mem} @{}
+  //   rdi = ctx_ptr (caller-owned [u64; 168] block; MUST be non-null
+  //         and @align(8))
+  //
+  // Non-leaf. Copies the 13 per-parse slots from the singleton .bss
+  // into the ctx layout in a single pass. Called by
+  // Parser::parse_argv_ctx (after parse_argv fills the singleton) and
+  // by SchemaInvoke::parse_from_schema_record_ctx (after the schema
+  // record path fills it). Also useful as a public "take a snapshot
+  // of the current parse" primitive — a shell that wants to remember
+  // an earlier parse before overwriting the singleton calls this
+  // directly.
+  //
+  // 5 array copies × 32 qwords + 8 scalar copies = 168 qword writes
+  // total = 1344 bytes = PA_CTX_SIZE. Each array copy delegates to
+  // pa_ctx_copy_qwords; each scalar copy is one load + one store.
+  //
+  // 1-push prologue (rbx = ctx_ptr, survives across the nested
+  // pa_ctx_copy_qwords calls). rsp%16: 8 → 0 at every call site.
+  // ============================================================
+  pub let pa_ctx_snapshot : (u64) -> () !{mem} @{} =
+    fn (ctx_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-006 (Closes #17) ParsedArgs::pa_ctx_snapshot — copies the 13 per-parse slots from the singleton .bss (flag_names/flag_values/flag_count/pos_ptrs/pos_count/error_code/error_arg_index/emit_schema/flag_ids/flag_kinds/ddash_seen/ddash_arg_index/subcommand_id) into a caller-owned ParsedArgsCtx block. Total 168 qwords = 1344 bytes = PA_CTX_SIZE. Non-leaf: calls pa_ctx_copy_qwords 5 times (one per 32-qword array). Prologue: 1-push (rbx) → rsp%16 = 0 for the nested calls; rbx holds ctx_ptr across every call because pa_ctx_copy_qwords is a leaf that only clobbers caller-save (rax/rcx). Scalar copies are one load into rax through a lea r11 scratch + one store [rbx + imm]. Every displacement fits imm32 (max 1336). The snapshot is called by parse_argv_ctx / parse_from_schema_record_ctx AFTER the underlying parse fills the singleton — this preserves the entire existing parser without a rewrite (the additive-only constraint the ENH-006 issue calls out).",
+      block: {
+        push rbx;
+        mov rbx, rdi;                         // rbx = ctx_ptr
+
+        // flag_names[32] → ctx+0
+        mov rdi, rbx;
+        lea rsi, [rip + flag_names];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // flag_values[32] → ctx+256
+        mov rdi, rbx;
+        add rdi, 256;
+        lea rsi, [rip + flag_values];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // flag_count (scalar) → ctx+512
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        mov [rbx + 512], rax;
+
+        // pos_ptrs[32] → ctx+520
+        mov rdi, rbx;
+        add rdi, 520;
+        lea rsi, [rip + pos_ptrs];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // pos_count (scalar) → ctx+776
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        mov [rbx + 776], rax;
+
+        // error_code (scalar) → ctx+784
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        mov [rbx + 784], rax;
+
+        // error_arg_index (scalar) → ctx+792
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        mov [rbx + 792], rax;
+
+        // emit_schema (scalar) → ctx+800
+        lea r11, [rip + emit_schema];
+        mov rax, [r11];
+        mov [rbx + 800], rax;
+
+        // flag_ids[32] → ctx+808
+        mov rdi, rbx;
+        add rdi, 808;
+        lea rsi, [rip + flag_ids];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // flag_kinds[32] → ctx+1064
+        mov rdi, rbx;
+        add rdi, 1064;
+        lea rsi, [rip + flag_kinds];
+        mov rdx, 32;
+        call pa_ctx_copy_qwords;
+
+        // ddash_seen (scalar) → ctx+1320
+        lea r11, [rip + ddash_seen];
+        mov rax, [r11];
+        mov [rbx + 1320], rax;
+
+        // ddash_arg_index (scalar) → ctx+1328
+        lea r11, [rip + ddash_arg_index];
+        mov rax, [r11];
+        mov [rbx + 1328], rax;
+
+        // subcommand_id (scalar) → ctx+1336
+        lea r11, [rip + subcommand_id];
+        mov rax, [r11];
+        mov [rbx + 1336], rax;
+
+        pop rbx;
         ret;
       }
     }

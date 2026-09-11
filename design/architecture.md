@@ -35,9 +35,13 @@ if err != ParsedArgs::ERR_OK { emit stderr diagnostic + exit code per I4 }
 ```
 
 The consumer never allocates a ParsedArgs itself in M1 — the singleton
-lives in libpdx-argv's `.bss` (see §3 below). M4 introduces a
-caller-owned struct variant so multiple parse contexts can coexist inside
-one process; M1 does not need that shape.
+lives in libpdx-argv's `.bss` (see §3 below). `libpdx-argv.ENH-006`
+(landed post-M4, Closes #17) adds a caller-owned `ParsedArgsCtx`
+variant so multiple parse contexts can coexist inside one process
+(the shape a shell — many command lines per process — a subshell,
+`mux`'s split panes, and `pkg`'s subcommand re-parse all need);
+M1..M5 consumers ignore that variant and keep using the singleton
+entry points unchanged. See §3 for the storage-model landing.
 
 ## 2. ParsedArgs record shape
 
@@ -83,10 +87,87 @@ is deliberate for bootstrap:
   the schema flag; the arrays are consumed by index up to `flag_count` /
   `pos_count`, so stale trailing entries are unreachable.
 
-M4 (`libpdx-argv.M4-001`) reruns the parse-correctness matrix against a
-caller-owned `ParsedArgs*` variant so tests can build many contexts in
-one process. That extension changes only the two module entry points —
-consumers keep the same field names.
+M4 landed the parse-correctness matrix against the singleton .bss
+only; the caller-owned variant it hinted at was deferred and shipped
+by `libpdx-argv.ENH-006` (Closes #17) as `ParsedArgsCtx` /
+`FlagSpecCtx`. Two documents disagreed for two releases (the M4 line
+above and `src/parsed_args.pdx:32`'s "bootstrap-scope; M4 migrates to
+caller-owned" comment both promised what M4 had actually not
+delivered); ENH-006 lands the deliverable and rewrites both to
+reflect that.
+
+### 3.1 ENH-006 storage model — caller-owned ParsedArgsCtx (Closes #17)
+
+`ParsedArgsCtx` is a caller-allocated `[u64; 168]` block @align(8)
+(1344 bytes, `PA_CTX_SIZE`) laid out to mirror the 13 per-parse
+singleton slots (see the docstring in `src/parsed_args.pdx` for the
+byte offsets — every `PA_CTX_OFF_*` constant carries its own offset
+value). `FlagSpecCtx` is a `[u64; 295]` block @align(8) (2360 bytes,
+`FS_CTX_SIZE`) that mirrors the FlagSpec singleton with 16
+slot-groups. Both are declared by the caller in `.bss` (or `.rodata`
+for a read-only replay); libpdx-argv writes only to the slot range
+the caller pointed it at.
+
+Four new `_ctx` entry points:
+
+  - `Parser::parse_argv_ctx(ctx_ptr, argv, argc) -> u64` —
+    parses into a caller-owned `ParsedArgsCtx`. Internally resets
+    the singleton, calls `parse_argv`, snapshots the result via
+    `ParsedArgs::pa_ctx_snapshot`. Return value = the parse error
+    code (also mirrored into `ctx.error_code`).
+  - `SchemaInvoke::parse_from_schema_record_ctx(ctx_ptr, rec_ptr,
+    rec_len) -> u64` — same shape for the schema-record path.
+  - `ParsedArgs::reset_ctx(ctx_ptr)` — zeroes the 8 bookkeeping
+    slots inside a caller ctx (mirrors `parsed_args_reset`).
+  - `ParsedArgs::find_flag_by_id_ctx(ctx_ptr, id) -> u64` — scans
+    ctx.flag_ids up to ctx.flag_count and returns the matching
+    slot's index or 32 (`MAX_FLAGS`).
+
+Additive-only design. The pre-existing singleton entry points
+(`parse_argv`, `parse_from_schema_record`, `parsed_args_reset`,
+`find_flag_by_id`, `find_last_flag_by_id`, `count_flag_by_id`, the
+`error_at` / `error_count` ring API) all stay byte-identical.
+Each takes the singleton .bss as its "library-owned default
+context" — the same 13 slots the ctx layout maps — and every
+existing consumer (`cp`, `ls`, `mkdir`, `mv`, `pkg`, `rm`, every
+schema-record test, every satellite) sees zero behaviour change.
+
+Snapshot-after mechanism. `parse_argv_ctx` does not rewrite the
+parser to use ctx-relative addressing — that would be a
+~1600-line internal change and no consumer needs it. Instead the
+underlying parser writes to the singleton exactly as it always
+has, and the `_ctx` wrapper copies the 13 fields into the caller's
+ctx block via `pa_ctx_snapshot` (5 array copies × 32 qwords + 8
+scalar copies = 168 qwords). Two consecutive
+`parse_argv_ctx(&a, …)` / `parse_argv_ctx(&b, …)` calls then
+leave both ctx blocks with byte-independent results — the
+multi-parse fingerprint the ENH-006 issue text specifies.
+
+FlagSpecCtx uses a save/load pattern rather than per-entry `_ctx`
+variants: `flag_spec_save_ctx(ctx)` snapshots the singleton
+registration table into a caller-owned block;
+`flag_spec_load_ctx(ctx)` copies the block back into the singleton.
+A shell that wants git-vs-mercurial FlagSpec independence swaps the
+whole registration set with two calls (load target, do work, save
+target) rather than duplicating every registration entry point as
+`register_ctx` / `register_sep_ctx` / `register_int_ctx` / etc.
+The offset constants (`FS_CTX_OFF_SPEC_NAMES` = 0, `…SPEC_KINDS`
+= 256, etc.) are the future-ABI seed for a rewrite that would
+duplicate the per-entry surface (`libpdx-argv.ENH-047` if it
+ever ships).
+
+Implicit reset. `parse_argv_ctx` calls `parsed_args_reset` before
+the nested `parse_argv`, so a caller doing many parse_argv_ctx
+calls does not need a bookkeeping dance between each parse. The
+singleton `parse_argv` still relies on the caller's own
+`parsed_args_reset` call (the pre-ENH-006 contract is preserved
+byte-for-byte).
+
+Concurrency. paideia-os is single-threaded; the coexistence
+issue that motivated ENH-006 is sequential (one call at a time,
+independent state per ctx). A concurrent-parse extension would
+need a thread substrate that does not yet exist and is out of
+scope for ENH-006.
 
 ## 4. Parser state machine
 
