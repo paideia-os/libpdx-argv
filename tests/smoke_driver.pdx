@@ -148,6 +148,12 @@ module SmokeDriver = structure {
         call ParseTypedValuesTests::run_case27;
         call ParseTypedValuesTests::run_case28;
         call ParseTypedValuesTests::run_case29;
+        // libpdx-argv.ENH-019 (Closes #29): STRING flag enum validation.
+        call ParseTypedValuesTests::run_case30;
+        call ParseTypedValuesTests::run_case31;
+        call ParseTypedValuesTests::run_case32;
+        call ParseTypedValuesTests::run_case33;
+        call ParseTypedValuesTests::run_case34;
 
         // --- ParseTypedArgsTests (module id 3) ----------------------
         call ParseTypedArgsTests::run_case1;

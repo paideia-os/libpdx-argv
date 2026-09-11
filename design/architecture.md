@@ -1694,3 +1694,170 @@ not affect any consumer that reads only the scalar slots.
   API to distinguish "16 errors" from "16 or more".
 
 Klog tag: `pdxargv.collect-errors`.
+
+## 18. STRING flag enum validation (ENH-019, Closes #29)
+
+Pre-ENH-019 an FKIND_STR flag was a raw byte channel: the parser stored
+the value pointer verbatim and every consumer wanting to gate on a fixed
+vocabulary — "must be one of `auto`, `always`, `never`" — re-implemented
+the same three-string strcmp against a locally-declared table, five to
+ten lines of near-identical boilerplate per call site with no shared
+error code. This mirrors the pre-ENH-018 gap for INT ranges (§13) and
+gets the parallel resolution: lift the check into the library at
+registration time, so the parser fires it inline and every consumer
+observes the same `ParsedArgs::error_code`.
+
+### 18.1 Module surface delta
+
+`FlagSpec` grows two `[u64; 32]` .bss arrays (`spec_allowed_ptr`,
+`spec_allowed_count`) and one exported function:
+
+- `register_string_enum(name_ptr, id, allowed_ptr, allowed_count)` —
+  appends `(name, FKIND_STR, id)` with `(allowed_ptr, allowed_count)`
+  published into the new slots. `allowed_ptr` is a pointer to an
+  array of NUL-terminated-string pointers (`*const *const u8` in the
+  caller's declaration); `allowed_count` is the pointer count. Kind
+  is fixed to `FKIND_STR` (1) — `register_string_enum` is the
+  STR-with-allowed-set superset of `flag_spec_register`, mirroring
+  the shape ENH-018's `register_int` uses for INT. Silently no-ops
+  past `SPEC_MAX`. Every other registration path
+  (`flag_spec_register`, `register_sep`, `register_int`,
+  `register_with_help`) defensively zeroes both slots so a slot
+  recycled after a `register_string_enum` batch never inherits a
+  stale allowed set.
+
+`FlagSpec::lookup` grows two companion `.bss` slots that its match
+path publishes (same shape as `last_lookup_sep_required`):
+
+- `last_lookup_allowed_ptr : u64` and
+  `last_lookup_allowed_count : u64` — the matched slot's
+  `spec_allowed_ptr[i]` / `spec_allowed_count[i]` pair, or `(0, 0)`
+  on a miss. Valid only immediately after a `lookup()` call.
+
+`Parser::parse_argv_ex` grows two inline enum-walk blocks (one at
+each of the long-flag and short-flag store sites) plus a shared
+`parse_argv_string_enum` fail label. Each walk block:
+
+  1. Gates on `kind == FKIND_STR && r14 != 0 && last_lookup_allowed_count > 0`;
+  2. Hoists `allowed_ptr` and `allowed_count` into caller-save regs;
+  3. Byte-compares (via the same inline `xor+mov_b+cmp` shape
+     `lookup()` itself uses) the captured value against every
+     candidate, first match wins;
+  4. Falls off the walk (no match) into `parse_argv_string_enum`
+     which sets `rax = 18` and routes through
+     `parse_argv_maybe_collect`.
+
+`ParsedArgs` grows one error-code constant:
+
+- `ERR_STRING_ENUM : u64 = 18` — set by the parser on a gate
+  rejection; also stored into `ParsedArgs::error_code` per the
+  ENH-017 "first error wins" scalar-publish contract.
+
+### 18.2 Sentinel contract: `allowed_count == 0` means "gate OFF"
+
+The `allowed_count == 0` case bypasses the walk entirely, so a plain
+`flag_spec_register(name, FKIND_STR, id)` — which writes 0 into
+`spec_allowed_count` via the defensive zeroing block — behaves
+identically to pre-ENH-019 for every existing consumer. This is the
+same shape ENH-018 uses for the `(min=0, max=0)` INT range sentinel:
+the empty-set state matches what non-opting-in paths naturally
+produce, so no explicit "off" call is needed at bootstrap.
+
+A caller wanting an explicitly-empty allowed set (which would reject
+every value including the empty string) should not call
+`register_string_enum` at all — such a compose is not a plausible use
+case, and the sentinel-collision is by design.
+
+### 18.3 Case-sensitivity discipline
+
+The byte compare uses `xor rax, rax; mov_b rax, [ptr]` loads on both
+the candidate and the captured value with no ASCII-case normalisation
+anywhere in the path — `"AUTO"` never matches an `"auto"` entry. This
+matches the byte-for-byte discipline of the rest of the parser (§paideia-as
+compliance) and keeps the fingerprint locked at the compare shape,
+not at a downstream case-folding table that could drift. Consumers
+wanting case-insensitive vocabularies register the equivalence classes
+explicitly (`{"auto\0", "AUTO\0", "Auto\0"}`).
+
+### 18.4 Gate independence from the collect-all bit
+
+Unlike ENH-017's inline FKIND_INT validation (which fires ONLY under
+`ARGV_COLLECT_ALL_ERRORS`), the FKIND_STR enum walk fires on BOTH
+`parse_argv` and `parse_argv_ex(..., 0)`. The reason is the allowed
+set is a per-registration property opted into at
+`register_string_enum` time — the caller has explicitly asked for the
+gate, so running it inline under the plain entry point is behaviour-
+faithful to the registration intent. INT-value validation, by
+contrast, is a shape every FKIND_INT flag technically wants but has
+historically lived at the consumer's dispatch site; flipping it on
+under plain `parse_argv` would silently change behaviour for every
+pre-ENH-017 INT consumer, which the collect-bit gate avoids.
+
+### 18.5 Store-not-rolled-back discipline
+
+On a gate rejection the store itself is preserved: `flag_names[k] /
+flag_values[k] / flag_ids[k] / flag_kinds[k]` all reflect the
+(name, offending-value, id, STR) triple the parser observed. This
+matches ENH-017's `ERR_BAD_INT` shape and keeps the diagnostic path
+identical: `argv[error_arg_index]` reads the offending token
+verbatim, and a collect-all-mode walker treats any `FKIND_STR` slot
+whose value would fail the gate as diagnostic-only. Rolling back
+would need a per-slot "tentative store" state machine that neither
+ERR_BAD_INT nor any other ENH-017 recoverable fail asks for.
+
+### 18.6 Cluster-path exclusion
+
+Clustered short flags (ENH-013) are BOOL-only by the admissibility
+rule: any letter whose lookup returns FKIND_STR fails the whole
+cluster with `ERR_CLUSTER_WITH_ARITY (16)` before any letter is
+dispatched. So no enum walk fires from the cluster path — the block
+lives only in the single-letter short-flag store, which is where a
+tool that explicitly registers `-c` as FKIND_STR with an allowed set
+lands.
+
+### 18.7 Fingerprint (issue #29)
+
+With `register_string_enum("--color", ID_COLOR, &["auto\0",
+"always\0", "never\0"], 3)`:
+
+- `parse_argv(["--color", "auto"])`   → `ERR_OK`, `error_code=0`
+- `parse_argv(["--color", "always"])` → `ERR_OK`
+- `parse_argv(["--color", "never"])`  → `ERR_OK`
+- `parse_argv(["--color", "mauve"])`  → `ERR_STRING_ENUM (18)`;
+  `error_code=18`; `flag_count=1` (store preserved)
+- `parse_argv(["--color", "AUTO"])`   → `ERR_STRING_ENUM (18)`;
+  case-sensitive rejection
+
+Under `register_string_enum("--color", ID_COLOR, 0, 0)` (empty set):
+
+- `parse_argv(["--color", "mauve"])`  → `ERR_OK` — gate OFF.
+
+Cases 30-34 in `tests/parse_typed_values_tests.pdx` are the
+regression fixtures.
+
+### 18.8 What ENH-019 explicitly does not do
+
+- No `register_string_enum_sep` variant. A tool that wants a
+  bounded STR flag whose spelling ALSO mandates a separator
+  (`--color=<mode>` only, never `--color <mode>`) has to compose
+  that via `register_sep()` followed by a manual post-hoc
+  `spec_allowed_ptr` / `spec_allowed_count` write. Promoting the
+  compose into a first-class variant is a follow-on ENH parallel
+  to ENH-018's future `register_int_sep`.
+- No case-insensitive comparison. Register the case variants
+  explicitly if needed (see §18.3).
+- No FKIND_ENUM interaction. `FKIND_ENUM (5)` remains the
+  StdVocab-owned kind for `--color`'s I3 spelling; the ENH-019
+  gate is orthogonal, addressing the FKIND_STR flow specifically
+  where a tool wants a bounded vocabulary without leaving the
+  raw-string kind. A future unification is possible but out of
+  scope; today a tool picks one or the other by which register_*
+  it calls.
+- No SchemaInvoke-path gate. The schema-record's typed values
+  are decoded upstream (the sender is responsible for supplying
+  an in-set value); adding a gate there would need a shared
+  allowed-list wire schema. The consumer's own dispatch-site
+  validation catches out-of-set values on that path exactly as
+  before.
+
+Klog tag: `pdxargv.string-enum`.

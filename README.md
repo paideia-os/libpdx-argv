@@ -68,7 +68,18 @@ BOOL/COUNTED short flags are now expanded instead of rejected),
 fires ONLY under `parse_argv_ex(..., ARGV_COLLECT_ALL_ERRORS)`; the
 stored flag slot is NOT rolled back, and the pre-ENH-017
 `parse_argv` never triggers this code so existing consumers see no
-behavior change).
+behavior change),
+`ERR_STRING_ENUM` 18 (`libpdx-argv.ENH-019`, Closes #29 — captured
+FKIND_STR value did not byte-equal (case-sensitive) any entry in the
+allowed-values list a caller registered via
+`FlagSpec::register_string_enum`. Unlike `ERR_BAD_INT`, this gate
+fires on BOTH `parse_argv` and `parse_argv_ex` regardless of the
+collect bit — the allowed set is a per-registration opt-in, so the
+check is orthogonal to ENH-017's collect-mode opt-in. Empty
+allowed_count is the "gate OFF" sentinel and preserves pre-ENH-019
+behavior for every consumer that never called
+`register_string_enum`. The stored flag slot is NOT rolled back —
+same discipline as `ERR_BAD_INT`).
 
 ENH-017 additions: `ARGV_COLLECT_ALL_ERRORS = 1` (bit 0 of
 `parse_argv_ex`'s third argument — turns on multi-error accumulation
@@ -102,6 +113,7 @@ Declarative flag table, capacity `SPEC_MAX = 32`. Value kinds:
 | `register_sep(name_ptr: u64, kind: u64, id: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-010`)** Same as `flag_spec_register`, but the flag's value MUST arrive inline — the parser never accepts a lookahead value for it, even if `argv[i+1]` looks like a plausible one. Use for a flag whose I3 spelling mandates a separator (`--color=`, `--no-cap:`). |
 | `register_int(name_ptr: u64, id: u64, min: u64, max: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Register an INT-kinded flag (kind fixed to `FKIND_INT`) with an inclusive unsigned `[min, max]` interval published into new `spec_min` / `spec_max` slots. `Typed::parse_int_u64_ranged` reads the pair (either forwarded by the consumer or recovered via `get_range_by_id`) and rejects a decoded value outside the interval with `ERR_INT_RANGE`. Sentinel: `(min = 0, max = 0)` means "range OFF" — the plain `flag_spec_register` path writes exactly this, so every existing INT registration is transparent to the gate. |
 | `get_range_by_id(id: u64) -> u64 !{mem} @{}` | **(`libpdx-argv.ENH-018`, Closes #28)** Multi-return `(min in rax, max in rdx)` — companion accessor for the range slots `register_int` publishes. Returns `(0, 0)` both for an unregistered id AND for a flag registered without a range — indistinguishable at this API, by design; callers that need to tell them apart call `lookup()` first. |
+| `register_string_enum(name_ptr: u64, id: u64, allowed_ptr: u64, allowed_count: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-019`, Closes #29)** Register a STR-kinded flag (kind fixed to `FKIND_STR`) with a caller-owned array of NUL-terminated-string pointers (`*const *const u8`) as the allowed-values gate. The parser byte-compares (case-sensitive) every captured value against every entry in the array and rejects a no-match value with `ERR_STRING_ENUM` (18). Sentinel: `allowed_count = 0` means "gate OFF" — behaviour identical to a plain `flag_spec_register(name, FKIND_STR, id)`, so a caller who wants no gate can call either path. The gate fires on BOTH `parse_argv` and `parse_argv_ex` (independent of `ARGV_COLLECT_ALL_ERRORS`) because the allowed set is a per-registration opt-in. |
 | `lookup(name_ptr: u64) -> u64 !{mem} @{}` | Inline-strcmp scan; returns **kind in `rax`, id in `rdx`**. Miss yields `FKIND_UNKNOWN` / id 0 — unregistered flags are treated as boolean. |
 | `set_strict(on: u64) -> () !{mem} @{}` | **(`libpdx-argv.ENH-004`)** Opt into strict mode: `on != 0` makes both `parse_argv` and `parse_from_schema_record` fail with `ERR_UNKNOWN_FLAG` (12) on any `lookup` miss instead of storing the flag as boolean. Defaults to 0 (permissive); `flag_spec_reset()` restores 0. |
 

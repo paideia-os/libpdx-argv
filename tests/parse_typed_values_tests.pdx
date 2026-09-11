@@ -66,6 +66,30 @@ module ParseTypedValuesTests = structure {
   pub let f_int_32 : [u8; 3] = "32\0"
   pub let f_int_65 : [u8; 3] = "65\0"
 
+  // -- libpdx-argv.ENH-019 STRING-enum-validation fixtures (Closes #29) --
+  // Fingerprint uses register_string_enum("--color", ID_COLOR,
+  // &["auto\0","always\0","never\0"], 3) and exercises each half of
+  // the {in-set, out-of-set, case-sensitive rejection, empty-set
+  // sentinel} matrix. Argv is assembled inline in each run_caseN
+  // via a 2-entry .bss argv scratch so the lookahead value form
+  // (`--color auto`) — the shape the fingerprint literally uses —
+  // is exercised end-to-end through parse_argv.
+  pub let ecs_name_color   : [u8; 8]  = "--color\0"
+  pub let ecs_bare_color   : [u8; 6]  = "color\0"       // FlagSpec key (no leading '--')
+  pub let ecs_val_auto     : [u8; 5]  = "auto\0"
+  pub let ecs_val_always   : [u8; 7]  = "always\0"
+  pub let ecs_val_never    : [u8; 6]  = "never\0"
+  pub let ecs_val_mauve    : [u8; 6]  = "mauve\0"       // not in the allowed set
+  pub let ecs_val_AUTO_upper : [u8; 5] = "AUTO\0"       // case-sensitive miss
+  // Allowed-values array-of-pointers. Registered as a [u64; 3] of
+  // .rodata string pointers so register_string_enum sees a
+  // pointer-scaled indexable base. The parser walks it via
+  // `mov rdi, [r8 + r9*8]` which matches this layout exactly.
+  pub let mut ecs_allowed : [u64; 3] = uninit @align(8)
+  // Two-entry argv scratch reused across every ENH-019 case (each
+  // case is full_reset-preceded so no cross-case state leaks).
+  pub let mut ecs_argv : [u64; 2] = uninit @align(8)
+
   // ============================================================
   // case 1  parse_int_u64("0") → (1, 0)
   // ============================================================
@@ -847,6 +871,288 @@ module ParseTypedValuesTests = structure {
         pop rbx; ret;
       case29_fail:
         mov rdi, 0x20000001D;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // libpdx-argv.ENH-019 STRING flag enum validation (Closes #29)
+  // Cases 30-34: fingerprint from the issue body. Each case
+  // installs the three-entry allowed set into the ecs_allowed
+  // scratch, registers `--color` (FlagSpec key "color") via
+  // register_string_enum with allowed_count=3, assembles a two-
+  // slot argv (["--color", "<value>"]), and asserts parse_argv's
+  // return code + ParsedArgs::error_code. Case 34 additionally
+  // verifies the empty-set sentinel (register_string_enum with
+  // count=0 → gate OFF; every value including "mauve" accepted).
+  //
+  // The lookahead `--color <value>` shape (two argv slots) is the
+  // exact shape the fingerprint prescribes; the inline `--color=<value>`
+  // shape is exercised by the parse_grammar tests (case 18, ENH-010)
+  // and is orthogonal to the ENH-019 gate — the STR-enum walk is
+  // independent of how the value was captured.
+  // ============================================================
+
+  // Small helper: install the standard three-entry allowed set
+  // {auto, always, never} into ecs_allowed. Called from each of
+  // cases 30-33 (and NOT case 34, which registers an empty set).
+  // Leaf-safe: only writes to ecs_allowed via r11 lea scratch.
+  pub let ecs_install_allowed_3 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 test helper — populates the ecs_allowed [u64; 3] scratch with the fingerprint's three .rodata pointers (ecs_val_auto, ecs_val_always, ecs_val_never). Extracted so the four case functions that share the same allowed set do not each duplicate three lea/mov pairs. Leaf; r11 lea scratch; three sequential 8-byte stores at offsets 0/8/16. No stack traffic — safe from any alignment.",
+      block: {
+        lea r11, [rip + ecs_allowed];
+        lea rax, [rip + ecs_val_auto];    mov [r11 + 0],  rax;
+        lea rax, [rip + ecs_val_always];  mov [r11 + 8],  rax;
+        lea rax, [rip + ecs_val_never];   mov [r11 + 16], rax;
+        ret;
+      }
+    }
+
+  // ============================================================
+  // case 30  parse_argv(["--color", "auto"]) → ERR_OK
+  //   register_string_enum("color", 100, &{auto,always,never}, 3)
+  //   "auto" is in the set → gate passes.
+  // ============================================================
+  pub let run_case30 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 case30 (Closes #29) — primary happy-path witness of the fingerprint's in-set arm. Registers `color` at FKIND_STR/id=100 with the three-entry allowed set; parses `--color auto`. Post-parse assertions: rax==ERR_OK (0), ParsedArgs::error_code==0, flag_count==1, find_flag_by_id(100) resolves to slot 0. Also asserts flag_kinds[0]==FKIND_STR (1) to lock in that register_string_enum wired the FKIND_STR-fixed kind end-to-end. Follows the case-25 pattern (full_reset first so error_code baseline is 0; asserts unchanged after the in-set case).",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call ecs_install_allowed_3;
+
+        // register_string_enum(name=ecs_bare_color, id=100, allowed=&ecs_allowed, count=3)
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        lea rdx, [rip + ecs_allowed];
+        mov rcx, 3;
+        call register_string_enum;
+
+        // Assemble argv: ["--color", "auto"]
+        lea r11, [rip + ecs_val_auto];
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color]; mov [rbx + 0], rax;
+        mov [rbx + 8], r11;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0; jne case30_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case30_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case30_fail;
+
+        mov rdi, 100;
+        call find_flag_by_id;
+        cmp rax, 32; je case30_fail;
+        cmp rax, 0;  jne case30_fail;
+
+        lea r11, [rip + flag_kinds];
+        mov rax, [r11 + 0];               // slot 0
+        cmp rax, 1; jne case30_fail;      // FKIND_STR
+
+        call record_pass;
+        pop rbx; ret;
+      case30_fail:
+        mov rdi, 0x20000001E;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 31  parse_argv(["--color", "always"]) → ERR_OK
+  //   Second in-set entry — exercises the multi-candidate walk's
+  //   probe advance (r9 = 1 branch is only reached when the first
+  //   candidate mismatches, so `always` witnesses the loop body
+  //   past the first probe).
+  // ============================================================
+  pub let run_case31 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 case31 (Closes #29) — witnesses the walk's per-candidate advance. `always` matches at allowed[1], so the parser's parse_argv_long_str_enum_probe loop must advance r9 from 0 to 1 (via parse_argv_long_str_enum_next) before finding the match. Pairs with case30 (which matches at allowed[0] on the first probe) so both r9==0 and r9>0 match branches are covered.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call ecs_install_allowed_3;
+
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        lea rdx, [rip + ecs_allowed];
+        mov rcx, 3;
+        call register_string_enum;
+
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color];  mov [rbx + 0], rax;
+        lea rax, [rip + ecs_val_always];  mov [rbx + 8], rax;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0; jne case31_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case31_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case31_fail:
+        mov rdi, 0x20000001F;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 32  parse_argv(["--color", "mauve"]) → ERR_STRING_ENUM (18)
+  //   "mauve" is NOT in the allowed set → gate rejects with the
+  //   new ENH-019 error code. Also asserts flag_count remains 1
+  //   (the store is NOT rolled back — see ERR_STRING_ENUM
+  //   docstring in parsed_args.pdx).
+  // ============================================================
+  pub let run_case32 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 case32 (Closes #29) — the fingerprint's out-of-set rejection witness. `mauve` fails every candidate strcmp, so parse_argv_long_str_enum_probe walks to r9 == 3 (== allowed_count), takes the jge fall-off branch to parse_argv_string_enum, sets rax = 18 (ERR_STRING_ENUM), and routes through parse_argv_maybe_collect. Under plain parse_argv (bit unset) the router falls through to parse_argv_epilogue which returns rax. Also asserts flag_count == 1 (store NOT rolled back — parser-observed triple is diagnostic-only) and error_code == 18 (first-error scalar publish).",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call ecs_install_allowed_3;
+
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        lea rdx, [rip + ecs_allowed];
+        mov rcx, 3;
+        call register_string_enum;
+
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color]; mov [rbx + 0], rax;
+        lea rax, [rip + ecs_val_mauve];  mov [rbx + 8], rax;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 18; jne case32_fail;     // ERR_STRING_ENUM
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 18; jne case32_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case32_fail;      // store NOT rolled back
+
+        call record_pass;
+        pop rbx; ret;
+      case32_fail:
+        mov rdi, 0x200000020;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 33  parse_argv(["--color", "AUTO"]) → ERR_STRING_ENUM (18)
+  //   "AUTO" (uppercase) is NOT in the allowed set — the parser's
+  //   byte compare is case-sensitive. Regression fixture for the
+  //   fingerprint's case-sensitivity clause.
+  // ============================================================
+  pub let run_case33 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 case33 (Closes #29) — case-sensitivity fixture. `AUTO` differs from `auto` at the first byte (0x41 vs 0x61) with no ASCII-case normalisation applied anywhere in the walk (xor+mov_b loads are byte-exact), so parse_argv_long_str_enum_cmp must jne on the very first byte compare of the first candidate, walk all three, and land at parse_argv_string_enum. Locks in that the byte compare stays byte-for-byte discipline, matching the rest of the parser (paideia-as compliance line 'Byte loads use xor rax, rax; mov_b rax, [ptr]' — no case-folding hardware is ever invoked here).",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call ecs_install_allowed_3;
+
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        lea rdx, [rip + ecs_allowed];
+        mov rcx, 3;
+        call register_string_enum;
+
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color];   mov [rbx + 0], rax;
+        lea rax, [rip + ecs_val_AUTO_upper]; mov [rbx + 8], rax;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 18; jne case33_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 18; jne case33_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case33_fail:
+        mov rdi, 0x200000021;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 34  Empty allowed_count → no gate.
+  //   register_string_enum("color", 100, 0, 0) (or an equivalent
+  //   plain flag_spec_register with FKIND_STR would behave the
+  //   same). "mauve" — which fails case 32 with the gate on — is
+  //   accepted here because count == 0 disables the walk.
+  //   Regression fixture for the fingerprint's final clause.
+  // ============================================================
+  pub let run_case34 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 case34 (Closes #29) — empty-set sentinel witness. Explicitly calls register_string_enum with count=0 (which the parser's `cmp rcx, 0; je parse_argv_long_skip_str_enum` short-circuit reads as 'gate OFF'), then parses the same `--color mauve` that case32 rejects. Result: ERR_OK, error_code == 0, flag_count == 1 — behaviour identical to a plain flag_spec_register(name, FKIND_STR, id). Locks in that a caller supplying count=0 sees byte-for-byte pre-ENH-019 semantics; also witnesses that the register_string_enum path's own defensive-zero of spec_min/spec_max/spec_help/spec_sep_required does not accidentally trip any other gate on the STR flow.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // register_string_enum with count = 0 → sentinel "gate OFF"
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        xor rdx, rdx;                     // allowed_ptr = null (unread when count=0)
+        xor rcx, rcx;                     // allowed_count = 0
+        call register_string_enum;
+
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color]; mov [rbx + 0], rax;
+        lea rax, [rip + ecs_val_mauve];  mov [rbx + 8], rax;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0; jne case34_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case34_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case34_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case34_fail:
+        mov rdi, 0x200000022;
         call record_fail;
         pop rbx; ret;
       }

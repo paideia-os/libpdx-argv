@@ -6,6 +6,140 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-019 — STRING flag enum validation via `register_string_enum` (Closes #29)
+
+Pre-ENH-019 an FKIND_STR flag was a raw byte channel: the parser
+stored the value pointer verbatim and every consumer wanting to
+gate on a fixed vocabulary — "must be one of `auto`, `always`,
+`never`" — re-implemented the same three-string strcmp against a
+locally-declared table, five to ten lines of near-identical
+boilerplate per call site with no shared error code. ENH-019
+lifts the check into the library at registration time, mirroring
+the ENH-018 shape for INT ranges (§13 of `design/architecture.md`).
+
+Public surface additions:
+
+  - `FlagSpec::register_string_enum(name_ptr, id, allowed_ptr,
+    allowed_count) -> ()` — registers `name` at kind = `FKIND_STR`
+    (1) with the caller-owned array of NUL-terminated string
+    pointers (`*const *const u8`) as the allowed-values gate.
+  - `FlagSpec::spec_allowed_ptr : [u64; 32]` and
+    `FlagSpec::spec_allowed_count : [u64; 32]` — the per-slot
+    storage backing the gate.
+  - `FlagSpec::last_lookup_allowed_ptr : u64` and
+    `FlagSpec::last_lookup_allowed_count : u64` — companion "out
+    parameter" slots that every `lookup()` call publishes, same
+    shape as `last_lookup_sep_required` (ENH-010). A miss zeroes
+    both.
+  - `ParsedArgs::ERR_STRING_ENUM : u64 = 18` — set by the parser
+    on a gate rejection.
+
+Parser changes (`src/parser.pdx`):
+
+  - Two inline enum-walk blocks (one at each of the long-flag and
+    short-flag store sites) run immediately after the flag_names
+    / flag_values / flag_ids / flag_kinds store, before the
+    ENH-017 FKIND_INT gate and the ENH-032 / ENH-014 auto-emit
+    dispatches. Each block gates on `kind == FKIND_STR (1) AND
+    r14 != 0 AND last_lookup_allowed_count > 0`, then walks the
+    caller-registered allowed-values array using the same inline
+    `xor+mov_b+cmp` strcmp shape `lookup()` itself uses (first
+    match wins).
+  - `parse_argv_string_enum` — a new recoverable-fail label near
+    `parse_argv_bad_int` that sets `rax = 18` and jumps to
+    `parse_argv_maybe_collect`. Reuses the ENH-017 recoverable-
+    fail router so the gate participates in collect-all mode
+    (advance-past-argv-slot recovery) without extra plumbing.
+  - The cluster path (`parse_argv_short_clustered`) is BOOL-only
+    per ENH-013's admissibility rule, so no enum walk fires
+    there.
+
+Defensive-zero hygiene:
+
+  - Every non-`register_string_enum` registration path
+    (`register_with_help`, `register_sep`, `register_int`)
+    writes `spec_allowed_ptr[slot] = 0` and
+    `spec_allowed_count[slot] = 0` at the store site, so a slot
+    recycled from a `register_string_enum` batch never inherits
+    a stale allowed set. This mirrors the ENH-018 defensive-zero
+    pattern for `spec_min` / `spec_max`.
+
+Semantics summary:
+
+  - **Sentinel: `allowed_count == 0` means "gate OFF"**. The
+    plain `flag_spec_register(name, FKIND_STR, id)` path writes
+    exactly this via the defensive-zero block, so every
+    pre-ENH-019 STR registration preserves byte-for-byte
+    behaviour. `register_string_enum(..., 0, 0)` is the
+    equivalent-but-explicit spelling.
+  - **Case-sensitive byte compare**. No ASCII-case normalisation
+    anywhere in the walk — `"AUTO"` never matches an `"auto"`
+    entry. Consumers wanting case-insensitive vocabularies
+    register the equivalence classes explicitly
+    (`{"auto\0", "AUTO\0", "Auto\0"}`).
+  - **Gate independence from the collect-all bit**. Unlike
+    ENH-017's inline FKIND_INT validation, the FKIND_STR enum
+    walk fires on BOTH `parse_argv` and `parse_argv_ex(..., 0)`
+    because the allowed set is a per-registration property
+    opted into at `register_string_enum` time. Under the
+    collect-all bit the fail routes through the same
+    `parse_argv_maybe_collect` router as every other
+    recoverable fail — the parser records ERR_STRING_ENUM and
+    advances past the offending argv slot instead of returning.
+  - **Store not rolled back**. On rejection the parser-observed
+    (name, offending-value, id, STR) triple stays in
+    `flag_names[k]` / `flag_values[k]` / `flag_ids[k]` /
+    `flag_kinds[k]` — same discipline as `ERR_BAD_INT`.
+    Consumers walking `ParsedArgs` after a parse that returned
+    (or collected) `ERR_STRING_ENUM` treat the offending
+    `FKIND_STR` slot as diagnostic-only.
+  - **First-error wins**. On a plain `parse_argv` the router
+    falls through to `parse_argv_epilogue` after the ring seed
+    (byte-for-byte pre-ENH-017 return-on-first-error semantics);
+    under collect-all the epilogue returns
+    `error_ring_codes[0]` per the ENH-017 first-error preservation
+    contract.
+
+Fingerprint (issue #29) — the parse_typed_values_tests.pdx cases
+30-34 are the regression fixtures:
+
+  With `register_string_enum("--color", ID_COLOR, &["auto\0",
+  "always\0", "never\0"], 3)`:
+
+    - `parse_argv(["--color", "auto"])`   → `ERR_OK`
+    - `parse_argv(["--color", "always"])` → `ERR_OK`
+    - `parse_argv(["--color", "never"])`  → `ERR_OK`
+    - `parse_argv(["--color", "mauve"])`  → `ERR_STRING_ENUM (18)`;
+      `error_code = 18`; `flag_count = 1` (store preserved)
+    - `parse_argv(["--color", "AUTO"])`   → `ERR_STRING_ENUM (18)`
+      (case-sensitive rejection)
+
+  With `register_string_enum("--color", ID_COLOR, 0, 0)`:
+
+    - `parse_argv(["--color", "mauve"])`  → `ERR_OK` (gate OFF)
+
+Klog tag: `pdxargv.string-enum`.
+
+Not touched by ENH-019 (out of scope):
+
+  - No `register_string_enum_sep()` variant. A tool wanting a
+    bounded STR flag whose spelling ALSO mandates a separator
+    (`--color=<mode>` only) has to compose that via
+    `register_sep()` followed by a manual post-hoc
+    `spec_allowed_ptr` / `spec_allowed_count` write — a
+    follow-on ENH parallel to ENH-018's future
+    `register_int_sep()`.
+  - No FKIND_ENUM interaction. `FKIND_ENUM (5)` remains the
+    StdVocab-owned kind for `--color`'s I3 spelling; the
+    ENH-019 gate is orthogonal, addressing the FKIND_STR flow
+    specifically.
+  - No SchemaInvoke-path gate. The schema-record's typed
+    values are decoded upstream; adding a gate there would need
+    a shared allowed-list wire schema.
+  - No ABI change for existing callers. Every non-STR-enum
+    registration path preserves its pre-ENH-019 signature; the
+    defensive-zero additions are internal store-block details.
+
 ### ENH-017 — Collect-all-errors mode via `ARGV_COLLECT_ALL_ERRORS` (Closes #27)
 
 Pre-ENH-017 `Parser::parse_argv` returned on the first parse

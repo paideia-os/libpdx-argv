@@ -112,6 +112,35 @@ module FlagSpec = structure {
   // paid only when the auto-table actually fires.
   pub let mut spec_help : [u64; 32] = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-019 (Closes #29): per-registration
+  // STRING-flag allowed-values gate. Set only by
+  // `register_string_enum()`; every other registration path
+  // (flag_spec_register, register_sep, register_int,
+  // register_with_help) explicitly writes 0 into both slots so a
+  // slot recycled after a `register_string_enum` batch never
+  // inherits a stale allowed set.
+  //
+  // Interpretation: `spec_allowed_ptr[i]` is a pointer to an array
+  // of NUL-terminated-string pointers (`*const *const u8` in the
+  // caller's declaration); `spec_allowed_count[i]` is the number
+  // of pointer entries in that array. The empty-list sentinel
+  // (`spec_allowed_count[i] == 0`) is the "gate OFF" state: the
+  // parser's post-store enum walk sees count == 0 and skips the
+  // walk entirely (behaves identically to a plain FKIND_STR
+  // registration).
+  //
+  // Only meaningful for slots whose spec_kinds[i] is FKIND_STR;
+  // for any other kind the slots are still zeroed on registration
+  // (matching the sep_required / min / max / help conventions) but
+  // no path reads them. The parser gates its own enum-walk on the
+  // just-stored kind == FKIND_STR before consulting these slots
+  // (via the lookup() companion publish), so a caller registering
+  // a non-STR flag with a nonzero allowed_count would still see
+  // its gate silently skipped — a caller-side contract violation,
+  // not a runtime one.
+  pub let mut spec_allowed_ptr   : [u64; 32] = uninit @align(8)
+  pub let mut spec_allowed_count : [u64; 32] = uninit @align(8)
+
   // Companion "out parameter" for lookup() (libpdx-argv.ENH-010):
   // lookup's own return convention is fixed at (kind in rax, id in
   // rdx) — the full width of SysV's multi-return rax:rdx pair — so a
@@ -123,6 +152,17 @@ module FlagSpec = structure {
   // uses after Parser::parse_argv. Valid only immediately after a
   // lookup() call; a miss (FKIND_UNKNOWN) always leaves this at 0.
   pub let mut last_lookup_sep_required : u64 = uninit @align(8)
+
+  // Added by libpdx-argv.ENH-019 (Closes #29): companion "out
+  // parameter" slots for lookup(). Every lookup() call publishes
+  // the matched slot's `spec_allowed_ptr[i]` / `spec_allowed_count[i]`
+  // pair here so `Parser::parse_argv_ex` can gate its post-store
+  // STRING-enum walk without a second linear scan. A miss
+  // (FKIND_UNKNOWN return) always leaves both at 0. Valid only
+  // immediately after a lookup() call — same lifetime discipline
+  // as `last_lookup_sep_required` above.
+  pub let mut last_lookup_allowed_ptr   : u64 = uninit @align(8)
+  pub let mut last_lookup_allowed_count : u64 = uninit @align(8)
 
   // Added by libpdx-argv.ENH-004: opt-in strict mode. 0 (default, and
   // the value FlagSpec::reset() restores) = permissive — an
@@ -275,6 +315,14 @@ module FlagSpec = structure {
         mov [r11 + rax*8], r8;
         lea r11, [rip + spec_help];
         mov [r11 + rax*8], rcx;
+        // ENH-019 (Closes #29): defensive-zero the STRING-enum slots
+        // so a slot recycled after a register_string_enum() batch
+        // into a plain register/register_with_help never inherits a
+        // stale allowed set.
+        lea r11, [rip + spec_allowed_ptr];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_allowed_count];
+        mov [r11 + rax*8], r8;
 
         add rax, 1;
         lea r11, [rip + spec_count];
@@ -324,6 +372,11 @@ module FlagSpec = structure {
         mov [r11 + rax*8], r8;
         lea r11, [rip + spec_help];
         mov [r11 + rax*8], r8;             // ENH-014: defensive-zero help slot
+        // ENH-019 (Closes #29): defensive-zero the STRING-enum slots.
+        lea r11, [rip + spec_allowed_ptr];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_allowed_count];
+        mov [r11 + rax*8], r8;
 
         add rax, 1;
         lea r11, [rip + spec_count];
@@ -403,6 +456,21 @@ module FlagSpec = structure {
         mov r8, [r11 + rcx*8];            // r8 = this match's sep_required
         lea r11, [rip + last_lookup_sep_required];
         mov [r11], r8;
+        // ENH-019 (Closes #29): also publish the matched slot's
+        // (allowed_ptr, allowed_count) pair into the two lookup
+        // companion slots so Parser::parse_argv_ex can gate its
+        // post-store STRING-enum walk without a second scan. r8
+        // is reused as a load/store cursor here since neither the
+        // sep_required companion nor lookup's kind/id return pair
+        // still depend on it.
+        lea r11, [rip + spec_allowed_ptr];
+        mov r8, [r11 + rcx*8];
+        lea r11, [rip + last_lookup_allowed_ptr];
+        mov [r11], r8;
+        lea r11, [rip + spec_allowed_count];
+        mov r8, [r11 + rcx*8];
+        lea r11, [rip + last_lookup_allowed_count];
+        mov [r11], r8;
         ret;
 
       lookup_not_found:
@@ -410,6 +478,14 @@ module FlagSpec = structure {
         xor rdx, rdx;                     // id = 0
         lea r11, [rip + last_lookup_sep_required];
         xor r8, r8;
+        mov [r11], r8;
+        // ENH-019 (Closes #29): a miss zeroes the STRING-enum
+        // companion slots too — an unregistered flag has no
+        // allowed set, so the parser's post-store enum walk (which
+        // fires only when count > 0) short-circuits on this path.
+        lea r11, [rip + last_lookup_allowed_ptr];
+        mov [r11], r8;
+        lea r11, [rip + last_lookup_allowed_count];
         mov [r11], r8;
         ret;
       }
@@ -484,6 +560,17 @@ module FlagSpec = structure {
         mov [r11 + rax*8], rcx;
         lea r11, [rip + spec_help];
         mov [r11 + rax*8], r8;             // ENH-014: defensive-zero help slot
+        // ENH-019 (Closes #29): defensive-zero the STRING-enum slots.
+        // register_int is FKIND_INT-only so the enum gate would
+        // never fire from this slot anyway (the parser gates its
+        // walk on kind == FKIND_STR before consulting these slots
+        // via the lookup() companion publish), but zeroing keeps a
+        // recycled slot deterministic across a register_string_enum
+        // → register_int sequence.
+        lea r11, [rip + spec_allowed_ptr];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_allowed_count];
+        mov [r11 + rax*8], r8;
 
         add rax, 1;
         lea r11, [rip + spec_count];
@@ -561,6 +648,118 @@ module FlagSpec = structure {
       grbi_not_found:
         xor rax, rax;                     // min = 0
         xor rdx, rdx;                     // max = 0
+        ret;
+      }
+    }
+
+  // ============================================================
+  // register_string_enum(name_ptr, id, allowed_ptr, allowed_count)
+  //                              — libpdx-argv.ENH-019 (Closes #29)
+  // Signature: (u64, u64, u64, u64) -> () !{mem} @{}
+  //   rdi = name_ptr (NUL-terminated string)
+  //   rsi = id (caller-chosen; 0 reserved for "unregistered")
+  //   rdx = allowed_ptr (pointer to an array of NUL-terminated-string
+  //         pointers; `*const *const u8` in the caller's declaration)
+  //   rcx = allowed_count (number of pointer entries in that array;
+  //         0 = "range OFF" sentinel, gate disabled)
+  //
+  // Registers `name_ptr` at kind=FKIND_STR (1) with the caller-chosen
+  // id AND publishes (allowed_ptr, allowed_count) into
+  // spec_allowed_ptr[slot] / spec_allowed_count[slot]. Downstream,
+  // `Parser::parse_argv_ex` byte-compares (case-sensitive) each
+  // captured value against every entry in the allowed set and sets
+  // `ParsedArgs::error_code = ERR_STRING_ENUM (18)` on no match; a
+  // slot with `spec_allowed_count == 0` (the plain-registration
+  // sentinel) disables the gate and preserves pre-ENH-019 behaviour.
+  //
+  // Kind is fixed to FKIND_STR (1) rather than taken from the caller:
+  // register_string_enum is the STR-with-allowed-set superset of
+  // flag_spec_register, and a caller registering something non-STR
+  // should call the plain path (which now also clears the allowed
+  // slots to 0/0 so a slot recycled after this call never inherits a
+  // stale allowed set). This mirrors register_int's FKIND_INT-fixed
+  // discipline (ENH-018) and keeps the type↔metadata coupling at
+  // registration time rather than parse time.
+  //
+  // Sentinel: allowed_count == 0 means "gate OFF" — the parser's
+  // post-store enum walk short-circuits on `cmp count, 0; je skip`
+  // and behaves identically to a plain FKIND_STR registration. This
+  // matches the (0) that every non-register_string_enum registration
+  // path writes into spec_allowed_count, so a flag registered via
+  // any other path never trips the gate even if the consumer's
+  // dispatch code walks the same slot. A caller wanting an
+  // explicitly-empty allowed set should not call register_string_enum
+  // at all — the empty set is indistinguishable from the sentinel by
+  // design (a zero-length allowed set would reject every value
+  // including the empty string, which is not a plausible flag
+  // spelling; the compose "register the flag and then reject every
+  // value" is not a use case we owe an API to).
+  //
+  // Sep-required posture: register_string_enum writes
+  // spec_sep_required[slot] = 0 (lookahead allowed). A tool that
+  // wants a bounded STR flag whose spelling ALSO mandates a
+  // separator (`--color=<mode>` only, never `--color <mode>`)
+  // currently has to compose that via register_sep() followed by
+  // manual post-hoc spec_allowed_ptr / spec_allowed_count writes;
+  // a `register_string_enum_sep()` variant is a follow-on ENH
+  // parallel to the register_int_sep future variant ENH-018 notes.
+  //
+  // Silently no-ops past SPEC_MAX (same policy as flag_spec_register
+  // and every other registration path — the M2 single-return API
+  // never grew a registration-failure code).
+  //
+  // Leaf. Register plan (all caller-save):
+  //   rax = spec_count / scratch
+  //   r8  = zero literal for spec_sep_required / spec_min /
+  //         spec_max / spec_help
+  //   r11 = lea scratch for cross-module .bss bases
+  //
+  // paideia-as compliance: 4 params ≤ MAX 6 for unsafe-bodied
+  // lambdas; no test mnemonic; every zero-check via cmp reg, 0;
+  // cmp rax, 32 fits imm8; r11 is scratch; mov r8, 1 for the
+  // FKIND_STR kind literal (fits imm8); indexed stores via
+  // `[r11 + rax*8]` stay inside the R49 encoder subset.
+  // ============================================================
+  pub let register_string_enum : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (name_ptr: u64) (id: u64) (allowed_ptr: u64) (allowed_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 FlagSpec::register_string_enum (Closes #29) — appends (name, FKIND_STR, id) at spec_count with the caller's (allowed_ptr, allowed_count) pair published into spec_allowed_ptr[slot] / spec_allowed_count[slot]. Kind is fixed to FKIND_STR (1) rather than taken from the caller: register_string_enum is the STR-with-allowed-set superset of flag_spec_register, and a caller registering something non-STR should call the plain path (which now also clears the allowed slots to 0/0 via the ENH-019 defensive-zero block so a slot recycled after this call never inherits a stale allowed set). spec_sep_required[slot] is zeroed here (lookahead allowed) to match flag_spec_register's default arity posture — a bounded STR flag with a mandatory separator is a compose-your-own until a register_string_enum_sep() variant lands. spec_min / spec_max / spec_help are also defensively zeroed with the same r8=0 staging pattern flag_spec_register uses so a slot recycled from a register_int() or register_with_help() call never inherits stale bounds/help. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal for the four defensive stores; the FKIND_STR literal (1) is staged into r8 for its own store then r8 is reloaded to 0 for the defensive block. Silently drops past SPEC_MAX (single-return API, mirrors flag_spec_register). MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). The caller-visible sentinel is `allowed_count == 0 → gate OFF`; a caller wanting an explicitly-empty allowed set should not call register_string_enum at all (indistinguishable by design). New klog tag: pdxargv.string-enum.",
+      block: {
+        lea r11, [rip + spec_count];
+        mov rax, [r11];
+        cmp rax, 32;                       // SPEC_MAX
+        jge register_string_enum_full;
+
+        lea r11, [rip + spec_names];
+        mov [r11 + rax*8], rdi;
+        lea r11, [rip + spec_kinds];
+        mov r8, 1;                         // FKIND_STR
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_ids];
+        mov [r11 + rax*8], rsi;
+        // Publish the allowed set into the ENH-019 slots.
+        lea r11, [rip + spec_allowed_ptr];
+        mov [r11 + rax*8], rdx;
+        lea r11, [rip + spec_allowed_count];
+        mov [r11 + rax*8], rcx;
+        // Defensive-zero every sibling per-slot array so a slot
+        // recycled from another registration path never inherits
+        // stale bits into this row.
+        mov r8, 0;
+        lea r11, [rip + spec_sep_required];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_min];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_max];
+        mov [r11 + rax*8], r8;
+        lea r11, [rip + spec_help];
+        mov [r11 + rax*8], r8;
+
+        add rax, 1;
+        lea r11, [rip + spec_count];
+        mov [r11], rax;
+
+      register_string_enum_full:
         ret;
       }
     }

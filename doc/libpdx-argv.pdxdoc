@@ -415,6 +415,62 @@ whole-buffer header failure.
                                      upstream). Klog tag:
                                      pdxargv.collect-errors.
 
+  ERR_STRING_ENUM (18)              FKIND_STR flag's captured value
+                                     did not byte-equal (case-
+                                     sensitive) any entry in the
+                                     caller-registered allowed set
+                                     (libpdx-argv.ENH-019, #29). Set
+                                     by Parser::parse_argv on both
+                                     the long-flag (`--color auto`
+                                     and `--color=auto`) and single-
+                                     letter short-flag store paths
+                                     immediately after the store
+                                     block, when the just-stored
+                                     kind is FKIND_STR (1) AND
+                                     FlagSpec::last_lookup_allowed_count
+                                     (published by the preceding
+                                     call lookup) is nonzero AND no
+                                     candidate in the allowed_ptr
+                                     array matches. The check fires
+                                     on BOTH parse_argv and
+                                     parse_argv_ex (independent of
+                                     the ARGV_COLLECT_ALL_ERRORS
+                                     bit) because the allowed set
+                                     is a per-registration property
+                                     opted into at
+                                     FlagSpec::register_string_enum
+                                     time — the caller has
+                                     explicitly asked for the gate.
+                                     Empty allowed_count is the
+                                     "gate OFF" sentinel: a plain
+                                     flag_spec_register(name,
+                                     FKIND_STR, id) writes 0 into
+                                     spec_allowed_count via the
+                                     defensive-zero block, so
+                                     pre-ENH-019 STR registrations
+                                     preserve byte-for-byte
+                                     behaviour. Case-sensitive: no
+                                     ASCII-case normalisation is
+                                     applied anywhere in the walk
+                                     (`"AUTO"` never matches an
+                                     `"auto"` entry) — callers
+                                     wanting case-insensitive
+                                     vocabularies register the
+                                     equivalence classes explicitly.
+                                     The stored flag slot is NOT
+                                     rolled back — the parser-
+                                     observed (name, offending-value,
+                                     id, STR) triple stays in
+                                     flag_names[k] / flag_values[k]
+                                     / flag_ids[k] / flag_kinds[k]
+                                     for a consumer's diagnostic
+                                     rendering. Cluster path
+                                     (parse_argv_short_clustered)
+                                     is BOOL-only per ENH-013's
+                                     admissibility rule, so no enum
+                                     walk fires there. Klog tag:
+                                     pdxargv.string-enum.
+
   ERR_INT_RANGE (14)                INT-flag value fell outside the
                                      registered inclusive-unsigned
                                      [min, max] interval
@@ -573,6 +629,32 @@ in .rodata (27 chars + NUL).
                        / `--jobs UINT64_MAX` all rejected with
                        ERR_INT_RANGE. Plain register keeps the
                        range OFF (0, 0 sentinel).
+  Unreleased          libpdx-argv.ENH-019 (Closes #29) — STRING
+                       flag enum validation. Adds
+                       FlagSpec::register_string_enum (kind fixed
+                       to FKIND_STR, publishes an *const *const u8
+                       array-of-NUL-terminated-string pointers +
+                       count into new spec_allowed_ptr /
+                       spec_allowed_count [u64; 32] slots), a
+                       lookup() companion publish
+                       (last_lookup_allowed_ptr /
+                       last_lookup_allowed_count) so
+                       Parser::parse_argv_ex can byte-compare (case-
+                       sensitive) the just-stored value against
+                       every allowed entry via an inline
+                       xor+mov_b+cmp strcmp walk, and
+                       ParsedArgs::ERR_STRING_ENUM (18). A tool
+                       registering `--color` with {auto, always,
+                       never} sees `--color auto`/`--color always`/
+                       `--color never` OK, `--color mauve`/`--color
+                       AUTO` rejected. Empty allowed_count = gate
+                       OFF; plain flag_spec_register(name, FKIND_STR,
+                       id) preserves pre-ENH-019 behaviour. Gate
+                       fires on BOTH parse_argv and parse_argv_ex
+                       (independent of ARGV_COLLECT_ALL_ERRORS) —
+                       the allowed set is a per-registration opt-in.
+                       Store NOT rolled back on rejection (matches
+                       ERR_BAD_INT discipline).
   Unreleased          libpdx-argv.ENH-017 (Closes #27) — collect-all-
                        errors mode. Adds Parser::parse_argv_ex(argv,
                        argc, parse_flags) as the primary entry point;

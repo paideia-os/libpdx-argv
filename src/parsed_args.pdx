@@ -186,6 +186,45 @@ module ParsedArgs = structure {
   //
   // New klog tag: `pdxargv.collect-errors`.
   pub let ERR_BAD_INT                   : u64 = 17
+  // Added by libpdx-argv.ENH-019 (Closes #29): STRING-flag value
+  // failed the caller-registered allowed-values gate. Set by
+  // `Parser::parse_argv_ex` after storing an FKIND_STR flag whose
+  // registration published a non-empty allowed-values list via
+  // `FlagSpec::register_string_enum` AND the just-captured value
+  // does not byte-equal (case-sensitive) any entry in that list.
+  // The store itself is NOT rolled back — flag_names[k] /
+  // flag_values[k] / flag_ids[k] / flag_kinds[k] all reflect the
+  // (name, offending-value, id, STR) triple the parser observed;
+  // consumers walking ParsedArgs post-parse in either single- or
+  // collect-all mode should treat any FKIND_STR slot whose value
+  // failed the gate as a diagnostic-only entry, exactly the same
+  // way ENH-017 asks them to treat an ERR_BAD_INT-flagged FKIND_INT
+  // slot. `error_arg_index` records the argv index of the value
+  // slot (r13 after the parser has advanced past the flag onto its
+  // lookahead value, or the flag slot itself on the inline `=`/`:`
+  // form where value and flag share one argv slot); a consumer's
+  // diagnostic renderer dereferences argv[error_arg_index] to get
+  // the offending token verbatim.
+  //
+  // The gate fires on BOTH the pre-ENH-017 parse_argv path and the
+  // ENH-017 parse_argv_ex path (regardless of the collect bit) —
+  // it is orthogonal to ENH-017's INT-validation opt-in, because
+  // the allowed-values list is a per-registration property that
+  // was explicitly opted into at `register_string_enum` time.
+  // The empty-list default (every registration path other than
+  // `register_string_enum` writes `spec_allowed_count[slot] = 0`)
+  // silently disables the gate for every pre-ENH-019 registration,
+  // so existing consumers see zero behaviour change.
+  //
+  // Not emitted on the SchemaInvoke path: the schema-record's
+  // typed values are decoded upstream (the sender is responsible
+  // for supplying an in-range value in the wire form) and adding a
+  // gate there would need a shared allowed-list wire schema; the
+  // consumer's own dispatch-site validation catches out-of-set
+  // values on that path exactly as before.
+  //
+  // New klog tag: `pdxargv.string-enum`.
+  pub let ERR_STRING_ENUM               : u64 = 18
 
   // --- ENH-017 collect-all-errors mode (Closes #27) -------------------
   // `Parser::parse_argv_ex(argv, argc, parse_flags)` opts into
