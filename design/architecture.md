@@ -1951,6 +1951,64 @@ Under `register_string_enum("--color", ID_COLOR, 0, 0)` (empty set):
 Cases 30-34 in `tests/parse_typed_values_tests.pdx` are the
 regression fixtures.
 
+### 18.7.1 Registration-time invariant check (ENH-019 hotfix, Closes #45)
+
+Pre-hotfix `register_string_enum` stored the caller's
+`(allowed_ptr, allowed_count)` pair verbatim, so a caller passing
+`allowed_ptr == 0` with `allowed_count > 0` (a contract violation)
+passed the `SPEC_MAX` gate and the subsequent
+`Parser::parse_argv_ex` enum walk dereferenced address 0 at
+`mov r8, [r11]; mov rdi, [r8 + r9*8]` — a null-page read that
+page-faults on paideia-os and clobbers whatever sits at 0 in a
+hosted target. The mirror shape `allowed_ptr != 0 &&
+allowed_count == 0` was memory-safe (the count-check sentinel
+already disabled the gate) but still a caller-intent mistake
+worth flagging.
+
+The hotfix prepends an invariant check on the caller's
+`(allowed_ptr, allowed_count)` pair BEFORE the `SPEC_MAX` gate:
+
+- `(0, 0)` — legal empty-set sentinel; `last_register_error =
+  ERR_OK (0)`; registration proceeds.
+- `(ptr, 0)` — nonsensical mirror; coerce to `(0, 0)`;
+  `last_register_error = ERR_INVALID_ENUM_SPEC (20)`;
+  registration proceeds with gate OFF.
+- `(0, count>0)` — null-deref shape; coerce to `(0, 0)`;
+  `last_register_error = ERR_INVALID_ENUM_SPEC (20)`;
+  registration proceeds with gate OFF (the parser's own
+  `cmp count, 0; je skip_str_enum` short-circuit fires before
+  the walker ever loads from `allowed_ptr`).
+- `(ptr, count>0)` — standard enum shape; `last_register_error
+  = ERR_OK (0)`; registration proceeds with the caller's pair.
+
+`last_register_error` is a new companion `.bss` slot in
+`FlagSpec`, valid immediately after any `register_string_enum`
+call (same lifetime discipline as `last_lookup_sep_required` /
+`last_lookup_allowed_ptr`/`count`). `flag_spec_reset` zeroes it
+so a fixture that observed a nonzero read in a prior case starts
+the next case from a clean baseline; the success path also
+writes 0 so "last call wins" semantics hold without an
+intervening reset.
+
+Behavioural notes:
+
+- The `register_*` family's "silent, never fails hard" invariant
+  is preserved: a caller that never reads `last_register_error`
+  sees safe fallback (a plain `FKIND_STR` flag with the gate
+  disabled) rather than a failed registration. This matches the
+  existing SPEC_MAX-overflow policy (silent drop) and the
+  ENH-018 range-off sentinel (`(0, 0)` treated as "no gate").
+- `ERR_INVALID_ENUM_SPEC (20)` is a registration-time
+  diagnostic only. No `parse_argv*` path writes it, so a
+  consumer's existing `if err != ERR_OK { … }` branch on a
+  `parse_argv*` return never observes it.
+- Cases 35-37 in `tests/parse_typed_values_tests.pdx` are the
+  regression fixtures: `(0, 1)` → diagnostic + safe parse,
+  `(&ecs_allowed, 0)` → diagnostic + safe parse, `(ptr, 3)`
+  after a poisoned slot → success-path zero-write.
+
+Klog tag: `pdxargv.enum-spec`.
+
 ### 18.8 What ENH-019 explicitly does not do
 
 - No `register_string_enum_sep` variant. A tool that wants a

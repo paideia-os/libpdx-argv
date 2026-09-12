@@ -217,6 +217,30 @@ module FlagSpec = structure {
   pub let mut last_lookup_allowed_ptr   : u64 = uninit @align(8)
   pub let mut last_lookup_allowed_count : u64 = uninit @align(8)
 
+  // Added by libpdx-argv.ENH-019 hotfix (Closes #45): companion "out
+  // parameter" slot for the register_* family. Currently written by
+  // `register_string_enum` only (the sole registration path with a
+  // caller-supplied (ptr, count) pair whose incoherent shapes have a
+  // real-memory footprint); every other register_* path is
+  // caller-arg-total-order-safe and never sets this slot. Valid
+  // immediately after any registration call — a caller that wants
+  // defence-in-depth introspection reads it with `cmp
+  // last_register_error, 0` right after the call and refuses to
+  // proceed on nonzero.
+  //
+  // Zeroed by `flag_spec_reset` so a fixture that observed a nonzero
+  // read in a prior case starts the next case from a clean baseline.
+  // A register_string_enum call that succeeds ALSO writes 0 here so
+  // the "last call" semantics stay accurate even without an
+  // intervening reset.
+  //
+  // Written values: `ParsedArgs::ERR_OK` (0) on success,
+  // `ParsedArgs::ERR_INVALID_ENUM_SPEC` (20) on either invariant
+  // violation (see `register_string_enum` for the specific coercion
+  // and safe-fallback behaviour). The slot never carries any other
+  // value.
+  pub let mut last_register_error : u64 = uninit @align(8)
+
   // Added by libpdx-argv.ENH-004: opt-in strict mode. 0 (default, and
   // the value FlagSpec::reset() restores) = permissive — an
   // unregistered flag name is treated as boolean, unchanged from
@@ -267,7 +291,7 @@ module FlagSpec = structure {
   pub let flag_spec_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.M2-001 + ENH-004 + ENH-020 + ENH-030 flag_spec_reset — zero spec_count so the next flag_spec_register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. ENH-020 (Closes #30) also zeroes subcommand_table_ptr and subcommand_table_count so a fixture that installed a table in a previous case never leaks it into the next parse — the caller re-installs each parse via register_subcommands, matching the existing per-parse re-registration discipline for FlagSpec itself. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant. ENH-030 renames the exported symbol from `reset` to `flag_spec_reset` to end the multi-module link collision — body otherwise byte-identical.",
+      justification: "libpdx-argv.M2-001 + ENH-004 + ENH-020 + ENH-030 + ENH-019 hotfix (Closes #45) flag_spec_reset — zero spec_count so the next flag_spec_register writes at slot 0, and zero strict_mode so every fixture (test or real consumer) starts permissive by default unless it explicitly opts into strict mode again after this call. ENH-020 (Closes #30) also zeroes subcommand_table_ptr and subcommand_table_count so a fixture that installed a table in a previous case never leaks it into the next parse — the caller re-installs each parse via register_subcommands, matching the existing per-parse re-registration discipline for FlagSpec itself. ENH-019 hotfix (Closes #45) also zeroes last_register_error so a fixture that observed an ERR_INVALID_ENUM_SPEC in a prior case starts the next case from a clean baseline; a subsequent successful register_string_enum call would rewrite it to 0 anyway, but the reset keeps the 'zero on entry' invariant every other .bss slot in this module already satisfies. The spec_names/kinds/ids arrays are consumed by index up to spec_count, so stale trailing entries are unreachable. Leaf; r11 scratch; xor rax,rax produces the zero constant. ENH-030 renames the exported symbol from `reset` to `flag_spec_reset` to end the multi-module link collision — body otherwise byte-identical.",
       block: {
         xor rax, rax;
         lea r11, [rip + spec_count];
@@ -277,6 +301,8 @@ module FlagSpec = structure {
         lea r11, [rip + subcommand_table_ptr];
         mov [r11], rax;
         lea r11, [rip + subcommand_table_count];
+        mov [r11], rax;
+        lea r11, [rip + last_register_error];
         mov [r11], rax;
         ret;
       }
@@ -804,8 +830,45 @@ module FlagSpec = structure {
   pub let register_string_enum : (u64, u64, u64, u64) -> () !{mem} @{} =
     fn (name_ptr: u64) (id: u64) (allowed_ptr: u64) (allowed_count: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.ENH-019 FlagSpec::register_string_enum (Closes #29) — appends (name, FKIND_STR, id) at spec_count with the caller's (allowed_ptr, allowed_count) pair published into spec_allowed_ptr[slot] / spec_allowed_count[slot]. Kind is fixed to FKIND_STR (1) rather than taken from the caller: register_string_enum is the STR-with-allowed-set superset of flag_spec_register, and a caller registering something non-STR should call the plain path (which now also clears the allowed slots to 0/0 via the ENH-019 defensive-zero block so a slot recycled after this call never inherits a stale allowed set). spec_sep_required[slot] is zeroed here (lookahead allowed) to match flag_spec_register's default arity posture — a bounded STR flag with a mandatory separator is a compose-your-own until a register_string_enum_sep() variant lands. spec_min / spec_max / spec_help are also defensively zeroed with the same r8=0 staging pattern flag_spec_register uses so a slot recycled from a register_int() or register_with_help() call never inherits stale bounds/help. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal for the four defensive stores; the FKIND_STR literal (1) is staged into r8 for its own store then r8 is reloaded to 0 for the defensive block. Silently drops past SPEC_MAX (single-return API, mirrors flag_spec_register). MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). The caller-visible sentinel is `allowed_count == 0 → gate OFF`; a caller wanting an explicitly-empty allowed set should not call register_string_enum at all (indistinguishable by design). New klog tag: pdxargv.string-enum.",
+      justification: "libpdx-argv.ENH-019 FlagSpec::register_string_enum (Closes #29) + ENH-019 hotfix (Closes #45) — appends (name, FKIND_STR, id) at spec_count with the caller's (allowed_ptr, allowed_count) pair published into spec_allowed_ptr[slot] / spec_allowed_count[slot]. Kind is fixed to FKIND_STR (1) rather than taken from the caller: register_string_enum is the STR-with-allowed-set superset of flag_spec_register, and a caller registering something non-STR should call the plain path (which now also clears the allowed slots to 0/0 via the ENH-019 defensive-zero block so a slot recycled after this call never inherits a stale allowed set). spec_sep_required[slot] is zeroed here (lookahead allowed) to match flag_spec_register's default arity posture — a bounded STR flag with a mandatory separator is a compose-your-own until a register_string_enum_sep() variant lands. spec_min / spec_max / spec_help are also defensively zeroed with the same r8=0 staging pattern flag_spec_register uses so a slot recycled from a register_int() or register_with_help() call never inherits stale bounds/help. Leaf; r11 for lea; rax as spec_count/scratch; r8 stages the zero literal for the four defensive stores; the FKIND_STR literal (1) is staged into r8 for its own store then r8 is reloaded to 0 for the defensive block. Silently drops past SPEC_MAX (single-return API, mirrors flag_spec_register). MAX-check uses cmp rax, 32 (well ≤ 0x7FFFFFFF). The caller-visible sentinel is `allowed_count == 0 → gate OFF`; a caller wanting an explicitly-empty allowed set should not call register_string_enum at all (indistinguishable by design). ENH-019 hotfix (Closes #45) prepends an invariant check on the caller's (allowed_ptr, allowed_count) pair BEFORE the SPEC_MAX gate: the two incoherent shapes (allowed_ptr == 0 && allowed_count > 0 — the null-deref shape the parser's post-store enum walk would page-fault on — and allowed_ptr != 0 && allowed_count == 0 — the nonsensical mirror where the gate is already OFF by the count-check sentinel so the pointer is wasted) are both coerced to (0, 0) via xor rdx,rdx / xor rcx,rcx before proceeding to the store, and ERR_INVALID_ENUM_SPEC (20) is published into last_register_error so a defence-in-depth caller can `cmp last_register_error, 0` after the call and refuse to proceed. The success path writes 0 to last_register_error so 'last call' semantics are accurate without an intervening reset. This preserves the register_* family's 'silent, never fails hard' invariant while eliminating the null-deref regardless of caller vigilance — the walker sees the coerced count==0 and short-circuits at its own `cmp count, 0` gate. New klog tag: pdxargv.string-enum / pdxargv.enum-spec (hotfix).",
       block: {
+        // ENH-019 hotfix (#45): invariant check on (allowed_ptr, allowed_count).
+        // Both invalid combinations coerce to (0, 0) and publish
+        // ERR_INVALID_ENUM_SPEC (20) into last_register_error; the
+        // (0, 0) coercion is the parser's own "gate OFF" sentinel
+        // so the post-store enum walk short-circuits and never
+        // dereferences a null allowed_ptr. Legal shapes fall
+        // through to rse_bounds_ok with last_register_error = 0.
+        cmp rdx, 0;
+        jne rse_check_mirror;
+        // allowed_ptr == 0
+        cmp rcx, 0;
+        je  rse_bounds_ok;                 // (0, 0) — plain STR flag, gate OFF
+        jmp rse_invalid;
+
+      rse_check_mirror:
+        // allowed_ptr != 0
+        cmp rcx, 0;
+        jne rse_bounds_ok;                 // both nonzero — standard enum shape
+        // fallthrough: (ptr!=0, count==0) is the nonsensical mirror.
+
+      rse_invalid:
+        mov r8, 20;                        // ERR_INVALID_ENUM_SPEC
+        lea r11, [rip + last_register_error];
+        mov [r11], r8;
+        xor rdx, rdx;                      // coerce allowed_ptr  = 0
+        xor rcx, rcx;                      // coerce allowed_count = 0
+        jmp rse_store;
+
+      rse_bounds_ok:
+        // Legal shape: publish ERR_OK (0) so a caller's post-call
+        // `cmp last_register_error, 0` observes clean state without
+        // needing an intervening flag_spec_reset.
+        xor r8, r8;
+        lea r11, [rip + last_register_error];
+        mov [r11], r8;
+
+      rse_store:
         lea r11, [rip + spec_count];
         mov rax, [r11];
         cmp rax, 32;                       // SPEC_MAX

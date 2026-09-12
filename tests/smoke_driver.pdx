@@ -154,6 +154,11 @@ module SmokeDriver = structure {
         call ParseTypedValuesTests::run_case32;
         call ParseTypedValuesTests::run_case33;
         call ParseTypedValuesTests::run_case34;
+        // libpdx-argv.ENH-019 hotfix (Closes #45): register_string_enum
+        // null-page-read defence (invariant check + coerce + diagnostic).
+        call ParseTypedValuesTests::run_case35;
+        call ParseTypedValuesTests::run_case36;
+        call ParseTypedValuesTests::run_case37;
 
         // --- ParseTypedArgsTests (module id 3) ----------------------
         call ParseTypedArgsTests::run_case1;

@@ -263,6 +263,43 @@ module ParsedArgs = structure {
   // New klog tag: `pdxargv.subcommand`.
   pub let ERR_UNKNOWN_SUBCOMMAND        : u64 = 19
 
+  // Added by libpdx-argv.ENH-019 hotfix (Closes #45): the caller passed
+  // `FlagSpec::register_string_enum` an incoherent (allowed_ptr,
+  // allowed_count) pair — either `(allowed_ptr == 0 && allowed_count
+  // > 0)` (the security-relevant shape: without the hotfix the
+  // downstream parser's post-store enum walk would dereference address
+  // 0 at `mov r8, [r11]; mov rdi, [r8 + r9*8]`) or `(allowed_ptr != 0
+  // && allowed_count == 0)` (the nonsensical mirror: the gate is
+  // already OFF by the count-check sentinel so the pointer is a
+  // wasted argument, but the combination is a caller mistake worth
+  // flagging).
+  //
+  // Not stored into `ParsedArgs::error_code`: this is a
+  // REGISTRATION-time diagnostic, not a parse-time one. It is
+  // published into `FlagSpec::last_register_error` (a companion .bss
+  // slot with the same "valid immediately after the call" lifetime
+  // discipline as `FlagSpec::last_lookup_sep_required`) so a caller
+  // that wants defence-in-depth introspection can `cmp
+  // last_register_error, 0` after every `register_string_enum` call
+  // and refuse to proceed on a nonzero read. A caller that never
+  // inspects it still gets the SAFE fallback: `register_string_enum`
+  // silently coerces the offending (allowed_ptr, allowed_count) pair
+  // to (0, 0) before the store, so the gate is disabled — the flag
+  // is still registered as a plain FKIND_STR and the parser's enum
+  // walk short-circuits at `cmp count, 0`. This eliminates the
+  // null-deref regardless of caller vigilance while preserving the
+  // "registration is cheap and never fails hard" invariant every
+  // other register_* function upholds.
+  //
+  // Reserved but not currently written by any parse-time path — every
+  // ERR_* below 20 remains a parse-time code so a consumer's
+  // existing `if err != ERR_OK { … }` branch handles ERR_OK / parse
+  // errors uniformly and never observes ERR_INVALID_ENUM_SPEC from a
+  // `parse_argv*` return.
+  //
+  // New klog tag: `pdxargv.enum-spec`.
+  pub let ERR_INVALID_ENUM_SPEC         : u64 = 20
+
   // --- ENH-017 collect-all-errors mode (Closes #27) -------------------
   // `Parser::parse_argv_ex(argv, argc, parse_flags)` opts into
   // multi-error accumulation via bit 0 of `parse_flags`. When the bit

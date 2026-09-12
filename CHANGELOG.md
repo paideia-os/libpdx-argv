@@ -6,6 +6,65 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-019 hotfix — `register_string_enum` null-page-read defence (Closes #45)
+
+Pre-hotfix `FlagSpec::register_string_enum` stored the caller's
+`(allowed_ptr, allowed_count)` pair verbatim. A caller passing
+`allowed_ptr == 0` with `allowed_count > 0` (a contract violation)
+passed the SPEC_MAX gate and the subsequent `Parser::parse_argv_ex`
+enum walk dereferenced address 0 at
+`mov r8, [r11]; mov rdi, [r8 + r9*8]` — a null-page read that
+page-faults on paideia-os and clobbers whatever sits at 0 in a hosted
+target. The mirror shape `allowed_ptr != 0 && allowed_count == 0`
+was safe (the count-check sentinel already disabled the gate) but
+still a caller-intent mistake worth flagging.
+
+Fix (defence in depth, no signature change):
+
+- `src/flag_spec.pdx`: `register_string_enum` now prepends an
+  invariant check on `(allowed_ptr, allowed_count)`. Both
+  incoherent shapes coerce to `(0, 0)` via `xor rdx,rdx / xor
+  rcx,rcx` before the store — the parser's own `cmp count, 0; je
+  skip_str_enum` gate then short-circuits and never dereferences
+  the null pointer. `ERR_INVALID_ENUM_SPEC` (20) is published into
+  a new companion `.bss` slot `last_register_error` so a
+  defence-in-depth caller can `cmp last_register_error, 0` after
+  every `register_string_enum` and refuse to proceed on nonzero.
+  The success path also writes 0 to the slot so "last call
+  wins" semantics stay accurate without an intervening reset.
+- `src/flag_spec.pdx`: new `pub let mut last_register_error : u64`
+  companion slot; `flag_spec_reset` extended to zero it (same
+  discipline as `strict_mode` / `subcommand_table_ptr` /
+  `subcommand_table_count`).
+- `src/parsed_args.pdx`: new `ERR_INVALID_ENUM_SPEC : u64 = 20`
+  constant. Not written by any `parse_argv*` path — it is a
+  registration-time diagnostic only, published into
+  `FlagSpec::last_register_error`, so a consumer's existing
+  `if err != ERR_OK { … }` branch on a `parse_argv*` return
+  never observes it.
+- `tests/parse_typed_values_tests.pdx`: new `run_case35`
+  (security-relevant shape `(ptr=0, count=1)` → `last_register_error
+  == 20`, subsequent parse safe with `ERR_OK`), `run_case36`
+  (mirror `(ptr!=0, count=0)` → same diagnostic + safe parse),
+  and `run_case37` (legal shape → `last_register_error == 0`,
+  proving the success path clears the slot). All three follow the
+  case-30 pattern (`full_reset` first, `record_pass`/`record_fail`
+  under standard tags 0x200000023 / 0x200000024 / 0x200000025).
+- `tests/smoke_driver.pdx`: dispatch the three new cases after
+  `run_case34`.
+
+Impact: caller-contract-violation only (attacker-controlled data
+cannot reach `register_string_enum`'s arguments via wire input on
+any current consumer), so the pre-hotfix severity was low; the
+hotfix eliminates the null-deref regardless of caller vigilance and
+gives defence-in-depth callers a discoverable diagnostic. The
+`register_*` family's "silent, never fails hard" invariant is
+preserved: the coercion still registers the flag as a plain
+`FKIND_STR` (with the gate disabled), so a caller that ignores
+`last_register_error` sees safe fallback rather than a failed
+registration. Discovered by W45 retrospective debugger sweep,
+2026-09-11.
+
 ### ENH-007 — Runnable smoke: SysExit wiring + `tools/run-tests.sh` (Closes #14)
 
 Pre-ENH-007 the "M4-001 50/50 green" claim recorded throughout

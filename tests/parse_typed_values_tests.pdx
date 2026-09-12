@@ -1157,4 +1157,195 @@ module ParseTypedValuesTests = structure {
         pop rbx; ret;
       }
     }
+
+  // ============================================================
+  // libpdx-argv.ENH-019 hotfix (Closes #45)
+  // Cases 35-36: null-page-read defence for register_string_enum.
+  //
+  // The pre-hotfix register_string_enum stored the caller's
+  // (allowed_ptr, allowed_count) pair verbatim; a subsequent
+  // Parser::parse_argv_ex flag-store whose kind == FKIND_STR would
+  // then walk `mov r8, [r11]; mov rdi, [r8 + r9*8]` at address 0
+  // when allowed_ptr == 0 && allowed_count > 0 — a null-page read
+  // that page-faults on paideia-os and clobbers whatever sits at 0
+  // in a hosted x86_64-Linux target (the smoke driver's own
+  // environment). Post-hotfix the invariant check at the top of
+  // register_string_enum coerces both incoherent shapes to (0, 0)
+  // (which the parser's own `cmp count, 0; je skip_str_enum` gate
+  // reads as "gate OFF") AND publishes
+  // ParsedArgs::ERR_INVALID_ENUM_SPEC (20) into
+  // FlagSpec::last_register_error so a defence-in-depth caller can
+  // inspect the result.
+  //
+  // These two cases witness both halves of the fix: (a) the
+  // security-relevant shape (ptr=0, count>0) → coerce + diagnostic
+  // + safe parse (case 35), and (b) the nonsensical mirror
+  // (ptr!=0, count=0) → coerce + diagnostic + safe parse (case
+  // 36). Both cases assemble the same `--color mauve` argv that
+  // case 32 uses (mauve is out of the allowed set) and assert
+  // ERR_OK because the coerced count=0 disables the gate — an
+  // unregistered gate must never trip its own error.
+  // ============================================================
+
+  // ============================================================
+  // case 35  ptr=0, count=1 → null-deref shape (security case)
+  //   register_string_enum("color", 100, 0, 1)
+  //   Post-register: last_register_error == ERR_INVALID_ENUM_SPEC (20)
+  //   Parse `--color mauve`: ERR_OK (0), error_code == 0, flag_count == 1
+  //   No null-deref during parse (the coerced count=0 short-circuits
+  //   the parser's enum walk before it dereferences allowed_ptr).
+  // ============================================================
+  pub let run_case35 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 hotfix (Closes #45) case35 — primary witness of the null-deref shape. Registers `color` with allowed_ptr=0, allowed_count=1 (the exact combination the pre-hotfix parser walk would have dereferenced at address 0). Post-register assertion: last_register_error == ERR_INVALID_ENUM_SPEC (20) — the hotfix's invariant check tripped and published the diagnostic. Then parses `--color mauve` (mauve is out of any allowed set); asserts rax == ERR_OK (0) and error_code == 0 because the coerced (0, 0) pair disables the gate: the parser's `cmp count, 0; je skip_str_enum` short-circuit fires before the walker ever loads from allowed_ptr. The flag itself IS still registered (flag_count == 1), so the coercion is safe fallback rather than silent drop. This is the fingerprint the issue prescribes: no null-page read, and a caller who checks last_register_error sees the diagnostic. Follows the case-30 pattern (full_reset first for known-zero baseline).",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // register_string_enum(name=ecs_bare_color, id=100, allowed_ptr=0, allowed_count=1)
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        xor rdx, rdx;                     // allowed_ptr = null (the bad shape)
+        mov rcx, 1;                       // allowed_count = 1 (the bad shape)
+        call register_string_enum;
+
+        // Assert last_register_error == ERR_INVALID_ENUM_SPEC (20).
+        lea r11, [rip + last_register_error];
+        mov rax, [r11];
+        cmp rax, 20; jne case35_fail;
+
+        // Assemble argv: ["--color", "mauve"] (out-of-set value; safe because
+        // the coerced count=0 disables the gate).
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color]; mov [rbx + 0], rax;
+        lea rax, [rip + ecs_val_mauve];  mov [rbx + 8], rax;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0; jne case35_fail;      // no null-deref; gate OFF
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case35_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case35_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case35_fail:
+        mov rdi, 0x200000023;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 36  ptr!=0, count=0 → nonsensical-mirror shape
+  //   register_string_enum("color", 100, &ecs_allowed, 0)
+  //   Post-register: last_register_error == ERR_INVALID_ENUM_SPEC (20)
+  //   Parse `--color mauve`: ERR_OK (0), error_code == 0, flag_count == 1
+  //   Gate was already OFF by the count=0 sentinel; the pointer is
+  //   wasted but harmless. Fix still fires the diagnostic so the
+  //   caller mistake is discoverable.
+  // ============================================================
+  pub let run_case36 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 hotfix (Closes #45) case36 — mirror-invariant witness. Registers `color` with allowed_ptr=&ecs_allowed (nonzero) and allowed_count=0. The count=0 sentinel already disables the gate on the parser side, so this shape was never a memory-safety issue pre-hotfix — it is a caller-intent mistake (why pass a pointer if you never intended to gate?). The hotfix flags it via last_register_error so a defence-in-depth caller catches the mistake at registration time; parse behaviour is unchanged (gate OFF, `--color mauve` accepted). Also witnesses that the coerce path handles both invariant arms symmetrically (jmp rse_invalid falls into the same coerce + diagnostic block from either sub-branch). Follows case-34's shape (out-of-set value against a count=0 registration, ERR_OK expected) with the added last_register_error assertion.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call ecs_install_allowed_3;       // populate ecs_allowed so the ptr is a real address
+
+        // register_string_enum(name=ecs_bare_color, id=100, allowed_ptr=&ecs_allowed, allowed_count=0)
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        lea rdx, [rip + ecs_allowed];     // allowed_ptr = nonzero
+        xor rcx, rcx;                     // allowed_count = 0
+        call register_string_enum;
+
+        // Assert last_register_error == ERR_INVALID_ENUM_SPEC (20).
+        lea r11, [rip + last_register_error];
+        mov rax, [r11];
+        cmp rax, 20; jne case36_fail;
+
+        // Assemble argv: ["--color", "mauve"] (gate is OFF, so mauve is fine).
+        lea rbx, [rip + ecs_argv];
+        lea rax, [rip + ecs_name_color]; mov [rbx + 0], rax;
+        lea rax, [rip + ecs_val_mauve];  mov [rbx + 8], rax;
+
+        lea rdi, [rip + ecs_argv];
+        mov rsi, 2;
+        call parse_argv;
+        cmp rax, 0; jne case36_fail;
+
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 0; jne case36_fail;
+
+        lea r11, [rip + flag_count];
+        mov rax, [r11];
+        cmp rax, 1; jne case36_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case36_fail:
+        mov rdi, 0x200000024;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
+
+  // ============================================================
+  // case 37  legal shape witness — last_register_error is cleared
+  //   register_string_enum("color", 100, &ecs_allowed, 3)
+  //   Post-register: last_register_error == ERR_OK (0) — the success
+  //   path must also touch the slot so a defence-in-depth caller
+  //   never observes stale ERR_INVALID_ENUM_SPEC from a prior call.
+  // ============================================================
+  pub let run_case37 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-019 hotfix (Closes #45) case37 — success-path zero-write witness. Confirms that a legal (ptr!=0, count>0) register_string_enum call writes 0 into last_register_error, not just the invalid path. Without this write a caller who calls register_string_enum twice — first with an invalid pair, then with a valid one — would see stale ERR_INVALID_ENUM_SPEC (20) after the good call and wrongly refuse to proceed. Sequence: full_reset (last_register_error = 0 baseline) → invalid call (seeds slot to 20; also registers a placeholder flag at slot 0 with count=0) → valid call (registers a second flag at slot 1 with the full three-entry allowed set; the success path must write 0 to the slot). Assert last_register_error == 0 after the second call. Pairs with cases 35/36 to lock in that the invariant machinery is 'last call wins', matching the discipline every other companion-.bss-slot in this module (last_lookup_sep_required, last_lookup_allowed_ptr/count) already upholds.",
+      block: {
+        push rbx;
+
+        call full_reset;
+        call ecs_install_allowed_3;
+
+        // Seed: invalid pair → last_register_error = 20 (also registers
+        // a placeholder flag at slot 0 with the coerced count=0 pair).
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 100;
+        xor rdx, rdx;
+        mov rcx, 1;
+        call register_string_enum;
+        // last_register_error is now 20; the next call should clear it.
+
+        // Valid pair → the success path writes 0 into last_register_error.
+        lea rdi, [rip + ecs_bare_color];
+        mov rsi, 101;                     // distinct id so nothing collides
+        lea rdx, [rip + ecs_allowed];
+        mov rcx, 3;
+        call register_string_enum;
+
+        // Assert last_register_error == ERR_OK (0).
+        lea r11, [rip + last_register_error];
+        mov rax, [r11];
+        cmp rax, 0; jne case37_fail;
+
+        call record_pass;
+        pop rbx; ret;
+      case37_fail:
+        mov rdi, 0x200000025;
+        call record_fail;
+        pop rbx; ret;
+      }
+    }
 }

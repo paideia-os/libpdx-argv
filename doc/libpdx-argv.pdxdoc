@@ -556,6 +556,38 @@ whole-buffer header failure.
                                      post-parse inspection sees the
                                      top-level table intact. Klog
                                      tag: pdxargv.subcommand.
+  ERR_INVALID_ENUM_SPEC (20)       REGISTRATION-time diagnostic —
+                                     never written by any parse
+                                     path. `FlagSpec::register_string_enum`
+                                     rejected the caller's
+                                     (allowed_ptr, allowed_count)
+                                     pair as incoherent — either
+                                     (allowed_ptr == 0 &&
+                                     allowed_count > 0), the
+                                     null-deref shape the parser's
+                                     post-store enum walk would
+                                     have page-faulted on, or the
+                                     mirror (allowed_ptr != 0 &&
+                                     allowed_count == 0), a
+                                     nonsensical wasted-pointer
+                                     combination (libpdx-argv.ENH-019
+                                     hotfix, #45). Both shapes
+                                     coerce internally to (0, 0),
+                                     so the flag IS still registered
+                                     as a plain FKIND_STR with the
+                                     gate disabled; a defence-in-
+                                     depth caller reads
+                                     `FlagSpec::last_register_error`
+                                     immediately after the call and
+                                     refuses to proceed on
+                                     nonzero. Never appears in
+                                     ParsedArgs::error_code (parse
+                                     path does not touch it), so a
+                                     consumer's existing
+                                     `if err != ERR_OK { … }`
+                                     branch on a parse_argv* return
+                                     never observes it. Klog tag:
+                                     pdxargv.enum-spec.
 
 `ERR_UNKNOWN_ARG_FORM` (3) fires when an argv slot is neither
 flag-shaped (starts with `-` AND has at least one byte after) NOR a
