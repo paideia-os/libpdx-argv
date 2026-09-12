@@ -43,18 +43,20 @@
 
 module SmokeDriver = structure {
 
-  // libpdx-argv.ENH-032 (Closes #25): in-repo stub for the extern
-  // symbol VersionBackend::emit_default reads at auto-emit time. A
-  // real consumer's per-repo constants module (e.g.
-  // `mkfs.pdxfs/src/version_constants.pdx` with `pub let
-  // PDX_TOOL_VERSION : [u8; N] = "<semver>\0"`) supplies this at
-  // final-link time; the smoke binary links THIS stub instead, so
-  // the ENH-032 tests can exercise the auto-emit end to end
-  // (ParseStdVocabTests::run_version_auto_emit runs parse_argv on
-  // ['--version'] which triggers seven sys_writes into stdout — the
-  // string below is what lands after the tool name and space). The
-  // string is deliberately marked "smoke" so an operator inspecting
-  // the smoke output can tell it apart from a real tool's version.
+  // libpdx-argv.ENH-032 (Closes #25) + ENH-032 hotfix (Closes #42):
+  // in-repo stubs for the two extern symbols VersionBackend::emit_default
+  // reads at auto-emit time. A real consumer's per-tool constants
+  // module (e.g. `cat/src/version_constants.pdx` with
+  //   `pub let PDX_TOOL_NAME    : [u8; 4] = "cat\0"`
+  //   `pub let PDX_TOOL_VERSION : [u8; N] = "<semver>\0"`)
+  // supplies these at final-link time; the smoke binary links THESE
+  // stubs instead, so the ENH-032 tests can exercise the auto-emit
+  // end to end (ParseStdVocabTests::run_version_auto_emit runs
+  // parse_argv on ['--version'] which triggers seven sys_writes into
+  // stdout). The name is deliberately "pdxargv" and the version
+  // marked "libpdx-smoke" so an operator inspecting the smoke output
+  // can tell it apart from a real tool's version.
+  pub let PDX_TOOL_NAME    : [u8; 8]  = "pdxargv\0"
   pub let PDX_TOOL_VERSION : [u8; 19] = "1.2.0-libpdx-smoke\0"
 
   // Entry point. Runs every M4 test case in module order, then exits

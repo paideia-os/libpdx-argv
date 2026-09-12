@@ -1,4 +1,7 @@
 // src/version_backend.pdx — libpdx-argv.ENH-032 (Closes #25)
+//                           + ENH-032 hotfix (Closes #42): per-tool
+//                             PDX_TOOL_NAME extern replaces the
+//                             baked-in "doc"/"DOC" literal.
 // VersionBackend: library-owned `--version` auto-emitter.
 //
 // Motivation
@@ -24,11 +27,11 @@
 // `--version` AND `override_enabled == 0`:
 //   1. `emit_default` writes to fd 1 (stdout), in seven sys_write
 //      calls, the byte sequence:
-//        <DOC_TOOL_NAME bytes without NUL>
+//        <PDX_TOOL_NAME bytes without NUL>
 //        ' '
 //        <PDX_TOOL_VERSION bytes without NUL>
 //        '\n'
-//        <DOC_TOOL_NAME_UPPER bytes without NUL>
+//        <PDX_TOOL_NAME bytes, ASCII-uppercased>
 //        ' VERSION OK\n'
 //   2. `ParsedArgs::error_code` is set to `ERR_VERSION_EMITTED` (13).
 //   3. `parse_argv` returns `ERR_VERSION_EMITTED` in rax, WITHOUT
@@ -49,36 +52,48 @@
 //
 // Extern symbol convention
 // ------------------------
-// `PDX_TOOL_VERSION` is a NUL-terminated ASCII string in `.rodata`
-// defined per-tool in that tool's own constants module. This module
-// only REFERENCES it via `lea rsi, [rip + PDX_TOOL_VERSION]`; the
-// resulting object carries an UND relocation resolved at final-link
-// time. Consumers that link libpdx-argv without defining
-// `PDX_TOOL_VERSION` fail at ld with an undefined-symbol error naming
-// the missing symbol — a build-time catch, not a run-time surprise.
-// The mirroring symbol on the tool side is:
+// Two per-tool externs are referenced by this module and MUST be
+// supplied by every binary that links libpdx-argv:
 //
-//   // e.g. mkfs.pdxfs/src/version_constants.pdx
+//   PDX_TOOL_NAME    : [u8; N]  = "<tool>\0"    (e.g. "cat\0")
+//   PDX_TOOL_VERSION : [u8; M]  = "<semver>\0"  (e.g. "1.4.2\0")
+//
+// Both are NUL-terminated ASCII strings in `.rodata` defined per-tool
+// in that tool's own constants module. This module only REFERENCES
+// them via `lea rsi, [rip + PDX_TOOL_NAME]` / `lea rsi, [rip +
+// PDX_TOOL_VERSION]`; the resulting object carries UND relocations
+// resolved at final-link time. Consumers that link libpdx-argv
+// without defining either symbol fail at ld with an undefined-symbol
+// error naming the missing symbol — a build-time catch, not a
+// run-time surprise. The mirroring symbols on the tool side are:
+//
+//   // e.g. cat/src/version_constants.pdx
 //   module VersionConstants = structure {
-//     pub let PDX_TOOL_VERSION : [u8; N] = "<semver>\0"
+//     pub let PDX_TOOL_NAME    : [u8; 4]  = "cat\0"
+//     pub let PDX_TOOL_VERSION : [u8; 7]  = "1.4.2\0"
 //   }
 //
 // No weak-symbol default is provided by libpdx-argv: the paideia-as
 // 0.36 encoder does not currently expose the STB_WEAK binding, and
-// even if it did a wrong-version default ("0.0.0-unset\0" say) would
-// silently pass under `--version` — worse than a link-time failure.
+// even if it did a wrong-name default ("doc\0" was the pre-hotfix
+// value) would silently pass under `--version` — worse than a
+// link-time failure. This exact regression is what #42 tracks: the
+// pre-hotfix module referenced `HelpBackend::DOC_TOOL_NAME` (a
+// module-local literal "doc\0") for the emit's first line and a
+// mirrored `DOC_TOOL_NAME_UPPER = "DOC\0"` for the sixth, so every
+// tool that consumed libpdx-argv 1.1.x auto-emit printed
+// `doc <ver>\nDOC VERSION OK\n` regardless of the real binary name.
+// The hotfix removes both baked-in literals and rewrites `emit_default`
+// to read `PDX_TOOL_NAME` (lowercase source) and derive the uppercase
+// mirror at runtime into `tool_name_upper_buf` (a module-local
+// `.bss` scratch capped at `TOOL_NAME_UPPER_MAX` = 32 bytes; a name
+// longer than 32 bytes is silently truncated in both write slots —
+// no P0 tool name comes close to that ceiling).
 //
-// The tool-name half is currently sourced from
-// `HelpBackend::DOC_TOOL_NAME` per the issue contract. That symbol is
-// today the fixed literal `"doc\0"` — every tool's auto-emit therefore
-// says `doc <ver>\nDOC VERSION OK\n`. Making it per-tool is a
-// follow-on ENH (probably by promoting DOC_TOOL_NAME to a weak/extern
-// symbol paired with PDX_TOOL_VERSION); the paired uppercase literal
-// `DOC_TOOL_NAME_UPPER` in this module tracks the lowercase mirror.
-// If DOC_TOOL_NAME ever varies at build time, this module's coupled
-// pair must vary with it or the emit's second line will diverge from
-// the first — a fingerprint break the version-emit case in
-// `tests/parse_std_vocab.pdx` catches.
+// `HelpBackend::DOC_TOOL_NAME` retains its role as the argv[0] slot
+// for the `doc` subprocess spawn (see `HelpBackend::fill_doc_argv`);
+// that role is unrelated to `--version` emission and is preserved
+// unchanged by this hotfix.
 //
 // Override mechanism
 // ------------------
@@ -99,17 +114,20 @@
 //   - Module VersionBackend (PascalCase basename matching file).
 //   - `version_strlen`, `pdxargv_version_reset`, `set_override` are
 //     leaf; only caller-save regs.
-//   - `emit_default` is non-leaf: it calls `version_strlen` for the
-//     dynamic PDX_TOOL_VERSION length. 4-push (rbx/r12/r13/r14) +
-//     sub rsp, 8 prologue → 40 + 8 = 48 bytes on stack past the
-//     return address, rsp%16 = 0 at every nested call. `syscall`
-//     itself has no alignment requirement (only CALL does), so the
-//     six interleaved sys_writes need no additional bookkeeping.
+//   - `emit_default` is non-leaf: it calls `version_strlen` twice
+//     (once for PDX_TOOL_NAME, once for PDX_TOOL_VERSION). 4-push
+//     (rbx/r12/r13/r14) + sub rsp, 8 prologue → 40 + 8 = 48 bytes on
+//     stack past the return address, rsp%16 = 0 at every nested
+//     call. `syscall` itself has no alignment requirement (only
+//     CALL does), so the six interleaved sys_writes need no
+//     additional bookkeeping.
 //   - No test mnemonic anywhere; every zero-check via cmp reg, 0.
 //   - Every cmp reg, imm is well ≤ 0x7FFFFFFF (max: 0x7A for the
-//     ASCII 'z' bound in the uppercase gate; 32 for register push
-//     accounting is in a comment only).
+//     ASCII 'z' bound in the uppercase gate; 32 = TOOL_NAME_UPPER_MAX
+//     for the copy cap).
 //   - Byte loads use xor rax,rax; mov_b rax,[ptr] per #1248.
+//   - Byte stores use `mov_b [ptr], rax` (same idiom as
+//     `SchemaEmit::emit_parse_error`'s tail-pad byte writes).
 //   - No `and reg, imm64` on r8-r15; no 2-op `imul r, imm`; no
 //     `cmp reg, [mem]`; no `[reg + N*8]` for uncommon scales.
 //   - Reserved-label discipline: every internal label is prefixed
@@ -134,17 +152,22 @@ module VersionBackend = structure {
   // bytes; the NUL is a literal-terminator only.
   pub let LIT_VERSION_OK : [u8; 13] = " VERSION OK\n\0"
 
-  // Uppercase mirror of HelpBackend::DOC_TOOL_NAME ("doc\0" → "DOC\0").
-  // Coupled with the lowercase symbol at library-ship time (see the
-  // module preamble's "Extern symbol convention"). If either symbol
-  // ever becomes per-tool the pair must vary together.
-  pub let DOC_TOOL_NAME_UPPER     : [u8; 4] = "DOC\0"
-  pub let DOC_TOOL_NAME_UPPER_LEN : u64     = 3
+  // Maximum bytes of PDX_TOOL_NAME the uppercase mirror can hold.
+  // A name longer than this is silently truncated in BOTH the
+  // lowercase (segment 2) and uppercase (segment 6) sys_writes so
+  // the two lines stay in lock-step. 32 bytes comfortably covers
+  // every P0 tool name shipped or planned ("mount.pdxfs" is 11 bytes;
+  // the widest planned "umount.pdxfs" is 12); a caller that needs
+  // more can call `set_override(1)` and render its own text.
+  pub let TOOL_NAME_UPPER_MAX : u64 = 32
 
-  // Length of HelpBackend::DOC_TOOL_NAME's payload (bytes before the
-  // NUL). Kept alongside its uppercase mirror to save a strlen probe
-  // on every emit_default call.
-  pub let DOC_TOOL_NAME_LEN       : u64     = 3
+  // `.bss` scratch for the runtime-computed uppercase mirror of
+  // PDX_TOOL_NAME. `emit_default` populates the first `name_len`
+  // bytes on every call (no persistence between calls — safe for a
+  // consumer that later `set_override(0)` toggles). Aligned to 8
+  // for the mov_b store idiom, though byte stores themselves have
+  // no alignment requirement.
+  pub let mut tool_name_upper_buf : [u8; 32] = uninit @align(8)
 
   // ============================================================
   // Singleton .bss state.
@@ -261,16 +284,20 @@ module VersionBackend = structure {
   // this call without additional bookkeeping.
   //
   // Register plan inside the frame:
-  //   r14 = DOC_TOOL_NAME_LEN (hoisted once; identical bytes-count
-  //         for both the lowercase write in step 2 and the
-  //         uppercase write in step 6 because DOC_TOOL_NAME_UPPER
-  //         is coupled at ship time — see module preamble).
+  //   r13 = strlen(PDX_TOOL_NAME) capped to TOOL_NAME_UPPER_MAX.
+  //         Shared byte-count for the lowercase write in segment 2
+  //         and the uppercase write in segment 6 — both segments
+  //         must agree or the emitted `<tool>` / `<TOOL>` pair
+  //         diverges.
   //   r12 = strlen(PDX_TOOL_VERSION), computed once via
-  //         version_strlen and reused for step 4's sys_write
+  //         version_strlen and reused for segment 4's sys_write
   //         length.
-  //   rbx, r13 = unused; pushed only for alignment parity so future
-  //              additions (a build-hash line, say) can spill without
-  //              re-padding the frame.
+  //   r14 = TOOL_NAME_UPPER_MAX constant (32), hoisted once so both
+  //         the cap-clamp and the copy-loop use the same immediate
+  //         and the file has a single point of change.
+  //   rbx = unused; pushed only for alignment parity so a future
+  //         addition (a build-hash line, say) can spill without
+  //         re-padding the frame.
   //
   // Caps.decl impact: this module performs sys_write on fd 1.
   // libpdx-argv 1.1.0 caps.decl said "performs NO syscalls of its
@@ -286,7 +313,7 @@ module VersionBackend = structure {
   pub let emit_default : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-argv.ENH-032 VersionBackend::emit_default — seven sys_writes to fd 1 realising the frozen fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n`. Non-leaf: one call to VersionBackend::version_strlen resolves PDX_TOOL_VERSION's length. 4-push prologue (rbx/r12/r13/r14) plus sub rsp, 8 aligns rsp%16 to 0 for the nested call; rbx/r13 are pushed for alignment parity rather than use, so a future extension (build-hash line, signing-key fingerprint) can spill into them without re-padding the frame. r14 hoists DOC_TOOL_NAME_LEN once because the lowercase write in segment 2 and the uppercase write in segment 6 share the same byte count by ship-time coupling (module preamble). r12 preserves the PDX_TOOL_VERSION length across the syscall in segment 4. syscall itself has no rsp-alignment requirement (only CALL does), so the six interleaved sys_writes need no additional bookkeeping between the strlen call and epilogue. Byte loads inside version_strlen use xor+mov_b per #1248. No test mnemonic; every zero-check is cmp reg,0. No `and reg,imm64` on r8-r15; no 2-op `imul r,imm`; no `cmp reg,[mem]`; no `[reg + N*8]` non-unit scale. Reserved-label discipline: labels prefixed pdxv_emit_ where any exist (no internal branches in this function's body — every fall-through is straight-line syscall issue).",
+      justification: "libpdx-argv.ENH-032 hotfix (Closes #42) VersionBackend::emit_default — seven sys_writes to fd 1 realising the frozen fingerprint `<tool> <ver>\\n<TOOL> VERSION OK\\n`, sourcing the tool name from the per-tool PDX_TOOL_NAME extern instead of the pre-hotfix baked-in HelpBackend::DOC_TOOL_NAME literal. Non-leaf: two calls to VersionBackend::version_strlen resolve PDX_TOOL_NAME's and PDX_TOOL_VERSION's lengths in that order. 4-push prologue (rbx/r12/r13/r14) plus sub rsp, 8 aligns rsp%16 to 0 for both nested calls; rbx is pushed for alignment parity rather than use, so a future extension (build-hash line, signing-key fingerprint) can spill into it without re-padding the frame. r13 holds strlen(PDX_TOOL_NAME) clamped to TOOL_NAME_UPPER_MAX=32; it is the shared byte-count for segment 2 (lowercase) and segment 6 (uppercase) and must be identical across both or the pair of lines diverges. r12 preserves strlen(PDX_TOOL_VERSION) across the syscall in segment 4. r14 hoists the TOOL_NAME_UPPER_MAX constant (32) once for the clamp/copy loop bound. syscall itself has no rsp-alignment requirement (only CALL does), so the six interleaved sys_writes need no additional bookkeeping between the strlen calls and the epilogue. The runtime uppercase mirror is built by a straight-line byte loop over PDX_TOOL_NAME into `tool_name_upper_buf`: for each byte, if 0x61 <= b <= 0x7a subtract 0x20, else pass through; the loop is bounded by min(name_len, TOOL_NAME_UPPER_MAX) so a pathological caller supplying a 33+-byte name silently truncates rather than overrunning the .bss buffer. Byte loads use xor+mov_b per #1248; byte stores use `mov_b [ptr], rax` (schema_emit precedent). No test mnemonic; every zero-check is cmp reg,0. No `and reg,imm64` on r8-r15; no 2-op `imul r,imm`; no `cmp reg,[mem]`; no `[reg + N*8]` non-unit scale. `sub rax, 0x20` is a 3-byte imm8-encoded arithmetic — well inside the R49 subset. Reserved-label discipline: internal labels prefixed pdxv_emit_ (`pdxv_emit_upper_loop` etc. — the bare word `loop` never appears).",
       block: {
         // ---- prologue (4 pushes + 8-byte pad → rsp%16 = 0) --------------
         push rbx;
@@ -295,22 +322,63 @@ module VersionBackend = structure {
         push r14;
         sub rsp, 8;
 
-        // Hoist DOC_TOOL_NAME_LEN into r14 (shared by segments 2 and 6).
-        lea r11, [rip + DOC_TOOL_NAME_LEN];
+        // Hoist TOOL_NAME_UPPER_MAX into r14 (used by the clamp and
+        // by the copy loop bound; a single point of change if the
+        // ceiling ever grows).
+        lea r11, [rip + TOOL_NAME_UPPER_MAX];
         mov r14, [r11];
 
-        // -- Segment 1: compute strlen(PDX_TOOL_VERSION) into r12 --------
-        // PDX_TOOL_VERSION is an UND extern in this object; the linker
-        // binds it to the per-repo constants module at final link time.
+        // -- Segment 1a: compute strlen(PDX_TOOL_NAME) into r13 ----------
+        // PDX_TOOL_NAME is an UND extern in this object; the linker
+        // binds it to the per-tool constants module at final link time
+        // (see the "Extern symbol convention" block in the preamble).
+        lea rdi, [rip + PDX_TOOL_NAME];
+        call version_strlen;
+        mov r13, rax;                       // r13 = tool-name length (unclamped)
+
+        // Clamp r13 to TOOL_NAME_UPPER_MAX so both sys_write byte counts
+        // and the uppercase copy loop share the same bound.
+        cmp r13, r14;
+        jbe pdxv_emit_name_len_ok;
+        mov r13, r14;
+      pdxv_emit_name_len_ok:
+
+        // -- Segment 1b: compute strlen(PDX_TOOL_VERSION) into r12 -------
         lea rdi, [rip + PDX_TOOL_VERSION];
         call version_strlen;
         mov r12, rax;                       // r12 = version-string length
 
-        // -- Segment 2: sys_write(1, DOC_TOOL_NAME, DOC_TOOL_NAME_LEN) ---
+        // -- Segment 1c: build uppercase mirror of PDX_TOOL_NAME into
+        //                tool_name_upper_buf (r13 bytes).
+        //   rsi = src cursor, r11 = dst cursor, rcx = remaining byte count.
+        //   All three are caller-save; nothing after the loop CALLs, so
+        //   no need to preserve them across the syscalls that follow.
+        lea rsi, [rip + PDX_TOOL_NAME];
+        lea r11, [rip + tool_name_upper_buf];
+        mov rcx, r13;
+      pdxv_emit_upper_loop:
+        cmp rcx, 0;
+        je pdxv_emit_upper_done;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0x61;                      // 'a'
+        jb pdxv_emit_upper_store;
+        cmp rax, 0x7a;                      // 'z'
+        ja pdxv_emit_upper_store;
+        sub rax, 0x20;                      // ASCII lower → upper
+      pdxv_emit_upper_store:
+        mov_b [r11], rax;
+        add rsi, 1;
+        add r11, 1;
+        sub rcx, 1;
+        jmp pdxv_emit_upper_loop;
+      pdxv_emit_upper_done:
+
+        // -- Segment 2: sys_write(1, PDX_TOOL_NAME, r13) -----------------
         mov rax, 1;                         // SYS_write
         mov rdi, 1;                         // fd = stdout
-        lea rsi, [rip + DOC_TOOL_NAME];     // HelpBackend export
-        mov rdx, r14;
+        lea rsi, [rip + PDX_TOOL_NAME];
+        mov rdx, r13;
         syscall;
 
         // -- Segment 3: sys_write(1, LIT_SPACE, 1) -----------------------
@@ -334,11 +402,11 @@ module VersionBackend = structure {
         mov rdx, 1;
         syscall;
 
-        // -- Segment 6: sys_write(1, DOC_TOOL_NAME_UPPER, r14) -----------
+        // -- Segment 6: sys_write(1, tool_name_upper_buf, r13) -----------
         mov rax, 1;
         mov rdi, 1;
-        lea rsi, [rip + DOC_TOOL_NAME_UPPER];
-        mov rdx, r14;
+        lea rsi, [rip + tool_name_upper_buf];
+        mov rdx, r13;
         syscall;
 
         // -- Segment 7: sys_write(1, LIT_VERSION_OK, 12) -----------------

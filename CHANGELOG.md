@@ -6,6 +6,115 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-032 hotfix — auto `--version` prints per-tool name (Closes #42)
+
+Every P0 consumer of libpdx-argv 1.1.x (`cat`, `mv`, `cp`, `mkdir`,
+`rm`, `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`, …) that fell
+through the ENH-032 auto-emit printed the literal string
+`doc <ver>\nDOC VERSION OK\n` instead of its own tool name, e.g.
+
+    $ cat --version
+    doc 1.4.2
+    DOC VERSION OK
+
+The pre-hotfix `VersionBackend::emit_default` referenced two baked-in
+module symbols for the two `<TOOL>` slots:
+
+- Segment 2 read `HelpBackend::DOC_TOOL_NAME` (`"doc\0"`), the same
+  symbol `HelpBackend::fill_doc_argv` uses to spawn the `doc`
+  subprocess — its role there is legitimate but got mis-repurposed
+  as the `--version` byline source.
+- Segment 6 read a paired `VersionBackend::DOC_TOOL_NAME_UPPER`
+  literal (`"DOC\0"`) with matching `DOC_TOOL_NAME_UPPER_LEN` /
+  `DOC_TOOL_NAME_LEN` constants.
+
+The ENH-032 module preamble already flagged the shape as
+"a follow-on ENH": `DOC_TOOL_NAME` was to be promoted to a weak/extern
+symbol paired with `PDX_TOOL_VERSION`. This hotfix lands that
+promotion.
+
+Fix (source + smoke stub + downstream ripple, no wire-format change):
+
+- `src/version_backend.pdx`:
+  - New per-tool extern `PDX_TOOL_NAME` (mirrors `PDX_TOOL_VERSION`'s
+    convention): NUL-terminated ASCII in `.rodata`, defined by every
+    consumer in its own constants module (e.g.
+    `cat/src/version_constants.pdx` with
+    `pub let PDX_TOOL_NAME : [u8; 4] = "cat\0"`). Missing → ld
+    reports undefined `PDX_TOOL_NAME` at final link; a build-time
+    catch, not a runtime surprise. No weak default provided.
+  - Removed baked-in `DOC_TOOL_NAME_UPPER`, `DOC_TOOL_NAME_UPPER_LEN`,
+    and `DOC_TOOL_NAME_LEN` public constants — a downstream that
+    read them (none observed in the pkgs/consumers.list survey) now
+    breaks at build; the failure surfaces at the same place the
+    correct fix (add `PDX_TOOL_NAME` to constants module) is applied.
+  - New `.bss` slot `tool_name_upper_buf : [u8; 32]` for the
+    runtime-computed uppercase mirror.
+  - New public constant `TOOL_NAME_UPPER_MAX : u64 = 32` — the copy
+    cap; a name longer than 32 bytes is silently truncated in both
+    the lowercase (segment 2) and uppercase (segment 6) sys_writes
+    so the pair of lines stays byte-count-consistent.
+  - `emit_default` rewritten: two `version_strlen` calls (name,
+    version — both callee-save-preserved into r13/r12), one
+    straight-line byte loop that copies PDX_TOOL_NAME into
+    `tool_name_upper_buf` uppercasing bytes in `[0x61, 0x7a]` via
+    `sub rax, 0x20`, then the same seven-syscall fingerprint the
+    frozen contract requires, this time sourcing segments 2 and 6
+    from `PDX_TOOL_NAME` and `tool_name_upper_buf` respectively.
+    Frame unchanged: 4-push (rbx/r12/r13/r14) + `sub rsp, 8` keeps
+    rsp%16==0 across both nested strlen calls.
+  - Preamble and per-function docstrings updated: the "Extern
+    symbol convention" block now documents both externs; the
+    `emit_default` register plan explains r13 as clamped name-len,
+    r14 as the hoisted `TOOL_NAME_UPPER_MAX` constant.
+- `tests/smoke_driver.pdx`: added `pub let PDX_TOOL_NAME : [u8; 8] =
+  "pdxargv\0"` alongside the existing `PDX_TOOL_VERSION` stub so
+  `pdxargv_smoke.elf` links unchanged. The smoke's
+  `ParseStdVocabTests::run_version_auto_emit` (case 3) still asserts
+  the return code (`ERR_VERSION_EMITTED = 13`); the byte sequence
+  that lands on fd 1 is now `pdxargv 1.2.0-libpdx-smoke\nPDXARGV
+  VERSION OK\n` (was `doc 1.2.0-libpdx-smoke\nDOC VERSION OK\n`).
+  A downstream paideia-os shell fixture that greps for `DOC
+  VERSION OK` needs the same update; the fingerprint the
+  `<TOOL> VERSION OK` pattern targets is now the real tool name,
+  which is precisely what #42 asked for.
+
+Downstream ripple (main's follow-up):
+
+- Every P0 tool linking libpdx-argv >= 1.1.3 must define
+  `PDX_TOOL_NAME` in its constants module. The consumer list from
+  `pkgs/consumers.list` is `cat`, `mv`, `cp`, `mkdir`, `rm`,
+  `mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`, `libpdx-audit`,
+  `libpdx-elevate`, `shell` — main updates each after this hotfix
+  lands.
+- No paideia-os smoke fixture that greps for `<TOOL> VERSION OK`
+  needs a code change (the tool name is the invariant), but any
+  fixture that greps for the literal `DOC VERSION OK` from a
+  non-doc tool was masking this exact bug and must be re-pointed
+  to the real tool name.
+
+paideia-as 0.36 encoder compliance:
+
+- No `test reg, reg`; every zero-check is `cmp reg, 0`.
+- No `and reg, imm64` on r8-r15 (the copy loop uses `sub rax, 0x20`
+  which is imm8-encoded).
+- No 2-op `imul r, imm`; no multiplies at all.
+- No `cmp reg, [mem]`; the `TOOL_NAME_UPPER_MAX` clamp loads through
+  r14 first.
+- No `[reg + N*8]` with N ∉ {1,2,4,8}; the copy loop uses `[rsi]`
+  and `[r11]` with post-increment.
+- Byte loads: `xor rax,rax; mov_b rax,[ptr]` per #1248.
+- Byte stores: `mov_b [r11], rax` (schema_emit precedent).
+- Reserved-label discipline: `pdxv_emit_upper_loop`,
+  `pdxv_emit_upper_store`, `pdxv_emit_upper_done`,
+  `pdxv_emit_name_len_ok`. Bare `loop` never appears.
+- Frame math: 4 pushes + `sub rsp, 8` = 40 bytes past return
+  address → rsp%16 == 0 at both nested `call version_strlen`.
+
+Discovered: paideia-os `cat --version` printing `DOC VERSION OK` in
+the R47 shell smoke run, 2026-09-12. Filed as #42; hotfixed
+2026-09-12.
+
 ### ENH-017 hotfix — `MAX_COLLECTED_ERRORS` overflow-cap test coverage (Closes #44)
 
 `Parser::parse_argv_ex` under `ARGV_COLLECT_ALL_ERRORS` caps the

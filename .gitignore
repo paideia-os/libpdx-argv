@@ -1,0 +1,22 @@
+# libpdx-argv .gitignore — closes paideia-os/libpdx-argv#43.
+#
+# Rationale: build-out/ is the primary product directory (per manifest.pdxproj);
+# object/binary/archive artifacts must never enter version control (they diverge
+# from source and bloat the repo). git rm --cached below untracks the artifacts
+# that leaked in during early iterations without deleting them from disk.
+
+# Build products
+build-out/
+*.o
+*.bin
+*.elf
+*.a
+*.so
+*.so.*
+
+# Editor / OS noise
+*~
+.DS_Store
+
+# Local scratch
+.scratch/
