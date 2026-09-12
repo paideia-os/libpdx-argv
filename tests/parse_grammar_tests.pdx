@@ -2305,4 +2305,201 @@ module ParseGrammarTests = structure {
         ret;
       }
     }
+
+  // ============================================================
+  // Case 36 — libpdx-argv.ENH-017 hotfix (Closes #44) —
+  //   MAX_COLLECTED_ERRORS overflow-cap coverage.
+  //
+  //   Pre-hotfix, case 35 was the only exercise of the collect-all
+  //   error ring, and it drove exactly two accumulated errors. The
+  //   16→17 boundary of ParsedArgs::MAX_COLLECTED_ERRORS (the
+  //   ring's physical capacity) was unexercised at runtime, so a
+  //   refactor that flipped the cap gate direction (jge → jg),
+  //   moved the store past the gate, or forgot to skip the count
+  //   increment on overflow would land silently.
+  //
+  //   Fixture: 17 argv slots ALL pointing to the same "--zog\0"
+  //   string, plus FlagSpec::set_strict(1) with no register call
+  //   for zog. Every iteration fires ERR_UNKNOWN_FLAG (=12) via
+  //   the ENH-004 strict-mode lookup-miss path. flag_count never
+  //   advances (the strict reject fires BEFORE any store) so this
+  //   test does NOT collide with the MAX_FLAGS=32 gate; the only
+  //   observable is the error ring itself.
+  //
+  //   parse_argv_ex is invoked with parse_flags =
+  //   ARGV_COLLECT_ALL_ERRORS (1) so the recoverable-fail router
+  //   at parse_argv_maybe_collect keeps advancing past each
+  //   offending slot instead of returning on the first error.
+  //
+  //   Assertions (every one is a witness for a specific overflow
+  //   behavior — the whole point of case 36 is that dropping any
+  //   assertion below re-opens the coverage gap the hotfix closes):
+  //
+  //     rax                    == 12  (first-error preserved by
+  //                                    parse_argv_epilogue's
+  //                                    ring[0] read even after
+  //                                    16 additional records)
+  //     error_count()          == 16  (MAX_COLLECTED_ERRORS —
+  //                                    the 17th recoverable fail
+  //                                    was silently dropped; the
+  //                                    count did NOT roll past
+  //                                    the cap)
+  //     error_at(0)            == (12, 0)   first-error snapshot
+  //     error_at(15)           == (12, 15)  16th slot correctly
+  //                                         holds the 16th error
+  //                                         (NOT overwritten by
+  //                                         the dropped 17th —
+  //                                         cmp rcx,16 / jge in
+  //                                         parse_argv_maybe_collect
+  //                                         skips the store, not
+  //                                         just the count)
+  //     error_at(16)           == (0, 0)    OOB sentinel per the
+  //                                         ParsedArgs::error_at
+  //                                         docstring (idx >=
+  //                                         error_ring_count →
+  //                                         (0, 0))
+  //     error_code (scalar)    == 12   first-error preserved in
+  //                                    the pre-ENH-017 scalar slot
+  //     error_arg_index scalar == 0    ditto
+  //
+  //   Guards the following exact sequence in src/parser.pdx
+  //   (parse_argv_maybe_collect):
+  //
+  //     lea r11, [rip + error_ring_count];
+  //     mov rcx, [r11];
+  //     cmp rcx, 16;                        // MAX_COLLECTED_ERRORS
+  //     jge parse_argv_maybe_collect_gate;  // <-- THIS BRANCH
+  //     lea r11, [rip + error_ring_codes];
+  //     mov [r11 + rcx*8], rax;
+  //     lea r11, [rip + error_ring_indices];
+  //     mov [r11 + rcx*8], r13;
+  //     ...
+  //     add rcx, 1;
+  //     lea r11, [rip + error_ring_count];
+  //     mov [r11], rcx;
+  //
+  //   Any refactor that:
+  //     - flips jge → jg          → error_count()==17 assertion trips
+  //     - moves add rcx,1 above jge → same, error_count()==17
+  //     - drops the jge entirely   → error_at(15) reads the 17th
+  //                                   store (still (12, 16)); count
+  //                                   asserts trip
+  //     - stores past the cap into
+  //       an adjacent .bss slot    → error_at(15) reads (0, 0) or
+  //                                   garbage; equality assertion
+  //                                   trips
+  //
+  //   parse_argv_fail_append's parallel `cmp rcx, 16; jge
+  //   parse_argv_epilogue` is not exercised here (no hard-fail
+  //   path fires after 16 recoverable errors in this fixture);
+  //   it is left to a future case if the hard-fail append surface
+  //   ever grows a caller-visible observable beyond the ring
+  //   itself.
+  // ============================================================
+  pub let case36_zog      : [u8; 6]  = "--zog\0"
+  pub let mut case36_argv : [u64; 17] = uninit @align(8)
+
+  pub let run_case36 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-argv.ENH-017 hotfix (Closes #44) case36 — MAX_COLLECTED_ERRORS overflow-cap coverage. Drives 17 recoverable ERR_UNKNOWN_FLAG (12) fails under ARGV_COLLECT_ALL_ERRORS and asserts the ring caps at 16: error_count()==16 (not 17, not 15), error_at(15)==(12,15) (16th slot unchanged — witnesses that the `cmp rcx,16; jge parse_argv_maybe_collect_gate` branch skips BOTH the store and the increment, not just the increment), error_at(16)==(0,0) (OOB sentinel), and rax==12 via first-error preservation in parse_argv_epilogue (ring[0] read wins over any subsequent state). Fixture: 17 argv slots all pointing to the same '--zog\\0' string, set_strict(1), no register call for zog — every iteration fires ERR_UNKNOWN_FLAG via the ENH-004 strict-mode lookup-miss path BEFORE any store into flag_ids/flag_kinds, so this test does not collide with the MAX_FLAGS=32 gate; the only observable is the ring itself. Argv fill uses the same `xor rcx, rcx; loop; mov [rbx+rcx*8], r11; add rcx,1; cmp rcx,17; jne` shape as case25 (encoder-safe: rcx never exceeds 17, cmp imm8, no test mnemonic). Non-leaf: 1-push (rbx) aligns rsp%16 for the nested full_reset / set_strict / parse_argv_ex / error_count / error_at / record_* calls. Tag 0x100000024 = (1<<32) | 36 requires imm64 encoding (mov rdi, imm64) — same shape as every other case_fail tag in this module.",
+      block: {
+        push rbx;
+
+        call full_reset;
+
+        // Opt into strict mode so lookup misses fire ERR_UNKNOWN_FLAG
+        // instead of silently storing under FKIND_UNKNOWN. No
+        // flag_spec_register call for `zog` — the whole fixture
+        // depends on the lookup miss firing on every iteration.
+        mov rdi, 1;
+        call set_strict;
+
+        // Fill 17 argv slots with a pointer to the same "--zog\0".
+        // Same forward-index loop shape case25/case26 use — rcx is
+        // bounded by 17 (imm8, no imm32/imm64 encoding pressure).
+        lea r11, [rip + case36_zog];
+        lea rbx, [rip + case36_argv];
+        xor rcx, rcx;
+      case36_fill:
+        mov [rbx + rcx*8], r11;
+        add rcx, 1;
+        cmp rcx, 17;
+        jne case36_fill;
+
+        // parse_argv_ex(argv, argc=17, parse_flags=ARGV_COLLECT_ALL_ERRORS=1)
+        lea rdi, [rip + case36_argv];
+        mov rsi, 17;
+        mov rdx, 1;
+        call parse_argv_ex;
+        cmp rax, 12;                         // first-error = ERR_UNKNOWN_FLAG
+        jne case36_fail;
+
+        // error_count() == 16 (MAX_COLLECTED_ERRORS) — the 17th
+        // recoverable fail was silently dropped by the cap gate.
+        call error_count;
+        cmp rax, 16;
+        jne case36_fail;
+
+        // error_at(0) == (12, 0) — first error's snapshot lives in
+        // ring[0] and the scalar slots below.
+        xor rdi, rdi;
+        call error_at;
+        cmp rax, 12;
+        jne case36_fail;
+        cmp rdx, 0;
+        jne case36_fail;
+
+        // error_at(15) == (12, 15) — 16th slot correctly holds the
+        // 16th error's fingerprint. Witnesses that the cap gate
+        // skips the STORE (not just the count increment) — a
+        // refactor that dropped the jge or moved the add rcx,1
+        // above it would land the 17th write at ring[16] or
+        // overwrite ring[15]. Both regressions trip here.
+        mov rdi, 15;
+        call error_at;
+        cmp rax, 12;
+        jne case36_fail;
+        cmp rdx, 15;
+        jne case36_fail;
+
+        // error_at(16) == (0, 0) — OOB sentinel per the error_at
+        // docstring (idx >= error_ring_count returns (0, 0); 0 is
+        // not a valid ERR_* code so the sentinel is unambiguous).
+        // Witnesses that ring[16] was NEVER written — a refactor
+        // that widened the physical ring past 16 without updating
+        // MAX_COLLECTED_ERRORS trips here.
+        mov rdi, 16;
+        call error_at;
+        cmp rax, 0;
+        jne case36_fail;
+        cmp rdx, 0;
+        jne case36_fail;
+
+        // Scalar first-error slots preserved as (12, 0). The
+        // maybe_collect path only writes these on the first-error
+        // branch (cmp rcx, 0; jne ...); the 15 subsequent
+        // recoverable fails and the dropped 17th must not touch
+        // them. Witnesses first-error preservation is honored past
+        // the cap boundary, not just up to it.
+        lea r11, [rip + error_code];
+        mov rax, [r11];
+        cmp rax, 12;
+        jne case36_fail;
+        lea r11, [rip + error_arg_index];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne case36_fail;
+
+        call record_pass;
+        pop rbx;
+        ret;
+
+      case36_fail:
+        mov rdi, 0x100000024;                // (1<<32) | 36
+        call record_fail;
+        pop rbx;
+        ret;
+      }
+    }
 }

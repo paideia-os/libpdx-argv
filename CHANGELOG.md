@@ -6,6 +6,70 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-017 hotfix — `MAX_COLLECTED_ERRORS` overflow-cap test coverage (Closes #44)
+
+`Parser::parse_argv_ex` under `ARGV_COLLECT_ALL_ERRORS` caps the
+error ring at `MAX_COLLECTED_ERRORS` (16) via a single branch in
+`parse_argv_maybe_collect`:
+
+    lea r11, [rip + error_ring_count];
+    mov rcx, [r11];
+    cmp rcx, 16;                        // MAX_COLLECTED_ERRORS
+    jge parse_argv_maybe_collect_gate;  // skip store AND increment
+    ...store into ring[rcx]...
+    add rcx, 1;
+    ...write back error_ring_count...
+
+The gate is correct — the `jge` skips both the ring store and the
+count increment, so the 17th (and beyond) recoverable fail is
+silently dropped while the ring keeps its first 16 records
+intact. `error_count()` docstring states "reports
+MAX_COLLECTED_ERRORS on overflow", and `Parser::parse_argv_ex`
+carries the same claim in its own justification. Pre-hotfix,
+however, the whole cap surface was documentation-only at runtime:
+`tests/parse_grammar_tests.pdx` case 35 (the only exercise of the
+collect-all ring) drove exactly two accumulated errors, so a
+refactor that flipped the gate direction (`jge` → `jg`), moved
+the `add rcx, 1` above the gate, or dropped the gate entirely
+would land silently. `parse_argv_fail_append`'s parallel `cmp
+rcx, 16; jge parse_argv_epilogue` is also uncovered but does not
+change any caller-visible observable beyond the ring itself, so
+it is left to a future case.
+
+Fix (test-only; no source change — the cap logic is correct as
+shipped):
+
+- `tests/parse_grammar_tests.pdx`: new `run_case36`. Fixture
+  drives 17 argv slots all pointing to the same `"--zog\0"`
+  string under `FlagSpec::set_strict(1)` with no register call
+  for `zog`. Every iteration fires `ERR_UNKNOWN_FLAG` (12) via
+  the ENH-004 strict-mode lookup-miss path BEFORE any store into
+  `flag_ids`/`flag_kinds`, so the test does not collide with the
+  `MAX_FLAGS=32` gate; the only observable is the ring itself.
+  `parse_argv_ex(argv, 17, ARGV_COLLECT_ALL_ERRORS)` returns 12
+  (first-error preservation via `parse_argv_epilogue`'s ring[0]
+  read); assertions cover `error_count() == 16` (not 17, not
+  15), `error_at(0) == (12, 0)` (first-error snapshot),
+  `error_at(15) == (12, 15)` (16th slot correctly holds the 16th
+  error — witnesses that the gate skips the STORE, not just the
+  increment), `error_at(16) == (0, 0)` (OOB sentinel per the
+  `error_at` docstring), and the scalar `error_code` /
+  `error_arg_index` slots preserved at `(12, 0)`. Fail tag
+  `0x100000024 = (1<<32) | 36`.
+- `tests/smoke_driver.pdx`: dispatch `run_case36` immediately
+  after `run_case35`.
+
+Failure taxonomy: no dedicated overflow error code exists in the
+`ERR_*` table (0..20) and none is added — the cap is a silent
+drop by design (the return value carries the first error's code
+per the "first error wins" contract, unchanged whether the ring
+overflowed or not; `error_count()` distinguishes overflow vs.
+non-overflow via the equality-with-`MAX_COLLECTED_ERRORS` check
+callers already own).
+
+Impact: no runtime behavior change. Discovered by W44 pre-commit
+debugger sweep, 2026-09-11; hotfixed 2026-09-12.
+
 ### ENH-019 hotfix — `register_string_enum` null-page-read defence (Closes #45)
 
 Pre-hotfix `FlagSpec::register_string_enum` stored the caller's

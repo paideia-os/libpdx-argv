@@ -116,6 +116,13 @@ module SmokeDriver = structure {
         // errors + advance past both) AND the pre-ENH-017 backward-
         // compat shape (parse_argv, bit unset, stops at first error).
         call ParseGrammarTests::run_case35;
+        // libpdx-argv.ENH-017 hotfix (Closes #44): MAX_COLLECTED_ERRORS
+        // overflow-cap coverage. Drives 17 recoverable ERR_UNKNOWN_FLAG
+        // fails under ARGV_COLLECT_ALL_ERRORS and asserts the ring
+        // caps at 16 (silent drop of the 17th, no overwrite of the
+        // 16th, OOB sentinel from error_at(16), first-error
+        // preservation in rax + the scalar slots).
+        call ParseGrammarTests::run_case36;
 
         // --- ParseTypedValuesTests (module id 2) --------------------
         call ParseTypedValuesTests::run_case1;
