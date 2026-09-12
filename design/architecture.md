@@ -961,10 +961,45 @@ supplies the actual syscall bridge (analogous to
 holds no caps and cannot syscall — the driver's job is to package
 the tally; the wiring's job is to hand it out.
 
-A shell wrapper (analogous to `tools/verify-user-tokenizer.sh` in
-paideia-os) that assembles + boots + interprets the exit code lands
-with `pkg.M4` — see the M4→M5 dependency chain in
-`design/tooling/r49-r50-plan.md` §5.12.
+**Wiring layer (ENH-007, Closes #14)** — landed in-repo instead of
+waiting on `pkg.M4`. Three moving parts:
+
+- `tests/sys_exit_shim.pdx` supplies the `SysExit::exit` extern.
+  The elaborator flattens `Module::fn` path references to the last
+  path segment (see
+  `paideia-as::parse_stmt::try_extract_symbol_name`, issue #1319),
+  so the shim's module basename (`SysExitShim`) is linker-invisible
+  and only the `exit` symbol matters. The bridge is two
+  instructions: `mov rax, 60; syscall;` (paideia-os SC+ ID 60 =
+  sys_exit; Linux syscall table maps the same number to sys_exit
+  for host-runnable execution — the whole reason SC+ numbers were
+  chosen to shadow the Linux table at R17-m1-001).
+- `tools/tests-link.ld` — flat-ELF linker script mirroring
+  mkfs.pdxfs's `link.ld` (`ENTRY(_start)`, .text at 0x00400000,
+  .data at 0x00600000, .bss contiguous with .data).
+- `tools/run-tests.sh` — assembles src/*.pdx + tests/*.pdx,
+  links via `ld -T tools/tests-link.ld`, execs the smoke ELF and
+  decodes the exit status. A `python3` waitid helper recovers the
+  full 32-bit `si_status` (shell `$?` clamps to the low 8 bits);
+  bare `$?` fallback still catches `fail_count > 0`. Prints
+  `PDXARGV SMOKE OK` on all-green, `PDXARGV SMOKE FAIL` otherwise.
+  See `tests/README.md` §"Running the smoke" for the wrapper's
+  exit-code table.
+
+Pre-ENH-007 provenance: `tools/build.sh` (the only runner shipped
+through 1.1.0) counted encoder failures but never linked and never
+executed the driver — every "smoke passes" record in this document
+and elsewhere was an assembler signal, not a behaviour signal. See
+`STATUS.md` §"Runnable smoke wiring" for the plainly-stated history.
+
+Known outstanding at ENH-007 land: link-stage duplicate-symbol
+collisions on the flat `run_case1`, `run_case2`, ... exports six
+of the seven test modules share. `tools/run-tests.sh` surfaces this
+categorically (exit 2 + diagnostic) rather than papering over it
+with `--allow-multiple-definition`. The escalation is either
+Module::fn symbol mangling in paideia-as (preferred) or an in-repo
+rename of every test case to `<module>_<case>` shape. `STATUS.md`
+carries the resolution options.
 
 ### 11.5 What M4 explicitly does not do
 

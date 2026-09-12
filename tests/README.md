@@ -18,6 +18,7 @@ tests/
   help_backend.pdx           — HelpBackend::fill_doc_argv round-trip (id 7)
   schema_emit.pdx            — SchemaEmit register/get/reset (id 8)
   smoke_driver.pdx           — _start; runs every case, sys_exit(pass<<16|fail)
+  sys_exit_shim.pdx          — SC+ ID 60 trampoline (ENH-007 #14); link-only
 ```
 
 Test-module IDs (leftmost byte of `TestHarness::last_fail_tag`):
@@ -185,25 +186,81 @@ Per the M4 line in `design/tooling/r49-r50-plan.md` §5.12:
 
 ## Running the smoke
 
-`smoke_driver.pdx` exposes `_start` and expects a `SysExit::exit`
-symbol to be linked in from a smoke-binary wiring layer (analogous to
-`src/user/syscall_shim.pdx` in paideia-os — a per-target module that
-converts the `exit(u64)` call into the target's actual sys_exit
-syscall). The exit code is packed as `(pass_count << 16) | fail_count`;
-a zero low-16 means every case passed.
+`smoke_driver.pdx` exposes `_start` and calls `SysExit::exit(status)`
+after packing its tally as `(pass_count << 16) | fail_count`. The
+`SysExit::exit` symbol is supplied by `tests/sys_exit_shim.pdx` —
+a two-instruction SC+ ID 60 trampoline landed by
+`libpdx-argv.ENH-007` (Closes #14). Both paideia-os user-space and
+Linux dispatch sys_exit at syscall 60 with `rdi = status`, so the
+linked smoke ELF is host-runnable directly — no QEMU required.
 
-Once the pkg (§5.11) M4 wiring lands, a shell test wrapper
-(analogous to `tools/verify-user-*.sh` in paideia-os) will:
+Invoke the runner:
 
-1. Assemble tests/*.pdx + src/*.pdx into `pdxargv_smoke.elf`.
-2. Boot the smoke ELF under QEMU or the userspace loader stub.
-3. Read the exit code; report `PDXARGV SMOKE OK` on 0-fail or
-   `PDXARGV SMOKE FAIL` on non-zero with the packed tally.
+```
+bash tools/run-tests.sh
+```
 
-The M4-001 deliverable is the tests themselves + the driver shape;
-the wrapper lands with pkg.M4 per the M4 dependency chain (`libpdx-
-argv.M5-001 dual-signed release + .pdxdoc + mirror push` in turn
-depends on pkg.M4 per §5.12).
+The runner:
+
+1. Assembles every `src/*.pdx` and `tests/*.pdx` via paideia-as
+   (resolved through `$PAIDEIA_AS`, sibling paideia-os checkout, or
+   `$PATH` — same discipline as `tools/build.sh`).
+2. Links every emitted object into `build-out/pdxargv_smoke.elf`
+   via `ld -T tools/tests-link.ld` (mirrors mkfs.pdxfs's per-tool
+   linker script; ENTRY(`_start`), text at 0x00400000, data at
+   0x00600000, .bss contiguous with .data).
+3. Execs the ELF; a `python3` waitid helper recovers the full
+   32-bit `si_status` word (the child's raw exit-code int, which
+   shell `$?` clamps to the low 8 bits) and decodes both
+   `pass_count` (bits 16..31) and `fail_count` (bits 0..15). If
+   python3 is missing, the runner falls back to `$?` and reports
+   `fail_count` only.
+4. Prints `PDXARGV SMOKE OK` on all-green (`fail_count == 0`,
+   `pass_count > 0`) or `PDXARGV SMOKE FAIL` otherwise.
+
+Wrapper exit codes:
+
+| code | meaning |
+|-----:|---------|
+| 0    | smoke ran clean (`PDXARGV SMOKE OK`) |
+| 1    | paideia-as build failed |
+| 2    | ld link stage failed (see `build-out/link.log`) |
+| 3    | smoke ran but `fail_count > 0` (`PDXARGV SMOKE FAIL`) |
+| 4    | smoke killed by a signal (segfault etc.) |
+| 5    | prerequisite missing (`paideia-as`, `ld`) |
+
+Use `bash tools/run-tests.sh --no-run` to stop after the link stage
+(useful when triaging the link-line composition without side effects).
+
+### Known link-stage hazard
+
+Every test module currently exports its `run_case1`, `run_case2`, ...
+functions as bare flat linker symbols. This is by design in
+paideia-as: the elaborator flattens `Module::fn` path references to
+the last segment (see paideia-as
+`parse_stmt::try_extract_symbol_name`, issue #1319). Because six of
+the seven test modules define `run_case1`, `ld -z defs` (the default,
+correctly kept by this runner) will refuse the link with
+`multiple definition of run_case1`.
+
+The runner surfaces this as exit code 2 with a categorised
+diagnostic pointing at the paideia-as gap. **Resolutions** — either
+land Module::fn symbol mangling in paideia-as (preferred; benefits
+every satellite repo) or rename in-repo to
+`<module>_<case>` shape (e.g. `parse_grammar_run_case1`) at the cost
+of touching every test file. Do NOT paper over with
+`--allow-multiple-definition`: silent first-wins resolution would let
+each `run_case1` run only once and the smoke would falsely report
+green.
+
+### Pre-1.1 provenance
+
+Every "smoke passes" reference in the pre-ENH-007 wave of documents
+(STATUS.md's milestone rollup, tests/README.md's `M4-001` coverage
+matrix, design/architecture.md §11.4) was actually a claim that each
+`.pdx` file assembled cleanly — the `.pdx` files never reached a
+linked ELF and the driver never executed. See STATUS.md
+§"Runnable smoke wiring" for the plainly-stated provenance.
 
 ## Non-goals at M4-001
 

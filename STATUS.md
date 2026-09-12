@@ -9,6 +9,58 @@ the fixed #34 and #36) have all landed. See `CHANGELOG.md` for the
 per-version entries and `design/tooling/r49-r50-plan.md` §5.12 for
 the wave-level rubric.
 
+## Runnable smoke wiring (ENH-007 #14, unreleased)
+
+State plainly: **every "smoke passes" claim recorded in this repo
+before ENH-007 was an assembler signal, not a behaviour signal.**
+`tools/build.sh` (the only runner shipped through 1.1.0) assembled
+each `.pdx` file to a `.o` under `build-out/` and counted encoder
+failures — it never linked, never executed the driver, never
+observed a pass/fail count. `tests/smoke_driver.pdx` ended in
+`call SysExit::exit;` targeting an undefined symbol that no wiring
+layer in this repo supplied. The M4-001 tally of "50/50 green" that
+appears throughout `tests/README.md`, `design/architecture.md` §11,
+and the CHANGELOG's M4-001 entry was therefore a claim that each
+test file *assembled cleanly*, not that any assertion executed.
+
+ENH-007 lands the missing wiring inside this repo (rather than
+waiting on `pkg.M4` per the M4→M5 dependency chain in
+`design/tooling/r49-r50-plan.md` §5.12):
+
+- `tests/sys_exit_shim.pdx` — SC+ ID 60 (sys_exit) trampoline
+  supplying the extern `SysExit::exit` symbol the driver calls.
+  The `Module::fn` path is flattened by paideia-as to the last
+  segment (`exit`) — see
+  `paideia-as::parse_stmt::try_extract_symbol_name` (issue
+  #1319) — so the module basename (`SysExitShim`) is
+  linker-invisible and the shim only needs to export `exit`.
+- `tools/run-tests.sh` — assemble + link + exec + decode. Uses
+  `python3`'s `os.waitid` to recover the full 32-bit
+  `si_status` word (shell `$?` only preserves the low 8 bits);
+  decodes `(pass_count << 16) | fail_count` and prints
+  `PDXARGV SMOKE OK` on all-green or `PDXARGV SMOKE FAIL`
+  otherwise. Wrapper exit codes are in `tests/README.md`.
+- `tools/tests-link.ld` — flat-ELF linker script mirroring
+  mkfs.pdxfs's `link.ld` (paideia-os #1976).
+
+Neither paideia-os nor Linux enforce a cap gate on syscall 60, and
+paideia-os's SC+ table co-opts Linux's syscall numbering exactly so
+tests can be host-run on the developer's Linux box without QEMU. The
+smoke ELF's bytes are the same either way.
+
+**Known outstanding: link-stage duplicate-symbol collisions.**
+Every test module currently exports its `run_case1`, `run_case2`,
+... functions as bare flat linker symbols. Six of the seven test
+modules define `run_case1`, so `ld -z defs` (the correct default,
+kept by `tools/run-tests.sh`) refuses the link. The runner surfaces
+this categorically (exit 2 + a diagnostic pointing at the paideia-as
+gap). Resolutions: (a) land Module::fn symbol mangling in paideia-as
+(preferred — benefits every satellite repo), or (b) rename every
+test case to `<module>_<case>` shape in this repo. Do NOT use
+`--allow-multiple-definition`: silent first-wins would let each
+`run_case1` run exactly once and the smoke would falsely report
+green.
+
 Signature state at 1.1.0: `manifest.pdxsig` is payload-frozen; both
 signature slots carry `PENDING:` sentinels and every per-source
 sha256 line is `DEFERRED-COMPUTED-AT-RELEASE-RUNNER` (ENH-030

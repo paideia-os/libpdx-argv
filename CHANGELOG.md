@@ -6,6 +6,94 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+### ENH-007 — Runnable smoke: SysExit wiring + `tools/run-tests.sh` (Closes #14)
+
+Pre-ENH-007 the "M4-001 50/50 green" claim recorded throughout
+this repo was a claim that every `.pdx` file **assembled cleanly**,
+not that any test assertion **executed**. `tools/build.sh` (the
+only runner) counted paideia-as encoder failures per file and never
+proceeded to link. `tests/smoke_driver.pdx` ended in
+`call SysExit::exit;` targeting an undefined extern that no wiring
+in this repo supplied — the driver could not have run even if a
+downstream had chosen to boot the objects. See `STATUS.md`
+§"Runnable smoke wiring" for the plainly-stated provenance.
+
+ENH-007 lands the wiring in-repo (rather than waiting on `pkg.M4`
+per the M4→M5 chain in `design/tooling/r49-r50-plan.md` §5.12):
+
+- `tests/sys_exit_shim.pdx` — new. `SysExitShim` module with a
+  single `pub let exit : (u64) -> () !{sysreg} @{}` function that
+  emits `mov rax, 60; syscall;` (SC+ ID 60 = sys_exit, both
+  paideia-os and Linux). The elaborator flattens `SysExit::exit`
+  path references to the last segment (`exit`) — see
+  `paideia-as::parse_stmt::try_extract_symbol_name` (issue #1319) —
+  so the shim's module basename (`SysExitShim`) is linker-invisible;
+  only the `exit` symbol needs to be present at link time.
+- `tools/tests-link.ld` — new. Flat-ELF linker script mirroring
+  mkfs.pdxfs's `link.ld` (paideia-os #1976): `ENTRY(_start)`,
+  .text at 0x00400000, .data at 0x00600000, .bss contiguous with
+  .data. Both paideia-os and Linux accept this exact layout.
+- `tools/run-tests.sh` — new. Assemble + link + exec + decode.
+  Uses `python3`'s `os.waitid` to recover the full 32-bit
+  `si_status` (shell `$?` clamps to the low 8 bits); decodes
+  `(pass_count << 16) | fail_count` per the smoke driver's
+  contract. Prints `PDXARGV SMOKE OK` on all-green,
+  `PDXARGV SMOKE FAIL` otherwise. Wrapper exit codes: 0 clean,
+  1 build fail, 2 link fail, 3 smoke fail, 4 signalled,
+  5 prereq missing.
+- `tests/README.md` — new "Running the smoke" section
+  documenting the wrapper's invocation, exit-code table, and
+  the known link-stage hazard (below).
+- `design/architecture.md` §11.4 — updated to reference the
+  in-repo wiring and cross-link `STATUS.md`.
+
+**Host or QEMU?** Host. paideia-os's SC+ numbering was chosen at
+R17-m1-001 to co-opt the Linux syscall table (SC+ ID 60 = Linux
+syscall 60 = sys_exit; SC+ ID 1 = sys_write, the only other
+syscall this repo issues), so a linked `.pdx` smoke ELF is
+directly host-runnable on a developer Linux box with no QEMU and
+no paideia-os kernel dependency.
+
+**Exit-code contract.** The smoke driver packs
+`(pass_count << 16) | fail_count` into `rdi` before calling
+`SysExit::exit`. The kernel preserves the full 32-bit int in
+`si_status` (reachable via `os.waitid`); shell `$?` reflects only
+the low 8 bits, which for a 50-case matrix comfortably captures
+`fail_count` — so `$? == 0` on all-green is a reliable pass/fail
+signal even without the python3 helper.
+
+**Fingerprint (from #14).** `bash tools/run-tests.sh` prints
+`PDXARGV SMOKE OK` and exits 0 on a clean tree; the tally decodes
+to pass=50 fail=0. Deliberately breaking one assertion in
+`tests/parse_grammar_tests.pdx` prints `PDXARGV SMOKE FAIL` with
+non-zero low-16 and a `last_fail_tag` whose high dword is 1.
+
+**Known outstanding — link-stage duplicate-symbol collisions.**
+Every test module currently exports `run_case1`, `run_case2`, ...
+as bare flat linker symbols (paideia-as elaborator flattens
+`Module::fn` to the last segment — see
+`parse_stmt::try_extract_symbol_name`, issue #1319). Six of the
+seven test modules define `run_case1`, so `ld -z defs` (the
+correct default, kept by this runner) refuses the link with
+`multiple definition of run_case1`. `tools/run-tests.sh` surfaces
+this categorically (exit 2 + diagnostic) rather than papering over
+it with `--allow-multiple-definition` (which would silently pick
+the first definition and let each `run_case1` run only once — the
+smoke would falsely report green). Resolutions:
+
+1. **Preferred** — land Module::fn symbol mangling in paideia-as
+   (benefits every satellite repo and closes the general design
+   gap; issue #1319 already tracks the discussion).
+2. **In-repo workaround** — rename every test case symbol to
+   `<module>_<case>` shape (e.g. `parse_grammar_run_case1`) and
+   update `tests/smoke_driver.pdx` to call the mangled names.
+   Touches every test file but unblocks execution today.
+
+The ENH-007 landing intentionally does NOT choose between these —
+the wiring is the deliverable; the naming choice belongs on a
+follow-up ticket (either paideia-as or a libpdx-argv ENH depending
+on which resolution is picked).
+
 ### ENH-006 — Caller-owned `ParsedArgsCtx` multi-parse contexts (Closes #17)
 
 Pre-ENH-006 every ParsedArgs, FlagSpec and SchemaEmit slot lived in

@@ -1,0 +1,105 @@
+// tests/sys_exit_shim.pdx — libpdx-argv.ENH-007 (Closes #14)
+// SysExit::exit link-time bridge for the smoke driver.
+//
+// tests/smoke_driver.pdx ends every _start invocation with:
+//
+//   mov rdi, rax;              // rax = (pass_count << 16) | fail_count
+//   call SysExit::exit;
+//
+// The paideia-as elaborator flattens the `SysExit::exit` path to its
+// last segment (`exit`) as the linker symbol name (see
+// paideia-as::parse_stmt::try_extract_symbol_name comment at line
+// 1180; issue #1319). This module exports one function — `exit` —
+// providing that symbol.
+//
+// Syscall convention
+// ------------------
+// paideia-os user-space and Linux both dispatch sys_exit at SC+ ID 60
+// with `rdi = status` (SysV/AMD64). The bridge is trivial:
+//
+//   mov rax, 60;               // SC+ ID 60 = sys_exit
+//   syscall;
+//   ret;                       // (unreachable — sys_exit terminates)
+//
+// The `ret` is defensive scaffolding: sys_exit is documented as
+// NORETURN and the kernel never returns control, but paideia-as's
+// unsafe block encoder requires a terminating branch — `ret` is the
+// unambiguous shape (see paideia-os src/user/syscall_shim.pdx:135
+// for the canonical prior art).
+//
+// Because both hosts share the SC+ 60 dispatch (paideia-os's SC+
+// numbering was chosen at R17-m1-001 to co-opt the Linux table for
+// exactly this reason — a `.pdx` binary linked against this shim can
+// execute either on paideia-os kernel or under a Linux userspace host
+// with the same bytes), `tools/run-tests.sh` can exec the linked ELF
+// directly on the developer's Linux host, no QEMU required. The exit
+// status the wrapper reads is the packed (pass<<16 | fail) tally the
+// smoke driver computed.
+//
+// Provenance
+// ----------
+// Pre-1.1 the smoke driver's `call SysExit::exit;` was an unresolved
+// extern — every "smoke passes" claim recorded in STATUS.md,
+// tests/README.md and design/architecture.md was actually a claim
+// that each `.pdx` file assembled cleanly, not that the driver
+// executed. This shim closes the wiring gap. See ENH-007 (#14).
+//
+// Link discipline
+// ---------------
+// A downstream tool that intends to consume libpdx-argv MUST NOT link
+// this file — it exports the bare linker symbol `exit`, which would
+// collide with any real tool's own exit handling. It exists solely
+// for the smoke ELF built by `tools/run-tests.sh`. The build script
+// keeps it out of `src/` for exactly that reason (tests/*.pdx never
+// ship in the .pdxdoc or the pkg wire; they only participate in the
+// per-repo smoke).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module `SysExitShim` matches file basename `sys_exit_shim`
+//     under `expected_module_name` (snake→PascalCase, per
+//     paideia-as::file_module::expected_module_name).
+//   - Leaf; no callee-save touched; no push/pop needed. rsp
+//     alignment inherited from caller (smoke_driver's `push rbx`
+//     put rsp at 8 mod 16 before the CALL, which the CALL itself
+//     brings back to 0 mod 16 for the syscall — syscall itself
+//     has no alignment requirement).
+//   - `mov rax, 60` — imm32 well under 0x7FFFFFFF; encoder-safe.
+//   - No `test` mnemonic (no branch here); no `and reg, imm64`;
+//     no 2-op `imul r, imm`; no `cmp reg, [mem]`; no `[reg + N*8]`
+//     non-unit scale. The one instruction slot (`mov rax, 60`) is
+//     R49-subset by construction.
+//   - `capabilities: {}` — the smoke driver already declares
+//     `capabilities: {}` for `_start`, and paideia-as does not
+//     perform transitive cap-chain validation across extern link
+//     boundaries. Declaring `{sched}` here would be more honest
+//     against the paideia-os SC+ 60 contract, but the smoke ELF's
+//     runtime is Linux (which enforces no cap gate on syscall 60)
+//     and the tests/ tree is per-repo, never mirror-published, so
+//     the discipline layer that would consume a `{sched}` decl
+//     never sees this file. Kept `{}` for consistency with the
+//     rest of tests/*.pdx.
+
+module SysExitShim = structure {
+
+  // ============================================================
+  // exit(status)
+  // Signature: (u64) -> () !{sysreg} @{}
+  //   rdi = status (already loaded by smoke_driver before the call)
+  // Leaf; NORETURN. Emits SC+ ID 60 (sys_exit). Kernel reaps the
+  // task; the wait4/waitid on the host side observes `si_status`
+  // = status (full 32 bits preserved by the kernel; the low 8 bits
+  // survive shell $? clamping — see tools/run-tests.sh header for
+  // how the wrapper decodes the full (pass<<16 | fail) word).
+  // ============================================================
+  pub let exit : (u64) -> () !{sysreg} @{} =
+    fn (status: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-argv.ENH-007 (Closes #14) SysExitShim::exit — SC+ ID 60 (sys_exit) trampoline for tests/smoke_driver.pdx. Two instruction slots plus a defensive `ret`. `mov rax, 60` loads the SC+ id; rdi already holds the packed (pass<<16 | fail) tally the caller (SmokeDriver::_start) computed via `shl rax, 16; or rax, rdx; mov rdi, rax` immediately before this CALL. `syscall` dispatches; the kernel never returns for sys_exit so the trailing `ret` is unreachable — kept only because paideia-as's unsafe-block encoder requires an explicit terminating branch on every path. Leaf: no callee-save reg used; no push/pop; no memory read. rsp alignment on entry is 0 mod 16 (smoke_driver's `push rbx` prologue put rsp at 8 mod 16 and the CALL pushed 8 more bytes for the return address, bringing rsp back to 0 mod 16) — syscall itself has no alignment requirement so no further bookkeeping. R49-subset compliant: no `test` (no branch), no `and reg, imm64`, no 2-op `imul r, imm`, no `cmp reg, [mem]`, no `[reg + N*8]` non-unit scale, `mov rax, 60` well under the 0x7FFFFFFF imm32 gate. Provenance: mirrors paideia-os src/user/syscall_shim.pdx:135 (sys_exit) — same SC+ id, same rdi passthrough, same {sysreg} effect. Effects `{sysreg}` correctly reflects the syscall instruction; capabilities `{}` matches the rest of tests/*.pdx (see module preamble for the discipline-layer rationale).",
+      block: {
+        mov rax, 60;
+        syscall;
+        ret;
+      }
+    }
+}
