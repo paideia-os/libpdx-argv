@@ -6,6 +6,77 @@ rubric in `design/tooling/r49-r50-plan.md` §5.
 
 ## Unreleased
 
+_(nothing pending; next tranche will accumulate below this line.)_
+
+## 1.2.0 — 2026-09-13
+
+**libpdx-argv.ENH-025 (Closes #35).** Consolidation release rolling
+up every ENH-021..ENH-032 change that accumulated in Unreleased
+since v1.1.0 (2026-09-02). Version chosen `1.2.0` (not `1.1.4`)
+because ENH-032's `DOC_TOOL_NAME_UPPER` removal + the new required
+`PDX_TOOL_NAME` per-tool extern is a **downstream-visible source
+break**: every P0 consumer of libpdx-argv 1.1.x must define
+`PDX_TOOL_NAME` in its constants module or ld reports an undefined
+symbol at final link. Semver minor bump is the honest reflection
+of that shape change.
+
+Rollup (all entries below moved verbatim from the previous
+Unreleased span; see the per-ENH stanzas for the full source
+narratives):
+
+- ENH-032 hotfix — auto `--version` prints per-tool name (#42)
+- ENH-017 hotfix — `MAX_COLLECTED_ERRORS` overflow-cap test
+  coverage (#44)
+- ENH-019 hotfix — `register_string_enum` null-page-read defence
+  (#45)
+- ENH-007 — Runnable smoke: SysExit wiring + `tools/run-tests.sh`
+  (#14)
+- ENH-006 — Caller-owned `ParsedArgsCtx` multi-parse contexts
+  (#17)
+- ENH-020 — Git-shape subcommand dispatch (#30)
+- ENH-019 — STRING flag enum validation via
+  `register_string_enum` (#29)
+- ENH-017 — Collect-all-errors mode via
+  `ARGV_COLLECT_ALL_ERRORS` (#27)
+- ENH-013 — Clustered short flags for BOOL/COUNTED registrations
+  (#23)
+- ENH-016 — `PdxArgvParseErrorRecord@0.1` structured error
+  emission (#26)
+- ENH-014 — Auto `--help` table generated lazily from ArgSpec
+  (#24)
+- ENH-018 — INT flag range validation (min/max on ArgSpec) (#28)
+- ENH-032 — Library-owned `--version` auto-emitter (#25)
+- ENH-031 — `argv[0]`-skip convention: `parse_argv_skipping_zero`
+  helper (#41)
+
+**Release-runner manifest refresh.** `manifest.pdxsig` payload
+bumped `version: 1.1.0 → 1.2.0`, `released: 2026-09-02 →
+2026-09-13`. Every per-source sha256 remains
+`DEFERRED-COMPUTED-AT-RELEASE-RUNNER` — the release-runner host
+recomputes and re-signs at admission time (payload byte stream
+between `PAYLOAD BEGIN` / `PAYLOAD END`). Both signature blocks
+carry their `PENDING:` sentinels; `pkg install --strict` refuses
+this package until the runner replaces both.
+
+New `sources:` entry for the ENH-025 tranche is only additive
+where new source files landed (none in this consolidation — every
+ENH-021..ENH-032 change edited existing files; the sources list
+tracks the same eight files it did at 1.1.0).
+
+**pdxping migration (libpdx-argv.ENH-021, #31) — noted as
+follow-up.** No `tools/pdxping/` or `tools/user/pdxping/` tree
+exists in the paideia-os monorepo or as a sibling checkout at
+the time of this release cut. The R100 wave lists pdxping in
+`tools/user/pdxsock/README.md` and `tools/user/pdxsock/doc/
+pdxsock.pdxdoc` (as a cross-reference in `[[cref:
+pdxping#NAME]]`), but no repo has been created. #31 is closed
+as follow-up: when pdxping surfaces (paideia-os R100
+milestone), migrating its argv parser onto libpdx-argv 1.2.0
+is a one-file addition to its `deps.list` plus the standard
+`parse_argv_skipping_zero` entry-point rewrite; the migration
+tranche mirrors ENH-021's mkfs.pdxfs / mount.pdxfs / umount.pdxfs
+landing pattern.
+
 ### ENH-032 hotfix — auto `--version` prints per-tool name (Closes #42)
 
 Every P0 consumer of libpdx-argv 1.1.x (`cat`, `mv`, `cp`, `mkdir`,

@@ -1,23 +1,34 @@
-# libpdx-argv v1.1.0 — dual-signed release manifest
+# libpdx-argv v1.2.0 — dual-signed release manifest
 #
 # Format:  paideia-os pkg §6.3 (design/tooling/plan.md).
 # Signer:  paideia-as v0.33-crypto-kdf `release --sign` (ML-DSA-65).
 # Verify:  pkg install / pkg verify (design/user/model.md §11.2).
 #
-# This file is the load-bearing artifact of the 1.1 release. Its two
+# This file is the load-bearing artifact of the 1.2 release. Its two
 # signature blocks bind the payload above to (a) the author key and
 # (b) the paideia_root_pk countersignature applied at admission time
 # by the pkgs.paideia-os mirror. `pkg install --strict` refuses this
 # package while either block carries a PENDING sentinel.
 #
-# libpdx-argv.ENH-030 (2026-09-02): every 1.0 source file changed
-# under the cross-module symbol rename (parsed_args_reset,
-# flag_spec_reset, flag_spec_register, schema_emit_reset,
-# schema_emit_register), so the per-source sha256 lines below are
-# marked DEFERRED-COMPUTED-AT-RELEASE-RUNNER; the release runner
+# libpdx-argv.ENH-025 (2026-09-13, Closes #35): consolidation
+# release rolling up every ENH-021..ENH-032 change accumulated in
+# CHANGELOG.md Unreleased since 1.1.0 (2026-09-02). Every 1.1
+# source file changed under the tranche (the cross-cutting
+# ENH-032 auto-version rework touched `src/version_backend.pdx`;
+# the ENH-020 subcommand-dispatch rework touched
+# `src/parser.pdx` and `src/parsed_args.pdx`; the ENH-014
+# auto-help table touched `src/help_backend.pdx`; the ENH-016
+# structured-error emission touched `src/parse_error_record.pdx`
+# and `src/parser.pdx`; the ENH-013 clustered-short landing
+# touched `src/flag_spec.pdx` and `src/parser.pdx`), so the
+# per-source sha256 lines below stay marked
+# DEFERRED-COMPUTED-AT-RELEASE-RUNNER; the release runner
 # recomputes them and re-signs at admission time. Downstream
-# consumers pinning 1.0.0 keep working; anyone bumping to 1.1.0
-# updates their bare-name call sites to the new mangled names.
+# consumers pinning 1.1.0 who did NOT define `PDX_TOOL_NAME`
+# will hit an undefined-symbol link error under 1.2.0 (ENH-032
+# breaking-change); the per-tool constants-module addition is
+# a two-line fix at each consumer site (see CHANGELOG's ENH-032
+# hotfix stanza for the exact addition).
 
 # ---- payload (signed region, everything between "PAYLOAD BEGIN"
 # ---- and "PAYLOAD END" is fed into ml_dsa_65_sign as a single
@@ -26,13 +37,13 @@
 PAYLOAD BEGIN
 manifest_version:  1
 name:              libpdx-argv
-version:           1.1.0
+version:           1.2.0
 wave:              R49
 kind:              library
 license:           MIT
 license_sha256:    5d10906e3e9407412fd51592e3dd968251a4797b8ffdcc9e862d8fb1f3925e2b
 repo:              github.com/paideia-os/libpdx-argv
-released:          2026-09-02
+released:          2026-09-13
 released_by:       paideia-os-team
 source_tree_root:  DEFERRED-COMPUTED-AT-RELEASE-RUNNER
 source_tree_algo:  sha256-of-concat-sorted-source-files
@@ -43,14 +54,16 @@ requires_caps:     (none)
 deps:              (none — pure userspace; see deps.list)
 toolchain_floor:   paideia-as >= 0.33-crypto-kdf
 sources:
-  src/flag_spec.pdx      sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/help_backend.pdx   sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/parsed_args.pdx    sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/parser.pdx         sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/schema_emit.pdx    sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/schema_invoke.pdx  sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/std_vocab.pdx      sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
-  src/typed.pdx          sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/flag_spec.pdx          sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/help_backend.pdx       sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/parsed_args.pdx        sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/parse_error_record.pdx sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/parser.pdx             sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/schema_emit.pdx        sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/schema_invoke.pdx      sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/std_vocab.pdx          sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/typed.pdx              sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
+  src/version_backend.pdx    sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
 sidecar_files:
   caps.decl              sha256=be4cfa8ad2d04d44778c71595566d74b8a92b3218566f7d18a61f7b20f8f0058
   deps.list              sha256=DEFERRED-COMPUTED-AT-RELEASE-RUNNER
@@ -71,6 +84,23 @@ post_1_0_landed:
   ENH-023 #33 qualify smoke-driver cross-module call sites
   ENH-029 #39 scaffold pkgs/consumers.list
   ENH-030 #40 rename module-scope colliding exports (reset, register)
+post_1_1_landed:
+  ENH-007 #14 Runnable smoke: SysExit wiring + tools/run-tests.sh
+  ENH-006 #17 Caller-owned ParsedArgsCtx multi-parse contexts
+  ENH-020 #30 Git-shape subcommand dispatch
+  ENH-019 #29 STRING flag enum validation via register_string_enum
+  ENH-017 #27 Collect-all-errors mode (ARGV_COLLECT_ALL_ERRORS)
+  ENH-013 #23 Clustered short flags for BOOL/COUNTED registrations
+  ENH-016 #26 PdxArgvParseErrorRecord@0.1 structured error emission
+  ENH-014 #24 Auto --help table generated lazily from ArgSpec
+  ENH-018 #28 INT flag range validation (min/max on ArgSpec)
+  ENH-032 #25 Library-owned --version auto-emitter
+  ENH-031 #41 argv[0]-skip: parse_argv_skipping_zero helper
+  ENH-032-hotfix #42 auto --version prints per-tool name
+    (breaking: PDX_TOOL_NAME per-tool extern now required at link)
+  ENH-017-hotfix #44 MAX_COLLECTED_ERRORS overflow-cap coverage
+  ENH-019-hotfix #45 register_string_enum null-page-read defence
+  ENH-025 #35 v1.2.0 consolidation release cut
 PAYLOAD END
 
 # ---- signatures (each block is <= 4KiB; two blocks always present;
@@ -81,7 +111,7 @@ SIGNATURE author BEGIN
 key_id:    paideia-os-team@v0.33
 algorithm: ML-DSA-65
 signature: PENDING:paideia-os-team-key@v0.33
-# Populated by `paideia-as release --sign libpdx-argv-1.0.0` on the
+# Populated by `paideia-as release --sign libpdx-argv-1.2.0` on the
 # release-runner host once the paideia-as v0.33-crypto-kdf toolchain
 # and the release-key HSM slot are reachable. The signature bytes
 # replace the PENDING sentinel in place; nothing else in this file
@@ -97,5 +127,5 @@ signature: PENDING:paideia_root_pk@R32-mint
 # author signature above and, on success, adds this counter-
 # signature over the same payload byte stream before writing the
 # package into the mirror tree at
-# `pkgs.paideia-os/main/libpdx-argv/1.0.0/manifest.pdxsig`.
+# `pkgs.paideia-os/main/libpdx-argv/1.2.0/manifest.pdxsig`.
 SIGNATURE paideia_root END
